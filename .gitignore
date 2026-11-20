@@ -34,3 +34,6 @@ vendor/pycaps/.git/
 
 data/media_cache/
 data/ref_cache/
+
+data/profiles/
+data/flow_vault/

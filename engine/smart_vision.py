@@ -18,7 +18,7 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import cv2
 import httpx
@@ -38,8 +38,17 @@ CACHE_DIR = BASE_DIR / "data" / "media_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 YTDLP_BIN = BASE_DIR / ".venv" / "bin" / "yt-dlp"
 
-# Negative query terms applied across Pixabay, Wikimedia Commons, and yt-dlp
+# Negative query terms applied across all video searchers (Pixabay, Pexels, Wikimedia Commons, Archive, yt-dlp)
 NEGATIVE_STOCK_TERMS = '-greenscreen -"green screen" -"chroma key" -template -intro'
+CHROMA_GREEN_RATIO_LIMIT = 0.30
+
+
+def build_clean_search_query(query: str) -> str:
+    """Ensure any video search query appends the mandatory anti-chroma-key negative terms."""
+    q = " ".join(str(query or "").strip().split())
+    if "-greenscreen" not in q.lower():
+        q = f"{q} {NEGATIVE_STOCK_TERMS}".strip()
+    return q
 
 # Words that usually indicate talking-head/text-heavy/chroma-key videos we should skip
 BAD_YT_TITLE_WORDS = (
@@ -89,42 +98,71 @@ def compute_blur_score(video_path: Path) -> float:
     return float(np.median(scores)) if scores else 0.0
 
 
-def detect_chroma_key(video_path: Path, green_ratio_limit: float = 0.35) -> Tuple[bool, float]:
-    """Sample 3 frames via OpenCV and reject clips where >35% of pixels are pure green
-    (G > 200, R < 80, B < 80 in BGR). Returns (is_chroma_key, max_green_ratio).
+def frame_green_pixel_ratio(frame_bgr: np.ndarray) -> float:
+    """Compute fraction of pixels in a BGR frame with pure chroma-key green (G > 195, R < 85, B < 85)."""
+    if frame_bgr is None or frame_bgr.size == 0 or frame_bgr.ndim < 3:
+        return 0.0
+    b = frame_bgr[:, :, 0]
+    g = frame_bgr[:, :, 1]
+    r = frame_bgr[:, :, 2]
+    green_mask = (g > 195) & (r < 85) & (b < 85)
+    return float(np.mean(green_mask))
+
+
+def detect_chroma_key(
+    video_path: Union[Path, str],
+    green_ratio_limit: float = CHROMA_GREEN_RATIO_LIMIT,
+) -> Tuple[bool, float]:
+    """Sample frames via OpenCV and reject clips where >30% (0.30) of pixels are pure green
+    (G > 195, R < 85, B < 85 in BGR). Returns (is_chroma_key, max_green_ratio).
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return False, 0.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 30)
+    total = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 30))
     max_ratio = 0.0
-    for frac in (0.20, 0.50, 0.80):
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * frac))
+    for frac in (0.15, 0.35, 0.50, 0.65, 0.85):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, min(total - 1, max(0, int(total * frac))))
         ok, frame = cap.read()
         if not ok or frame is None:
             continue
-        # OpenCV uses BGR channel order
-        b = frame[:, :, 0]
-        g = frame[:, :, 1]
-        r = frame[:, :, 2]
-        green_mask = (g > 200) & (r < 80) & (b < 80)
-        ratio = float(np.mean(green_mask))
+        ratio = frame_green_pixel_ratio(frame)
         if ratio > max_ratio:
             max_ratio = ratio
     cap.release()
     return (max_ratio > green_ratio_limit), round(max_ratio, 4)
 
 
-def evaluate_clip_quality(video_path: Path, min_blur: float = 25.0, green_ratio_limit: float = 0.35) -> Dict[str, object]:
-    """Run full visual quality gate (Laplacian blur + 3-frame OpenCV chroma-key detector)."""
-    blur = round(compute_blur_score(video_path), 1)
-    is_chroma, green_ratio = detect_chroma_key(video_path, green_ratio_limit=green_ratio_limit)
+def has_chroma_key_green(
+    target: Union[Path, str, np.ndarray],
+    green_ratio_limit: float = CHROMA_GREEN_RATIO_LIMIT,
+) -> bool:
+    """Inspect an OpenCV BGR frame or a video file and return True if >30% (0.30) of pixels
+    have pure chroma-key green (G > 195, R < 85, B < 85).
+    """
+    if isinstance(target, np.ndarray):
+        return frame_green_pixel_ratio(target) > green_ratio_limit
+    is_chroma, _ = detect_chroma_key(Path(target), green_ratio_limit=green_ratio_limit)
+    return is_chroma
+
+
+def evaluate_clip_quality(
+    video_path: Union[Path, str],
+    min_blur: float = 25.0,
+    green_ratio_limit: float = CHROMA_GREEN_RATIO_LIMIT,
+) -> Dict[str, object]:
+    """Run full visual quality gate (Laplacian blur + OpenCV chroma-key green detector >30%)."""
+    vpath = Path(video_path)
+    blur = round(compute_blur_score(vpath), 1)
+    is_chroma, green_ratio = detect_chroma_key(vpath, green_ratio_limit=green_ratio_limit)
     passed = (blur >= min_blur) and (not is_chroma)
     return {
         "passed": passed,
         "blur_score": blur,
         "chroma_key_filter": "active",
+        "chroma_key_threshold": green_ratio_limit,
         "chroma_key_detected": is_chroma,
+        "has_chroma_key_green": is_chroma,
         "green_pixel_ratio": green_ratio,
         "reason": "chroma_key_rejected" if is_chroma else ("blur_rejected" if blur < min_blur else "ok"),
     }
@@ -189,7 +227,7 @@ def _search_pixabay(client: httpx.Client, query: str, api_key: str) -> List[Dict
     if not api_key:
         return []
     try:
-        full_q = f"{query} {NEGATIVE_STOCK_TERMS}"
+        full_q = build_clean_search_query(query)
         r = client.get(
             "https://pixabay.com/api/videos/",
             params={"key": api_key, "q": full_q, "per_page": 8, "safesearch": "true"},
@@ -215,9 +253,10 @@ def _search_pexels(client: httpx.Client, query: str, api_key: str) -> List[Dict[
     if not api_key:
         return []
     try:
+        full_q = build_clean_search_query(query)
         r = client.get(
             "https://api.pexels.com/videos/search",
-            params={"query": query, "orientation": "portrait", "per_page": 6},
+            params={"query": full_q, "orientation": "portrait", "per_page": 6},
             headers={"Authorization": api_key},
             timeout=10.0,
         )
@@ -225,6 +264,9 @@ def _search_pexels(client: httpx.Client, query: str, api_key: str) -> List[Dict[
             return []
         results = []
         for v in r.json().get("videos", []):
+            v_url = str(v.get("url", "")).lower()
+            if any(bad in v_url for bad in BAD_TAG_WORDS):
+                continue
             files = sorted(
                 [f for f in v.get("video_files", []) if f.get("file_type") == "video/mp4" and (f.get("height") or 0) >= 720],
                 key=lambda x: abs((x.get("height") or 0) - 1920),
@@ -239,12 +281,13 @@ def _search_pexels(client: httpx.Client, query: str, api_key: str) -> List[Dict[
 def _search_wikimedia_cc0(client: httpx.Client, query: str) -> List[Dict[str, str]]:
     """Query Wikimedia Commons open video library (zero API key) excluding green screen/templates."""
     try:
+        full_q = build_clean_search_query(query)
         r = client.get(
             "https://commons.wikimedia.org/w/api.php",
             params={
                 "action": "query",
                 "generator": "search",
-                "gsrsearch": f"filetype:video {query} {NEGATIVE_STOCK_TERMS}",
+                "gsrsearch": f"filetype:video {full_q}",
                 "gsrnamespace": 6,
                 "gsrlimit": 6,
                 "prop": "videoinfo",
@@ -275,15 +318,15 @@ def _search_wikimedia_cc0(client: httpx.Client, query: str) -> List[Dict[str, st
 
 
 def _search_internet_archive(client: httpx.Client, query: str) -> List[Dict[str, str]]:
-    """Query Internet Archive open MPEG4 movies (zero API key)."""
+    """Query Internet Archive open MPEG4 movies (zero API key) excluding greenscreen/chroma key."""
     try:
-        safe_q = " ".join(w for w in query.split()[:3] if w.isalnum())
-        if not safe_q:
-            safe_q = "city timelapse"
+        base_words = [w for w in query.split() if not w.startswith("-") and w.replace('"', "").isalnum()]
+        safe_q = " ".join(base_words[:3]) or "city timelapse"
+        full_q = build_clean_search_query(safe_q)
         r = client.get(
             "https://archive.org/advancedsearch.php",
             params={
-                "q": f"mediatype:(movies) AND format:(MPEG4) AND ({safe_q})",
+                "q": f"mediatype:(movies) AND format:(MPEG4) AND ({full_q})",
                 "fl[]": ["identifier", "title"],
                 "rows": 4,
                 "output": "json",
@@ -296,7 +339,8 @@ def _search_internet_archive(client: httpx.Client, query: str) -> List[Dict[str,
         results = []
         for d in docs[:3]:
             ident = d.get("identifier")
-            if not ident:
+            title_l = str(d.get("title", "")).lower()
+            if not ident or any(bad in title_l for bad in BAD_TAG_WORDS):
                 continue
             mr = client.get(f"https://archive.org/metadata/{ident}/files", timeout=8.0)
             if mr.status_code != 200:
@@ -320,7 +364,8 @@ def _fetch_ytdlp_stock_clip(query: str, exclude_hashes: Set[str]) -> Optional[Pa
     Downloads only a clean 5-second middle slice (skipping intros) under 25MB.
     """
     ytdlp = str(YTDLP_BIN) if YTDLP_BIN.exists() else "yt-dlp"
-    search_str = f"ytsearch4:{query} vertical HD creative commons no copyright {NEGATIVE_STOCK_TERMS}"
+    clean_q = query.replace(NEGATIVE_STOCK_TERMS, "").strip()
+    search_str = build_clean_search_query(f"ytsearch4:{clean_q} vertical HD creative commons no copyright")
     try:
         probe = subprocess.run(
             [ytdlp, "--flat-playlist", "-J", "--no-warnings", search_str],

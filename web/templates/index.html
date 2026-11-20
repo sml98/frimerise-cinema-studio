@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="color-scheme" content="dark" />
-  <title>FrimeRise — Estúdio SaaS Local de Vídeos Virais</title>
+  <title>FrimeRise — Estúdio SaaS Local de Vídeos Virais & Documentários Cinema</title>
   <link rel="icon" type="image/png" href="/assets/brand/frimerise_logo.png" />
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
@@ -36,14 +36,22 @@
         <div>
           <div class="flex items-center gap-2">
             <h1 class="text-2xl font-black tracking-tight brand-gradient-text leading-none">FrimeRise</h1>
-            <span class="text-[11px] font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-full bg-frimepink/20 text-frimepink border border-frimepink/40">Studio Pro</span>
+            <span class="text-[11px] font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-full bg-frimepink/20 text-frimepink border border-frimepink/40">Studio Pro 2.0</span>
           </div>
-          <p class="text-xs text-[#B6A9D4]">Acer Aspire 5 • Intel Core i5 Local SaaS • 100% Comercial</p>
+          <p class="text-xs text-[#B6A9D4]">Acer Aspire 5 • Intel Core i5 Local SaaS • 3 Motores Master + Canais Gêmeos BR/US</p>
         </div>
       </div>
 
-      <!-- Live Telemetry Badges -->
+      <!-- Live Telemetry Badges + Google Flow Pro Credit Badge -->
       <div class="flex flex-wrap items-center gap-2.5 text-xs font-bold">
+        <!-- Google Flow Pro Credits Badge -->
+        <div id="badge-flow-pro" class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-frimepink/15 border border-frimepink/50 text-white">
+          <span class="text-frimegold" id="txt-flow-credits">🌊 Flow Pro: 10.000 cr</span>
+          <button type="button" onclick="loginGoogleFlow('flow')" class="px-2 py-0.5 rounded-md bg-frimepink text-white text-[10px] font-extrabold hover:brightness-110 transition" title="Autenticar Google Flow Pro & Flow Music no Camoufox Persistente">
+            🔐 Login Flow
+          </button>
+        </div>
+
         <!-- QuickSync ON (Lime Green) -->
         <div id="badge-quicksync" class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-frimelime/15 border border-frimelime/50 text-frimelime">
           <span class="pulse-dot"></span>
@@ -72,7 +80,7 @@
 
     <!-- Navigation Tabs -->
     <nav class="max-w-[1440px] mx-auto px-4 sm:px-6 pb-3 flex flex-wrap items-center gap-2" aria-label="Navegação Principal">
-      <button type="button" class="nav-tab active" data-tab="factory">🎬 Fábrica Multi-Modo</button>
+      <button type="button" class="nav-tab active" data-tab="factory">🎬 Fábrica & 10 Documentários</button>
       <button type="button" class="nav-tab" data-tab="vip">👑 Central VIP & Cascata 16:9</button>
       <button type="button" class="nav-tab" data-tab="b2b">💼 Vender p/ Empresas (B2B)</button>
       <button type="button" class="nav-tab" data-tab="clients">🎨 Estúdio de Clientes & Voz</button>
@@ -86,7 +94,7 @@
 
   <main class="max-w-[1440px] mx-auto px-4 sm:px-6 py-6 space-y-6">
 
-    <!-- ==================== TAB 1: FÁBRICA MULTI-MODO ==================== -->
+    <!-- ==================== TAB 1: FÁBRICA MULTI-MODO + 3 MOTORES + FILA 10 DOCUMENTÁRIOS ==================== -->
     <section id="tab-factory" class="tab-panel space-y-6">
       <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
         <!-- Left: Manufacture Form -->
@@ -94,38 +102,76 @@
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 class="text-xl font-black text-white">Fábrica Multi-Modo <span class="text-frimepink">FrimeRise</span></h2>
-              <p class="text-xs text-[#B6A9D4]">Produza 1 vídeo, lote de até 50 vídeos ou clone um viral concorrente.</p>
+              <p class="text-xs text-[#B6A9D4]">Escolha um dos 3 Motores Master, clone um viral com Raio-X 3×3 ou dispare a Fila de 10 Documentários.</p>
             </div>
             <!-- Mode Switcher -->
             <div class="flex bg-[#0B0713] p-1 rounded-xl border border-[rgba(179,136,255,0.2)] text-xs font-bold">
               <button type="button" class="mode-btn px-3 py-1.5 rounded-lg bg-frimepink text-white" data-mode="single">Tema Único</button>
               <button type="button" class="mode-btn px-3 py-1.5 rounded-lg text-[#B6A9D4]" data-mode="batch">Lote 50 Vídeos</button>
-              <button type="button" class="mode-btn px-3 py-1.5 rounded-lg text-[#B6A9D4]" data-mode="clone_url">Clonar URL</button>
+              <button type="button" class="mode-btn px-3 py-1.5 rounded-lg text-[#B6A9D4]" data-mode="clone_url">Clonar URL / .mp4</button>
             </div>
           </div>
 
-          <!-- Seletor de Estilo Master -->
+          <!-- Seletor dos 3 Motores Master -->
           <div class="space-y-2">
-            <span class="block text-xs font-bold text-frimegold uppercase">Estilo Master do Vídeo</span>
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <span class="block text-xs font-bold text-frimegold uppercase">Seletor dos 3 Motores Master</span>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <button type="button" class="style-btn text-left p-3.5 rounded-xl border border-frimelime bg-[#0B0713]/90 transition" data-style="cinematic_broll">
-                <div class="text-sm font-black text-white">🎬 Vídeo Dinâmico Cinematográfico</div>
-                <div class="text-[11px] text-[#B6A9D4] mt-0.5">Filmagens reais HD + Motion Graphics Skia + LUT 3D</div>
+                <div class="text-xs font-black text-white">🎬 Vídeo Dinâmico Viral / Bespoke 2.5D</div>
+                <div class="text-[11px] text-[#B6A9D4] mt-1">Parallax 2.5D CPU (u2netp) + Filmagens HD + LUT 3D + Cards Skia</div>
               </button>
               <button type="button" class="style-btn text-left p-3.5 rounded-xl border border-[rgba(179,136,255,0.22)] bg-[#0B0713]/70 transition" data-style="cartoon_2d">
-                <div class="text-sm font-black text-white">🎭 Animação 2D Cartoon v2 (Storytelling / Humor)</div>
-                <div class="text-[11px] text-[#B6A9D4] mt-0.5">60 FPS • Line Boil 8fps • Rhubarb 9-Visemas • Vozes Gemini TTS</div>
+                <div class="text-xs font-black text-white">🎭 Animação 2D Cartoon Multi-Personagens</div>
+                <div class="text-[11px] text-[#B6A9D4] mt-1">60 FPS • Line Boil 8fps • Rhubarb 9-Visemas • Vozes Atuadas</div>
               </button>
+              <button type="button" class="style-btn text-left p-3.5 rounded-xl border border-[rgba(179,136,255,0.22)] bg-[#0B0713]/70 transition" data-style="netflix_doc">
+                <div class="text-xs font-black text-white">🎞️ Documentário Cinema Netflix / MagnatesMedia 16:9 &amp; 9:16</div>
+                <div class="text-[11px] text-[#B6A9D4] mt-1">Cold Open • Capítulos • 5 Modos Skia • 3 Thumbs + 5 Shorts</div>
+              </button>
+            </div>
+          </div>
+
+          <!-- Google Flow & Flow Music Pro Controls -->
+          <div class="p-4 rounded-xl bg-[#0B0713]/90 border border-frimelilac/35 space-y-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <span class="text-xs font-black uppercase text-frimegold">🌊 Google Flow &amp; Flow Music Pro</span>
+                <span id="flow-mode-pill" class="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-frimelime/15 text-frimelime border border-frimelime/40">Cofre FlowVault 0-Crédito Ativo</span>
+              </div>
+              <div class="flex items-center gap-1.5">
+                <button type="button" onclick="loginGoogleFlow('flow')" class="btn-ghost px-2.5 py-1 text-[11px] font-bold">🔐 Login Flow.google</button>
+                <button type="button" onclick="loginGoogleFlow('flowmusic')" class="btn-ghost px-2.5 py-1 text-[11px] font-bold">🎵 Login FlowMusic</button>
+              </div>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
+              <div class="sm:col-span-7">
+                <label for="fac-flow-mode" class="block text-[11px] font-bold text-[#B6A9D4] mb-1">Modo de Geração Visual &amp; Guardião de Créditos</label>
+                <select id="fac-flow-mode" class="fr-input text-xs" onchange="toggleFlowCreditsCap()">
+                  <option value="economico_pro" selected>🟢 Econômico Pro (Nano Banana 2 + 2.5D Parallax CPU • 0 cr Veo)</option>
+                  <option value="gancho_de_ouro">🟡 Gancho de Ouro (~15 cr • Cena 1 Veo 3.1 Light + Cenas 2..N 2.5D CPU)</option>
+                  <option value="cinema_full_veo">🔴 Cinema Full Veo (Veo 3.1 com Teto Máximo de Créditos)</option>
+                </select>
+              </div>
+              <div class="sm:col-span-2">
+                <label for="fac-flow-cap" class="block text-[11px] font-bold text-frimegold mb-1">Teto Máx (cr)</label>
+                <input id="fac-flow-cap" type="number" min="0" max="1000" step="5" value="45" class="fr-input text-xs text-center" title="Teto máximo de créditos Google Flow por vídeo (max_credits_cap)" />
+              </div>
+              <div class="sm:col-span-3">
+                <label class="flex items-center gap-2 p-2.5 rounded-xl bg-[#140E24] border border-frimepink/35 cursor-pointer">
+                  <input id="opt-flow-music" type="checkbox" class="fr-check w-4 h-4" checked />
+                  <span class="text-[11px] font-extrabold text-white">🎵 Flow Music Vault</span>
+                </label>
+              </div>
             </div>
           </div>
 
           <!-- Opções Exclusivas de Animação 2D Cartoon Studio v2 -->
           <div id="cartoon-2d-options" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl bg-[#0B0713]/85 border border-frimepink/40">
             <div>
-              <label for="fac-aspect" class="block text-xs font-bold text-frimepink uppercase mb-1.5">Formato da Animação</label>
+              <label for="fac-aspect" class="block text-xs font-bold text-frimepink uppercase mb-1.5">Formato do Vídeo</label>
               <select id="fac-aspect" class="fr-input">
                 <option value="9:16">📱 Vertical 9:16 — Shorts / TikTok / Reels (1080×1920)</option>
-                <option value="16:9">📺 Horizontal 16:9 — YouTube Longo 3-5 min (1920×1080)</option>
+                <option value="16:9">📺 Horizontal 16:9 — YouTube Longo Cinema (1920×1080)</option>
               </select>
             </div>
             <div>
@@ -146,14 +192,44 @@
             <div>
               <label for="fac-cartoon-voice" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Motor de Voz dos Personagens</label>
               <select id="fac-cartoon-voice" class="fr-input">
-                <option value="gemini_tts" selected>🎭 Google Gemini TTS Expressivo (Atuação Real + Auto-Fallback)</option>
-                <option value="edge">⚡ Edge-TTS Instantâneo (Zero Custo / Ilimitado)</option>
+                <option value="gemini_tts" selected>🎭 Google Gemini TTS Expressivo + Kokoro/Edge</option>
+                <option value="edge">⚡ Edge-TTS Multi-Pitch Instantâneo (Zero Custo)</option>
               </select>
             </div>
-            <div class="sm:col-span-2 flex flex-wrap items-center gap-2 text-[11px] text-[#B6A9D4] pt-1">
-              <span class="px-2 py-0.5 rounded bg-frimelime/15 text-frimelime font-bold border border-frimelime/30">Rhubarb v1.14 (9 Visemas MIT)</span>
-              <span class="px-2 py-0.5 rounded bg-frimepink/15 text-frimepink font-bold border border-frimepink/30">Line Boil 8fps + Cel-Shading</span>
-              <span class="px-2 py-0.5 rounded bg-frimelilac/15 text-frimelilac font-bold border border-frimelilac/30">Braços IK + Pernas + Paralaxe 2.5D (0 tokens/frame)</span>
+          </div>
+
+          <!-- Opções Exclusivas de Documentário Cinema Netflix / MagnatesMedia -->
+          <div id="netflix-doc-options" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl bg-[#0B0713]/90 border border-frimegold/45">
+            <div>
+              <label for="doc-aspect" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Formato Documental</label>
+              <select id="doc-aspect" class="fr-input">
+                <option value="16:9" selected>📺 16:9 Widescreen Cinema (1920×1080 + 5 Shorts 9:16)</option>
+                <option value="9:16">📱 9:16 Doc Vertical Investigativo (1080×1920)</option>
+              </select>
+            </div>
+            <div>
+              <label for="doc-lang" class="block text-xs font-bold text-frimelime uppercase mb-1.5">Canal Gêmeo / Idioma Nativo</label>
+              <select id="doc-lang" class="fr-input" onchange="syncDocChannelSelection()">
+                <option value="pt_br" selected>🇧🇷 Dossiê Capital (PT-BR • pt-BR-AntonioNeural)</option>
+                <option value="en_us">🇺🇸 Vault Files (EN-US Dólar • en-US-AndrewMultilingualNeural)</option>
+              </select>
+            </div>
+            <div>
+              <label for="doc-thumb-hook" class="block text-xs font-bold text-frimepink uppercase mb-1.5">Texto 3 Palavras da Thumbnail (1280×720)</label>
+              <input id="doc-thumb-hook" type="text" class="fr-input" placeholder="Ex: ESCONDEU $1.4 BILHÃO ou HID $1.4 BILLION" />
+            </div>
+            <div>
+              <label for="doc-minutes" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Escala de Duração (Cena a Cena • Guardião Térmico)</label>
+              <select id="doc-minutes" class="fr-input">
+                <option value="0.5" selected>⚡ Demo Rápido (~30s • Cold Open + Capítulos Skia)</option>
+                <option value="3.0">🎬 Mini-Documentário (3 min • Pacing MagnatesMedia)</option>
+                <option value="8.0">🍿 Documentário Mid-Roll Alto RPM (8+ min)</option>
+              </select>
+            </div>
+            <div class="sm:col-span-2 flex flex-wrap items-center gap-2 text-[11px] text-[#B6A9D4]">
+              <span class="px-2 py-0.5 rounded bg-frimegold/15 text-frimegold font-bold border border-frimegold/30">Cold Open + C A P Í T U L O   I</span>
+              <span class="px-2 py-0.5 rounded bg-frimepink/15 text-frimepink font-bold border border-frimepink/30">Quadro Fios Vermelhos + Marca-Texto</span>
+              <span class="px-2 py-0.5 rounded bg-frimelime/15 text-frimelime font-bold border border-frimelime/30">LUT 02_dark_wealth.cube + 3 Thumbs + 5 Shorts</span>
             </div>
           </div>
 
@@ -170,46 +246,73 @@
 
           <!-- Mode Single -->
           <div id="mode-single-wrap">
-            <label for="fac-topic" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Tema ou História do Vídeo</label>
-            <input id="fac-topic" type="text" class="fr-input" placeholder="Ex: Jonas tentando fugir de barco na tempestade (ou tema comercial/financeiro)" />
+            <label for="fac-topic" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Tema, Investigação ou História do Vídeo</label>
+            <input id="fac-topic" type="text" class="fr-input" placeholder="Ex: Como um Único Operador Quebrou o Banco Mais Antigo da Rainha (Nick Leeson / Barings Bank)" />
           </div>
 
           <!-- Mode Batch 50 -->
           <div id="mode-batch-wrap" class="hidden">
             <label for="fac-batch" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Lista de Temas (1 por linha — até 50 vídeos na fila)</label>
-            <textarea id="fac-batch" rows="5" class="fr-input" placeholder="Tema 1: Como economizar 3h por dia com IA&#10;Tema 2: O segredo da Starbucks para lucrar bilhões&#10;Tema 3: Por que seu anúncio local não vende"></textarea>
+            <textarea id="fac-batch" rows="5" class="fr-input" placeholder="Tema 1: Como um único operador escondeu $1.4 bilhão no Barings Bank&#10;Tema 2: O monopólio invisível da Luxottica nos óculos de luxo&#10;Tema 3: Os boletos falsos de US$ 122 milhões pagos por Google e Facebook"></textarea>
           </div>
 
-          <!-- Mode Clone URL / Upload MP4 -->
-          <div id="mode-clone-wrap" class="hidden space-y-3">
+          <!-- Mode Clone URL / Upload MP4 + Visual DNA X-Ray -->
+          <div id="mode-clone-wrap" class="hidden space-y-3 p-4 rounded-xl bg-[#0B0713]/90 border border-frimepink/40">
             <div>
-              <label for="fac-url" class="block text-xs font-bold text-frimepink uppercase mb-1.5">URL Concorrente (YouTube / TikTok / Reels — ex: @animabible7)</label>
-              <input id="fac-url" type="url" class="fr-input" placeholder="https://www.youtube.com/shorts/..." />
+              <label for="fac-url" class="block text-xs font-bold text-frimepink uppercase mb-1.5">URL Concorrente (YouTube / TikTok / Reels / Shorts)</label>
+              <div class="flex gap-2">
+                <input id="fac-url" type="url" class="fr-input" placeholder="https://www.youtube.com/watch?v=... ou https://www.tiktok.com/..." />
+                <button type="button" id="btn-analyze-url" onclick="analyzeReferenceUrl()" class="btn-pink-lilac px-3.5 py-2 text-xs whitespace-nowrap">
+                  🧬 Raio-X DNA
+                </button>
+              </div>
             </div>
             <div class="flex flex-wrap items-center gap-3">
               <label class="btn-ghost px-3.5 py-2 text-xs font-bold cursor-pointer">
-                📂 Ou Subir MP4 de Referência
+                📂 Ou Subir .mp4 Local de Referência
                 <input id="fac-ref-mp4" type="file" accept="video/mp4,video/webm" class="hidden" onchange="uploadReferenceMp4(this)" />
               </label>
               <input type="hidden" id="fac-ref-mp4-path" />
               <span id="dna-status-badge" class="text-xs text-frimelilac"></span>
             </div>
-            <p class="text-xs text-[#B6A9D4]">🧬 O <code class="text-frimelime">VideoDNAExtractor</code> detecta automaticamente se a referência é <strong>Filmagem Real</strong> ou <strong>Animação 2D Cartoon</strong> e chaveia o motor certo!</p>
+
+            <!-- Visual DNA X-Ray Panel (contact_sheet.jpg + Cadence + Optical Flow + Palette + Save Preset) -->
+            <div id="dna-xray-panel" class="hidden p-3.5 rounded-xl bg-[#140E24] border border-frimelime/45 space-y-3">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <span class="text-xs font-black uppercase text-frimelime">🔬 Raio-X Multimodal de DNA (Storyboard 3×3 + OpenCV)</span>
+                <span id="dna-engine-pill" class="text-[11px] font-extrabold px-2.5 py-0.5 rounded-full bg-frimepink/20 text-frimepink border border-frimepink/40">Motor Detectado</span>
+              </div>
+              <div class="grid grid-cols-1 sm:grid-cols-12 gap-3 items-center">
+                <div class="sm:col-span-5">
+                  <img id="dna-contact-sheet-img" src="/assets/brand/frimerise_logo.png" alt="Contact Sheet 3x3 Keyframes" class="w-full aspect-video object-cover rounded-lg border border-frimelilac/40 bg-black" />
+                </div>
+                <div class="sm:col-span-7 space-y-2 text-xs">
+                  <div id="dna-metrics-text" class="text-[#B6A9D4] space-y-1"></div>
+                  <div class="flex items-center gap-1.5" id="dna-palette-swatches"></div>
+                  <div class="flex gap-2 pt-1">
+                    <input id="dna-preset-name" type="text" class="fr-input !py-1.5 text-xs" placeholder="Nome do Novo Preset (ex: Clone Magnates Dark)" />
+                    <button type="button" id="btn-save-dna-preset" onclick="saveDnaAsPreset()" class="btn-gold px-3 py-1.5 text-xs whitespace-nowrap">
+                      💾 Salvar DNA como Novo Preset
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
 
           <!-- Pro Options Checkboxes + Multi-Language Global Cloning -->
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
             <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.18)] cursor-pointer hover:border-frimelilac/50">
               <input id="opt-motion" type="checkbox" class="fr-check w-4 h-4" checked />
-              <span class="text-xs font-bold text-white">Motion Graphics Skia</span>
+              <span class="text-xs font-bold text-white">Motion Graphics &amp; Lower Thirds Skia</span>
             </label>
             <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.18)] cursor-pointer hover:border-frimelilac/50">
               <input id="opt-loop" type="checkbox" class="fr-check w-4 h-4" checked />
-              <span class="text-xs font-bold text-white">Loop Infinito + Retention Doctor</span>
+              <span class="text-xs font-bold text-white">Loop Infinito + Retention Doctor (Open Loops)</span>
             </label>
             <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.18)] cursor-pointer hover:border-frimelilac/50">
               <input id="opt-ab" type="checkbox" class="fr-check w-4 h-4" checked />
-              <span class="text-xs font-bold text-white">Teste A/B de Gancho</span>
+              <span class="text-xs font-bold text-white">Teste A/B + Cascata 5 Shorts 9:16</span>
             </label>
             <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/90 border border-frimegold/45 cursor-pointer hover:border-frimegold">
               <input id="opt-clone-langs" type="checkbox" class="fr-check w-4 h-4" />
@@ -240,7 +343,7 @@
                 <div id="active-job-bar" class="lime-progress-fill" style="width: 0%;"></div>
               </div>
               <p id="active-job-stage" class="text-xs text-frimelilac font-semibold">Aguardando comando...</p>
-              <pre id="active-job-log" class="text-[11px] leading-relaxed text-[#B6A9D4] bg-[#07040D] p-3 rounded-lg h-44 overflow-y-auto custom-scroll whitespace-pre-wrap">Motor Skia C++ e Intel QuickSync iHD prontos em standby.</pre>
+              <pre id="active-job-log" class="text-[11px] leading-relaxed text-[#B6A9D4] bg-[#07040D] p-3 rounded-lg h-56 overflow-y-auto custom-scroll whitespace-pre-wrap">3 Motores Skia C++ (Bespoke 2.5D, Cartoon 2D, Netflix Doc) e Intel QuickSync iHD prontos em standby.</pre>
             </div>
           </div>
 
@@ -262,6 +365,25 @@
         </div>
       </div>
 
+      <!-- ==================== FILA PRONTA DOS 10 DOCUMENTÁRIOS ("DOSSIÊ CAPITAL" BR & "VAULT FILES" US) ==================== -->
+      <div id="twin-channels-doc-queue" class="glass-card-vip p-6 space-y-5">
+        <div class="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <div class="flex items-center gap-2">
+              <span class="text-xs font-extrabold px-2.5 py-1 rounded-full bg-frimegold/20 text-frimegold border border-frimegold/40">2 CANAIS GÊMEOS PRÉ-CADASTRADOS • ALTO RPM</span>
+              <span class="text-xs font-extrabold px-2.5 py-1 rounded-full bg-frimelime/15 text-frimelime border border-frimelime/40">1 Longo 16:9 + 3 Thumbs A/B + 5 Shorts 9:16</span>
+            </div>
+            <h3 class="text-xl font-black text-white mt-2">🎞️ Fila Pronta dos 10 Documentários Investigativos (<span class="text-frimegold">Dossiê Capital</span> BR &amp; <span class="text-frimelime">Vault Files</span> US)</h3>
+            <p class="text-xs text-[#B6A9D4]">Lance qualquer um dos 10 episódios investigativos em Português (BR), Inglês (US Dólar) ou Ambos simultaneamente com 1 clique.</p>
+          </div>
+          <!-- Twin Channel Badges -->
+          <div id="twin-channels-header-cards" class="flex flex-wrap gap-3 text-xs"></div>
+        </div>
+
+        <!-- 10 Documentary Episodes Grid -->
+        <div id="doc-queue-grid" class="grid grid-cols-1 md:grid-cols-2 gap-3.5"></div>
+      </div>
+
       <!-- Recent Productions Strip -->
       <div class="glass-card p-5 space-y-3">
         <div class="flex items-center justify-between">
@@ -281,7 +403,7 @@
               <span class="text-frimegold text-xl">👑</span>
               <h2 class="text-2xl font-black text-white">Central VIP de Vendas e Entregas</h2>
             </div>
-            <p class="text-xs text-[#B6A9D4]">Compare Gancho A vs. Gancho B em 9:16 e baixe o pacote comercial completo em 1 clique.</p>
+            <p class="text-xs text-[#B6A9D4]">Inspecione o vídeo Master, 3 Thumbnails A/B 1280×720, 5 Shorts 9:16 e Dublagem Multi-Idioma em 1 clique.</p>
           </div>
           <div class="flex items-center gap-2">
             <label for="vip-job-select" class="text-xs font-bold text-frimegold uppercase">Vídeo Selecionado:</label>
@@ -289,20 +411,20 @@
           </div>
         </div>
 
-        <!-- Dual 9:16 Player (A vs B) + Commercial Package -->
+        <!-- Dual Player (A vs B) + Commercial Package -->
         <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          <!-- Dual Vertical Players -->
+          <!-- Dual Vertical/Horizontal Players -->
           <div class="lg:col-span-6 grid grid-cols-1 sm:grid-cols-2 gap-4 justify-items-center">
             <div class="space-y-2 text-center w-full flex flex-col items-center">
-              <span class="text-xs font-extrabold px-3 py-1 rounded-full bg-frimepink/20 text-frimepink border border-frimepink/40">VERSÃO A • GANCHO PRINCIPAL</span>
+              <span class="text-xs font-extrabold px-3 py-1 rounded-full bg-frimepink/20 text-frimepink border border-frimepink/40">VERSÃO A • MASTER PRINCIPAL</span>
               <div class="phone-frame">
-                <video id="player-hook-a" controls playsinline class="w-full h-full object-cover bg-black"></video>
+                <video id="player-hook-a" controls playsinline class="w-full h-full object-contain bg-black"></video>
               </div>
             </div>
             <div class="space-y-2 text-center w-full flex flex-col items-center">
               <span class="text-xs font-extrabold px-3 py-1 rounded-full bg-frimelilac/20 text-frimelilac border border-frimelilac/40">VERSÃO B • TESTE A/B (CONCAT COPY)</span>
               <div class="phone-frame">
-                <video id="player-hook-b" controls playsinline class="w-full h-full object-cover bg-black"></video>
+                <video id="player-hook-b" controls playsinline class="w-full h-full object-contain bg-black"></video>
               </div>
             </div>
           </div>
@@ -355,7 +477,7 @@
                 <div id="vip-retention-badge" class="text-[11px] text-frimelime font-bold">🩺 Retention Doctor: Open Loop a cada 15-25s ativo • 0 clichês robóticos</div>
                 <div class="flex flex-wrap gap-2">
                   <button type="button" onclick="openPublishModal('tiktok')" class="btn-lime px-4 py-2.5 text-xs">🚀 Publicar Agora (TikTok)</button>
-                  <button type="button" onclick="openPublishModal('youtube')" class="btn-lime px-4 py-2.5 text-xs">▶ Publicar Shorts</button>
+                  <button type="button" onclick="openPublishModal('youtube')" class="btn-lime px-4 py-2.5 text-xs">▶ Publicar Shorts / YouTube</button>
                   <button type="button" onclick="openPublishModal('facebook')" class="btn-pink-lilac px-4 py-2.5 text-xs">📘 Publicar FB Reels</button>
                 </div>
               </div>
@@ -370,7 +492,7 @@
             <div class="flex flex-wrap items-center justify-between gap-2">
               <div>
                 <h3 class="text-sm font-black uppercase text-frimegold">🖼️ Estúdio de 3 Thumbnails Magnéticas 1280×720 (Teste A/B/C)</h3>
-                <p class="text-[11px] text-[#B6A9D4]">Skia C++ + <code class="text-frimelime">rembg (u2netp)</code> • Sujeito recortado, Tarja True Crime, Setas & Anton/Montserrat-Black (máx 3 palavras).</p>
+                <p class="text-[11px] text-[#B6A9D4]">Skia C++ + <code class="text-frimelime">rembg (u2netp)</code> • Sujeito recortado, Tarja True Crime, Setas &amp; Anton/Montserrat-Black (máx 3 palavras).</p>
               </div>
               <button type="button" id="btn-gen-thumbs" onclick="generateVipThumbnails()" class="btn-gold px-3.5 py-2 text-xs">🖼️ Gerar 3 Thumbnails A/B (1280×720)</button>
             </div>
@@ -386,7 +508,7 @@
                 <h3 class="text-sm font-black uppercase text-frimelime">⚡ Cascata 16:9 → 5 Shorts 9:16</h3>
                 <button type="button" id="btn-extract-shorts" onclick="extract5ViralShorts()" class="btn-lime px-3.5 py-2 text-xs">⚡ Extrair 5 Cortes Virais 9:16 (Zero Tokens)</button>
               </div>
-              <p class="text-[11px] text-[#B6A9D4]">Re-enquadramento inteligente <code class="text-frimelilac">1920×1080 → 1080×1920</code> via MediaPipe / Centro de Interesse + Legenda Vertical + CTA pro vídeo longo.</p>
+              <p class="text-[11px] text-[#B6A9D4]">Re-enquadramento inteligente <code class="text-frimelilac">1920×1080 → 1080×1920</code> via MediaPipe / Saliency + Legenda Vertical + CTA pro vídeo longo.</p>
               <div id="vip-shorts-list" class="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1"></div>
             </div>
 
@@ -395,7 +517,7 @@
                 <h3 class="text-sm font-black uppercase text-frimelilac">🌎 Dublagem Multi-Idioma (USD / EUR)</h3>
                 <button type="button" id="btn-dub-langs" onclick="dubVipJobLanguages()" class="btn-pink-lilac px-3.5 py-1.5 text-xs">🌎 Clonar EN-US + ES Agora</button>
               </div>
-              <p class="text-[11px] text-[#B6A9D4]">Tradução cultural (&lt;500 tokens) + vozes nativas + Re-Timing automático de cenas e Lip-Sync 2D.</p>
+              <p class="text-[11px] text-[#B6A9D4]">Tradução cultural (&lt;500 tokens) + vozes nativas + Re-Timing matemático de cenas e Lip-Sync 2D.</p>
               <div id="vip-dubs-list" class="flex flex-wrap gap-2 pt-1"></div>
             </div>
           </div>
@@ -433,6 +555,7 @@
               <select id="b2b-style" class="fr-input">
                 <option value="cinematic_broll">🎬 Comercial Dinâmico Real HD + Card de Oferta Local</option>
                 <option value="cartoon_2d">🎭 Animação 2D Cartoon Humor Comercial (60 FPS)</option>
+                <option value="netflix_doc">🎞️ Mini-Doc Institucional de Autoridade (Netflix Style)</option>
               </select>
             </div>
 
@@ -470,8 +593,8 @@
         <div class="lg:col-span-7 glass-card p-6 space-y-5">
           <div class="flex items-center justify-between">
             <div>
-              <h2 class="text-xl font-black text-white">Estúdio de Clientes & Canais</h2>
-              <p class="text-xs text-[#B6A9D4]">Configure presets, LUTs, Voice Blender PT-BR, Proxy GeoIP e contas Stealth.</p>
+              <h2 class="text-xl font-black text-white">Estúdio de Clientes &amp; Canais Gêmeos</h2>
+              <p class="text-xs text-[#B6A9D4]">Inclui os 2 canais de alto RPM pré-cadastrados (<strong class="text-frimegold">Dossiê Capital</strong> BR e <strong class="text-frimelime">Vault Files</strong> US).</p>
             </div>
             <button type="button" onclick="resetClientForm()" class="btn-ghost px-3 py-1.5 text-xs font-bold">+ Novo Cliente</button>
           </div>
@@ -482,11 +605,11 @@
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label for="cli-name" class="block text-xs font-bold text-frimelilac uppercase mb-1">Nome do Cliente / Canal</label>
-              <input id="cli-name" type="text" class="fr-input" placeholder="Ex: Clínica Estética Prime" />
+              <input id="cli-name" type="text" class="fr-input" placeholder="Ex: Dossiê Capital ou Vault Files" />
             </div>
             <div>
               <label for="cli-niche" class="block text-xs font-bold text-frimelilac uppercase mb-1">Nicho de Mercado</label>
-              <input id="cli-niche" type="text" class="fr-input" placeholder="Ex: Saúde, Finanças, Negócio Local" />
+              <input id="cli-niche" type="text" class="fr-input" placeholder="Ex: 16:9 Documentário Cinema" />
             </div>
             <div>
               <label for="cli-lut" class="block text-xs font-bold text-frimegold uppercase mb-1">3D LUT de Cinema (.cube)</label>
@@ -511,23 +634,23 @@
             </div>
           </div>
 
-          <!-- Voice Blender PT-BR -->
+          <!-- Voice Blender PT-BR / EN-US -->
           <div class="p-4 rounded-xl bg-[#0B0713]/85 border border-frimelilac/25 space-y-4">
             <div class="flex flex-wrap items-center justify-between gap-2">
-              <h3 class="text-sm font-extrabold text-white">🎙️ Voice Blender PT-BR (Kokoro OpenVINO + Edge-TTS)</h3>
+              <h3 class="text-sm font-extrabold text-white">🎙️ Voice Blender PT-BR &amp; US (Kokoro OpenVINO + Edge-TTS)</h3>
               <button type="button" id="btn-voice-preview" onclick="previewVoice()" class="btn-pink-lilac px-3.5 py-1.5 text-xs">▶ Ouvir Prévia</button>
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label for="cli-voice-engine" class="block text-[11px] font-bold text-[#B6A9D4] mb-1">Motor de Voz</label>
                 <select id="cli-voice-engine" class="fr-input" onchange="syncVoiceListForEngine()">
-                  <option value="gemini_tts">Google Gemini TTS Expressivo (Atuação Real PT-BR)</option>
-                  <option value="edge">Edge-TTS Instantâneo (WordBoundary 0.1s)</option>
+                  <option value="gemini_tts">Google Gemini TTS Expressivo (Atuação Real)</option>
+                  <option value="edge">Edge-TTS Instantâneo (PT-BR Antonio / EN-US Andrew)</option>
                   <option value="kokoro">Kokoro-ONNX + OpenVINO (Voice Blender Local)</option>
                 </select>
               </div>
               <div>
-                <label for="cli-voice-id" class="block text-[11px] font-bold text-[#B6A9D4] mb-1">Voz Principal PT-BR</label>
+                <label for="cli-voice-id" class="block text-[11px] font-bold text-[#B6A9D4] mb-1">Voz Principal</label>
                 <select id="cli-voice-id" class="fr-input"></select>
               </div>
             </div>
@@ -561,11 +684,11 @@
           <button type="button" onclick="saveClient()" class="btn-lime w-full py-3.5 text-sm">💾 SALVAR CONFIGURAÇÃO DO CLIENTE</button>
         </div>
 
-        <!-- 7 Visual Presets Selector -->
+        <!-- Visual Presets Selector (includes Cloned DNA Presets!) -->
         <div class="lg:col-span-5 glass-card p-6 space-y-4">
           <div>
-            <h3 class="text-lg font-black text-white">7 Presets Visuais <span class="text-frimegold">1-Clique</span></h3>
-            <p class="text-xs text-[#B6A9D4]">Clique para aplicar tipografia, cores, LUT e trilha sonora do canal.</p>
+            <h3 class="text-lg font-black text-white">Presets Visuais &amp; DNA Clonado <span class="text-frimegold">1-Clique</span></h3>
+            <p class="text-xs text-[#B6A9D4]">Clique para aplicar tipografia, cores, LUT e trilha sonora do canal (inclui Presets salvos pelo Clonador de DNA).</p>
           </div>
           <input type="hidden" id="cli-preset-id" value="frimerise_signature" />
           <div id="presets-grid" class="space-y-2.5 max-h-[680px] overflow-y-auto custom-scroll pr-1"></div>
@@ -600,7 +723,7 @@
               <select id="fb-platform" class="fr-input">
                 <option value="tiktok">TikTok</option>
                 <option value="reels">Instagram / FB Reels</option>
-                <option value="shorts">YouTube Shorts</option>
+                <option value="shorts">YouTube / Shorts</option>
               </select>
               <select id="fb-variant" class="fr-input">
                 <option value="A">Gancho A</option>
@@ -630,7 +753,10 @@
             <h2 class="text-xl font-black text-white">Setup Rápido 1-Clique <span class="text-frimelime">(Zero Terminal / Zero .env)</span></h2>
             <p class="text-xs text-[#B6A9D4]">Todas as chaves são opcionais e ficam salvas localmente em <code class="text-frimelilac">data/frimerise.db</code>.</p>
           </div>
-          <button type="button" onclick="testSetup()" class="btn-pink-lilac px-4 py-2.5 text-xs">🔍 Testar Conexões & Hardware</button>
+          <div class="flex gap-2">
+            <button type="button" onclick="loginGoogleFlow('flow')" class="btn-gold px-3.5 py-2.5 text-xs">🌊 Conectar Google Flow Pro</button>
+            <button type="button" onclick="testSetup()" class="btn-pink-lilac px-4 py-2.5 text-xs">🔍 Testar Conexões &amp; Hardware</button>
+          </div>
         </div>
 
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -677,7 +803,7 @@
           </div>
 
           <div>
-            <label for="set-ollama" class="block text-xs font-bold text-frimelilac mb-1">URL Ollama Local & Limite Térmico (°C)</label>
+            <label for="set-ollama" class="block text-xs font-bold text-frimelilac mb-1">URL Ollama Local &amp; Limite Térmico (°C)</label>
             <div class="flex gap-2">
               <input id="set-ollama" type="text" class="fr-input" value="http://localhost:11434" />
               <input id="set-thermal" type="number" min="70" max="95" class="fr-input !w-24 text-center" value="85" title="Pausa Térmica Core i5 (°C)" />
@@ -687,7 +813,7 @@
 
         <div id="setup-test-results" class="hidden grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs"></div>
 
-        <button type="button" onclick="saveSettingsForm()" class="btn-lime w-full py-3.5 text-sm">💾 SALVAR CHAVES & PREFERÊNCIAS</button>
+        <button type="button" onclick="saveSettingsForm()" class="btn-lime w-full py-3.5 text-sm">💾 SALVAR CHAVES &amp; PREFERÊNCIAS</button>
       </div>
     </section>
   </main>
@@ -710,7 +836,7 @@
             <label for="pub-platform" class="block font-bold text-frimepink mb-1">Plataforma</label>
             <select id="pub-platform" class="fr-input">
               <option value="tiktok">TikTok (_tiktok.mp4)</option>
-              <option value="youtube">YouTube Shorts (_shorts.mp4)</option>
+              <option value="youtube">YouTube / Shorts (_shorts.mp4)</option>
               <option value="facebook">Facebook Reels (_reels.mp4 • TZ Shanghai)</option>
             </select>
           </div>
@@ -720,7 +846,7 @@
           </div>
         </div>
         <div>
-          <label for="pub-caption" class="block font-bold text-frimelilac mb-1">Legenda & Hashtags</label>
+          <label for="pub-caption" class="block font-bold text-frimelilac mb-1">Legenda &amp; Hashtags</label>
           <textarea id="pub-caption" rows="3" class="fr-input" placeholder="Descrição viral + #hashtags"></textarea>
         </div>
         <p class="text-[11px] text-[#B6A9D4]">🛡️ 1 navegador Camoufox por vez (<code class="text-frimelime">asyncio.Lock</code>) + Aquecedor Orgânico de 3 min + Proxy GeoIP.</p>
@@ -733,6 +859,6 @@
     </div>
   </dialog>
 
-  <script src="/static/app.js?v=4"></script>
+  <script src="/static/app.js?v=5"></script>
 </body>
 </html>

@@ -1,17 +1,18 @@
-"""FrimeRise End-to-End Video Manufacturing Pipeline (Real Footage + Hormozi Captions Edition).
-Orchestrates:
-  Script (clean complete ending, zero debug labels) ->
-  Broadcast Audio + VAD + 0.40s clean tail & fadeout ->
-  Zero-Key Real Footage (Pixabay -> Pexels -> yt-dlp -> Wikimedia -> Archive) changing every 3-4s
-    + 9:16 Smart Crop + Subpixel Zoom + 3D LUT + xfade + whoosh SFX ->
-  C++ Skia Compositor (Heavy Montserrat-Black 900 Hormozi captions + 2.5-3.5s auto-wrapped Motion Cards
-    with dynamic boxblur depth-of-field, ZERO watermark on Master) ->
-  Intel QuickSync VAAPI -> Dual-Hook A/B Splice -> 3 ShadowHash Mutations ->
-  540p WhatsApp Watermarked Preview -> CapCut ZIP -> Kdenlive OTIO -> Clean 9:16 HD Cover.
+"""FrimeRise End-to-End Video Manufacturing Pipeline (3 Master Engines + Twin Channels Edition).
+Orchestrates all 3 Master Engines:
+  1. cinematic_broll: Vídeo Dinâmico Viral / Bespoke 2.5D + Hormozi Captions + 3D LUT + Motion Cards
+  2. cartoon_2d: Animação 2D Cartoon Multi-Personagens (60 FPS, Line Boil 8fps, Rhubarb 9-Visemas)
+  3. netflix_doc: Documentário Cinema Netflix / MagnatesMedia 16:9 & 9:16 (Cold Open, Capítulos, 5 Modos Skia)
+Plus:
+  - 3 Magnetic 1280x720 A/B/C Thumbnails (with exact 3-word hooks)
+  - Cascade 16:9 -> 5 Vertical Shorts 9:16 (Zero Tokens)
+  - Multi-Language Dubbing & Re-Timing (PT-BR / EN-US / ES)
+  - ShadowHash 3 Mutations + 540p WhatsApp Preview + CapCut ZIP + Kdenlive OTIO
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import uuid
 from datetime import datetime
@@ -36,7 +37,7 @@ from engine.exporters import (
     export_whatsapp_preview_540p,
     splice_dual_hook_b,
 )
-from engine.global_scaler import dub_video_job_multi_language
+from engine.global_scaler import dub_video_job_multi_language, extract_5_viral_shorts_from_16x9
 from engine.intel_vaapi import read_cpu_temperature_c, run_ffmpeg_safe
 from engine.skia_compositor import SkiaMotionCompositor, render_cover_9x16
 from engine.smart_vision import (
@@ -48,6 +49,28 @@ from engine.smart_vision import (
 from engine.thumbnail_studio import generate_ab_thumbnails_16x9
 from engine.viral_cloner import VideoDNAExtractor
 from publisher.shadowhash import generate_shadowhash_variants
+
+# Defensive imports for Worker 1-4 modules
+try:
+    from engine.netflix_doc_studio import generate_netflix_doc_plan, render_netflix_documentary
+except ImportError:
+    generate_netflix_doc_plan = None  # type: ignore
+    render_netflix_documentary = None  # type: ignore
+
+try:
+    from agents.retention_doctor import audit_netflix_doc_plan
+except ImportError:
+    audit_netflix_doc_plan = None  # type: ignore
+
+try:
+    from engine.flow_vault import fetch_or_generate_flow_music
+except ImportError:
+    fetch_or_generate_flow_music = None  # type: ignore
+
+try:
+    from engine.bespoke_visuals import render_bespoke_25d_scene
+except ImportError:
+    render_bespoke_25d_scene = None  # type: ignore
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ASSETS_DIR = BASE_DIR / "assets"
@@ -62,14 +85,32 @@ def _rel_output(path: Path) -> str:
         return str(path)
 
 
+def _call_generate_ab_thumbnails(
+    master_mp4: Path,
+    title: str,
+    job_dir: Path,
+    custom_3words: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Call generate_ab_thumbnails_16x9 supporting both custom_3words and legacy 3-arg signature."""
+    if custom_3words:
+        try:
+            sig = inspect.signature(generate_ab_thumbnails_16x9)
+            if "custom_3words" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                return generate_ab_thumbnails_16x9(master_mp4, title, job_dir, custom_3words=custom_3words)
+        except Exception:
+            pass
+    return generate_ab_thumbnails_16x9(master_mp4, title, job_dir)
+
+
 def _schedule_motion_cards(raw_cards: List[Dict[str, Any]], duration_s: float) -> List[Dict[str, Any]]:
     """Schedule 1-2 short punchy Motion Graphics Cards (strictly 2.5s to 3.5s each) over real footage."""
     if not raw_cards or duration_s < 8.0:
         return []
-    # Prefer bar_chart & counter data cards; show max 2 brief cards spaced well apart so footage breathes
     n = min(2, len(raw_cards))
     scheduled = []
-    card_dur = 3.0  # Strictly inside 2.5s - 3.5s
+    card_dur = 3.0
     anchors = [duration_s * 0.34, duration_s * 0.68] if n == 2 else [duration_s * 0.45]
     for idx in range(n):
         card = dict(raw_cards[idx])
@@ -90,7 +131,7 @@ async def run_video_job(
     mode: str = "single",
     options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Execute a complete FrimeRise manufacturing job with real HD footage and clean broadcast polish."""
+    """Execute a complete FrimeRise manufacturing job across all 3 Master Engines."""
     opts = options or {}
     use_motion_cards = bool(opts.get("motion_cards", True))
     seamless_loop = bool(opts.get("seamless_loop", True))
@@ -99,11 +140,21 @@ async def run_video_job(
     reference_mp4_path = str(opts.get("reference_mp4_path", "")).strip()
     custom_script = opts.get("custom_script")
     engine_style = str(opts.get("engine_style", "cinematic_broll")).strip()
+    if engine_style not in ("cinematic_broll", "cartoon_2d", "netflix_doc"):
+        engine_style = "cinematic_broll"
     aspect_ratio = "16:9" if str(opts.get("aspect_ratio", "9:16")) == "16:9" else "9:16"
+    if engine_style == "netflix_doc" and not opts.get("aspect_ratio"):
+        aspect_ratio = "16:9"
     cartoon_tone = str(opts.get("cartoon_tone", "Comédia Nordestina/BR")).strip()
     cartoon_fps = 60 if int(opts.get("cartoon_fps", 60)) >= 60 else 30
     cartoon_voice_engine = str(opts.get("cartoon_voice_engine", "gemini_tts")).strip()
     clone_languages = bool(opts.get("clone_languages", False))
+    flow_mode = str(opts.get("flow_mode", "economico_pro")).strip()
+    max_credits_cap = int(opts.get("max_credits_cap", 45) or 45)
+    use_flow_music = bool(opts.get("use_flow_music", False))
+    thumb_3words = str(opts.get("thumb_3words") or "").strip() or None
+    auto_shorts_cascade = bool(opts.get("auto_shorts_cascade", engine_style == "netflix_doc"))
+    target_minutes = float(opts.get("target_minutes") or 0.5)
 
     job_dir = OUTPUTS_DIR / job_id
     work_dir = job_dir / "_work"
@@ -118,14 +169,17 @@ async def run_video_job(
 
     try:
         update_job(job_id, status="running", progress=5, stage="Analisando DNA & Roteirizando")
-        append_job_log(job_id, f"Iniciando fabricação | Cliente: {client['name']} | Estilo: {engine_style} | Formato: {aspect_ratio}")
+        append_job_log(
+            job_id,
+            f"Iniciando fabricação | Cliente: {client['name']} | Motor: {engine_style} | Formato: {aspect_ratio} | Flow: {flow_mode}",
+        )
 
         reference_transcript = ""
         detected_dna: Optional[Dict[str, Any]] = None
         if mode == "clone_url" and (source_url or reference_mp4_path):
             extractor = VideoDNAExtractor()
             if reference_mp4_path and (BASE_DIR / reference_mp4_path).exists():
-                append_job_log(job_id, f"Analisando DNA do MP4 enviado via VideoDNAExtractor...", progress=10, stage="Extraindo DNA do Vídeo")
+                append_job_log(job_id, "Analisando DNA do MP4 enviado via VideoDNAExtractor...", progress=10, stage="Extraindo DNA do Vídeo")
                 detected_dna = await asyncio.to_thread(extractor.extract_from_local_mp4, BASE_DIR / reference_mp4_path, topic)
             elif source_url:
                 append_job_log(job_id, f"Clonando URL via VideoDNAExtractor ({source_url})...", progress=10, stage="Extraindo DNA da URL Viral")
@@ -136,19 +190,28 @@ async def run_video_job(
                 if not topic or topic.lower().startswith("clone viral"):
                     topic = detected_dna.get("title", "Conteúdo Viral Clonado")
                     update_job(job_id, topic=topic)
-                dna_style = detected_dna.get("style", "live_action_broll")
+                dna_style = str(
+                    detected_dna.get("classified_engine")
+                    or detected_dna.get("engine_classification")
+                    or detected_dna.get("style", "live_action_broll")
+                ).lower()
                 append_job_log(
                     job_id,
                     f"VideoDNAExtractor detectou: {dna_style} (confiança={detected_dna.get('confidence', 0):.0%}, "
-                    f"falantes≈{detected_dna.get('estimated_speakers', 2)}, tom='{detected_dna.get('detected_tone', '')}')",
+                    f"cadência={detected_dna.get('scene_cadence', {})}, tom='{detected_dna.get('detected_tone', '')}')",
                 )
-                if dna_style == "2d_cartoon_animation":
+                if dna_style in ("2d_cartoon_animation", "2d_cartoon", "cartoon_2d"):
                     engine_style = "cartoon_2d"
                     if not opts.get("cartoon_tone"):
                         cartoon_tone = detected_dna.get("detected_tone", cartoon_tone)
                     if not opts.get("aspect_ratio") and detected_dna.get("aspect_ratio") in ("9:16", "16:9"):
                         aspect_ratio = detected_dna["aspect_ratio"]
                     append_job_log(job_id, "Chaveamento automático ativado -> Motor Animação 2D Cartoon (cartoon_2d_studio.py)!")
+                elif dna_style in ("netflix_doc", "documentary", "investigative_doc"):
+                    engine_style = "netflix_doc"
+                    if not opts.get("aspect_ratio") and detected_dna.get("aspect_ratio") in ("9:16", "16:9"):
+                        aspect_ratio = detected_dna["aspect_ratio"]
+                    append_job_log(job_id, "Chaveamento automático ativado -> Motor Documentário Cinema Netflix (netflix_doc_studio.py)!")
 
         # =====================================================================
         # BRANCH A: 2D CARTOON ANIMATION STUDIO (Blueprint Exact-Duration Clone OR Fresh Episode)
@@ -156,12 +219,15 @@ async def run_video_job(
         if engine_style == "cartoon_2d":
             master_mp4 = job_dir / "master.mp4"
             music_file = ASSETS_DIR / "music" / preset.get("music_file", "corporate_focus.mp3")
+            if use_flow_music and fetch_or_generate_flow_music is not None:
+                try:
+                    music_file = await fetch_or_generate_flow_music(cartoon_tone, 35.0)
+                except Exception:
+                    pass
 
             def _cb(pct: int, msg: str) -> None:
                 append_job_log(job_id, msg, progress=pct, stage=msg[:60])
 
-            # If we reverse-engineered a reference VideoBlueprint with scenes & segments, mirror its EXACT
-            # duration, aspect ratio, header bar, scene cuts & animation beats with original anti-plagiarism visuals!
             if detected_dna and detected_dna.get("scenes"):
                 append_job_log(
                     job_id,
@@ -192,8 +258,14 @@ async def run_video_job(
                 )
                 aspect_ratio = render_info["aspect_ratio"]
                 ep_title = render_info.get("header_title") or topic
+                plan = None
             else:
-                append_job_log(job_id, f"Gerando episódio Cartoon 2D v2 ({aspect_ratio} @ {cartoon_fps}fps | Voz: {cartoon_voice_engine} | Tom: {cartoon_tone})...", progress=15, stage="Roteirizando Diálogos Multi-Personagens")
+                append_job_log(
+                    job_id,
+                    f"Gerando episódio Cartoon 2D v2 ({aspect_ratio} @ {cartoon_fps}fps | Voz: {cartoon_voice_engine} | Tom: {cartoon_tone})...",
+                    progress=15,
+                    stage="Roteirizando Diálogos Multi-Personagens",
+                )
                 plan, llm_meta = await asyncio.to_thread(
                     generate_cartoon_episode_plan,
                     topic=topic,
@@ -283,21 +355,19 @@ async def run_video_job(
                 frame_snap if frame_snap.exists() else None,
             )
 
-            # Automatic 3 Magnetic 1280x720 A/B/C Thumbnails when aspect_ratio == 16:9 (or requested)
-            ab_thumbs: Dict[str, str] = {}
-            if aspect_ratio == "16:9" or opts.get("generate_thumbnails_ab"):
+            ab_thumbs: Dict[str, Any] = {}
+            if aspect_ratio == "16:9" or opts.get("generate_thumbnails_ab") or thumb_3words:
                 append_job_log(job_id, "Gerando 3 Thumbnails Magnéticas 1280x720 (Skia C++ + rembg u2netp)...", progress=93, stage="Gerando 3 Thumbnails A/B 1280x720")
-                raw_thumbs = await asyncio.to_thread(generate_ab_thumbnails_16x9, master_mp4, ep_title, job_dir)
+                raw_thumbs = await asyncio.to_thread(_call_generate_ab_thumbnails, master_mp4, ep_title, job_dir, thumb_3words)
                 ab_thumbs = {
                     "thumb_a": _rel_output(Path(raw_thumbs["thumb_a"])),
                     "thumb_b": _rel_output(Path(raw_thumbs["thumb_b"])),
                     "thumb_c": _rel_output(Path(raw_thumbs["thumb_c"])),
-                    "headline_words": raw_thumbs["headline_words"],
+                    "headline_words": raw_thumbs.get("headline_words", thumb_3words or ""),
                 }
 
-            # Automatic Multi-Language Dubbing & Re-Timing (EN-US + ES) when clone_languages=True
             dubbed_langs: Dict[str, Any] = {}
-            if clone_languages and not (detected_dna and detected_dna.get("scenes")):
+            if clone_languages and plan is not None:
                 append_job_log(job_id, "🌎 Clonando Idiomas (Inglês US + Espanhol) com Re-Timing & Lip-Sync 2D...", progress=95, stage="Dublando EN-US + ES & Re-Timing Lip-Sync")
                 dubbed_raw = await dub_video_job_multi_language(
                     job_dir=job_dir,
@@ -316,6 +386,7 @@ async def run_video_job(
             quality_report = {
                 "job_id": job_id,
                 "engine_style": "cartoon_2d",
+                "flow_mode": flow_mode,
                 "cartoon_engine": render_info.get("cartoon_engine", "cartoon_studio_v2_line_boil_2.5d"),
                 "clone_mode": "blueprint_exact_duration" if (detected_dna and detected_dna.get("scenes")) else "fresh_episode",
                 "aspect_ratio": aspect_ratio,
@@ -358,10 +429,235 @@ async def run_video_job(
                 duration_s=round(duration_s, 2),
                 completed_at=now_done,
             )
-            append_job_log(job_id, f"ANIMAÇÃO 2D FINALIZADA COM SUCESSO! ({duration_s:.1f}s | {vid_w}x{vid_h} | 6-Viseme Lip-Sync)", progress=100)
+            append_job_log(job_id, f"ANIMAÇÃO 2D FINALIZADA COM SUCESSO! ({duration_s:.1f}s | {vid_w}x{vid_h} | 9-Viseme Lip-Sync)", progress=100)
             return {"job_id": job_id, "status": "completed", "engine_style": "cartoon_2d", "master_path": str(master_mp4)}
 
-        # 1. Script generation (guaranteed complete final sentence, zero debug text)
+        # =====================================================================
+        # BRANCH B: NETFLIX / MAGNATESMEDIA CINEMA DOCUMENTARY STUDIO (16:9 & 9:16)
+        # =====================================================================
+        if engine_style == "netflix_doc":
+            if generate_netflix_doc_plan is None or render_netflix_documentary is None:
+                raise RuntimeError("Módulo engine/netflix_doc_studio.py não disponível.")
+
+            voice_id_client = str(client.get("voice_id") or "")
+            doc_lang = str(
+                opts.get("doc_lang")
+                or ("en_us" if "en-us" in voice_id_client.lower() or client.get("name") == "Vault Files" else "pt_br")
+            ).strip()
+            master_mp4 = job_dir / "master.mp4"
+            music_file = ASSETS_DIR / "music" / preset.get("music_file", "epic_doc.mp3")
+            if use_flow_music and fetch_or_generate_flow_music is not None:
+                try:
+                    music_file = await fetch_or_generate_flow_music("dark investigative documentary cinema", 45.0)
+                except Exception:
+                    pass
+
+            def _doc_cb(pct: int, msg: str) -> None:
+                append_job_log(job_id, msg, progress=pct, stage=msg[:60])
+
+            append_job_log(
+                job_id,
+                f"Gerando roteiro documental investigativo ({aspect_ratio} | Idioma: {doc_lang} | LUT: {lut_file})...",
+                progress=14,
+                stage="Estruturando Cold Open & Capítulos Netflix Doc",
+            )
+            maybe_plan = generate_netflix_doc_plan(
+                topic=topic,
+                aspect_ratio=aspect_ratio,
+                target_minutes=target_minutes,
+                lang=doc_lang,
+            )
+            if inspect.isawaitable(maybe_plan):
+                doc_plan = await maybe_plan
+            else:
+                doc_plan = maybe_plan
+
+            if not isinstance(doc_plan, dict):
+                doc_plan = doc_plan.model_dump() if hasattr(doc_plan, "model_dump") else dict(doc_plan)
+
+            if audit_netflix_doc_plan is not None:
+                try:
+                    doc_plan = audit_netflix_doc_plan(doc_plan)
+                except Exception:
+                    pass
+
+            update_job(
+                job_id,
+                script_json=json.dumps(doc_plan, ensure_ascii=False),
+                tokens_used=int(doc_plan.get("tokens_used", 0)),
+                cost_usd=float(doc_plan.get("cost_usd", 0.0)),
+            )
+
+            append_job_log(
+                job_id,
+                f"Renderizando Documentário Cinema '{doc_plan.get('title', topic)}' em Skia C++ (Cold Open + Capítulos + 5 Modos Investigativos)...",
+                progress=22,
+                stage="Renderizando Cenas Investigativas Skia C++",
+            )
+            render_info = await render_netflix_documentary(
+                plan=doc_plan,
+                work_dir=work_dir,
+                out_master_mp4=master_mp4,
+                music_mp3=music_file,
+                fps=30,
+                thermal_limit_c=thermal_limit,
+                progress_cb=_doc_cb,
+            )
+
+            duration_s = float(render_info.get("duration_s", 25.0))
+            master_audio = Path(render_info.get("master_audio") or (work_dir / "master_audio.m4a"))
+            words_a = render_info.get("words", [])
+            vid_w = int(render_info.get("width", 1920 if aspect_ratio == "16:9" else 1080))
+            vid_h = int(render_info.get("height", 1080 if aspect_ratio == "16:9" else 1920))
+            doc_title = str(doc_plan.get("title") or topic)
+
+            append_job_log(job_id, "Aplicando ShadowHash (3 mutações iPhone 16 Pro)...", progress=82, stage="Gerando Mutações ShadowHash")
+            sh_variants = await asyncio.to_thread(generate_shadowhash_variants, master_mp4, job_dir)
+
+            append_job_log(job_id, "Empacotando Central VIP (Prévia 540p, CapCut .zip, Kdenlive .otio, Capa HD)...", progress=88, stage="Exportando Pacote Comercial VIP")
+            preview_mp4 = job_dir / "preview_540p.mp4"
+            await asyncio.to_thread(export_whatsapp_preview_540p, master_mp4, preview_mp4, watermark_text, aspect_ratio)
+
+            capcut_zip = job_dir / "capcut_project.zip"
+            if master_audio.exists():
+                await asyncio.to_thread(
+                    export_capcut_zip,
+                    f"FrimeRise_Doc_{job_id[:8]}",
+                    master_mp4,
+                    master_audio,
+                    music_file,
+                    words_a,
+                    duration_s,
+                    capcut_zip,
+                    vid_w,
+                    vid_h,
+                )
+            otio_path = job_dir / "timeline.otio"
+            if master_audio.exists():
+                await asyncio.to_thread(
+                    export_kdenlive_otio,
+                    doc_title,
+                    master_mp4,
+                    master_audio,
+                    music_file,
+                    words_a,
+                    duration_s,
+                    otio_path,
+                )
+
+            frame_snap = work_dir / "cover_bg.png"
+            try:
+                await asyncio.to_thread(
+                    run_ffmpeg_safe,
+                    ["ffmpeg", "-y", "-v", "error", "-ss", f"{min(2.5, duration_s * 0.25):.2f}", "-i", str(master_mp4), "-frames:v", "1", str(frame_snap)],
+                )
+            except Exception:
+                frame_snap = Path("")
+
+            cover_png = job_dir / "cover_9x16.png"
+            await asyncio.to_thread(
+                render_cover_9x16,
+                doc_title,
+                "",
+                preset,
+                cover_png,
+                frame_snap if frame_snap.exists() else None,
+            )
+
+            # 3 Magnetic 1280x720 A/B/C Thumbnails with custom 3-word hook
+            append_job_log(
+                job_id,
+                f"Gerando 3 Thumbnails Magnéticas 1280x720 (Texto 3-palavras: '{thumb_3words or doc_title[:22]}')...",
+                progress=92,
+                stage="Gerando 3 Thumbnails A/B 1280x720",
+            )
+            raw_thumbs = await asyncio.to_thread(_call_generate_ab_thumbnails, master_mp4, doc_title, job_dir, thumb_3words)
+            ab_thumbs_doc = {
+                "thumb_a": _rel_output(Path(raw_thumbs["thumb_a"])),
+                "thumb_b": _rel_output(Path(raw_thumbs["thumb_b"])),
+                "thumb_c": _rel_output(Path(raw_thumbs["thumb_c"])),
+                "headline_words": raw_thumbs.get("headline_words", thumb_3words or ""),
+            }
+
+            # Cascade 16:9 -> 5 Vertical Shorts 9:16 (Zero Tokens)
+            shorts_cascade: List[Dict[str, Any]] = []
+            if auto_shorts_cascade and aspect_ratio == "16:9":
+                append_job_log(job_id, "⚡ Extraindo Cascata de 5 Shorts Virais 9:16 (Zero Tokens)...", progress=95, stage="Extraindo 5 Cortes Virais 9:16")
+                try:
+                    raw_shorts = await asyncio.to_thread(extract_5_viral_shorts_from_16x9, master_mp4, words_a, job_dir, 5)
+                    for s in raw_shorts:
+                        s["url"] = "/" + _rel_output(Path(s["path"]))
+                    shorts_cascade = raw_shorts
+                except Exception as exc:
+                    append_job_log(job_id, f"Aviso na cascata 9:16: {exc}")
+
+            dubbed_langs_doc: Dict[str, Any] = {}
+            if clone_languages:
+                append_job_log(job_id, "🌎 Clonando Idiomas (Inglês US + Espanhol) com Re-Timing Documental...", progress=97, stage="Dublando EN-US + ES")
+                try:
+                    dubbed_raw = await dub_video_job_multi_language(
+                        job_dir=job_dir,
+                        engine_style="netflix_doc",
+                        script_or_plan_dict=doc_plan,
+                        preset=preset,
+                        languages=("en_us", "es") if doc_lang == "pt_br" else ("pt_br", "es"),
+                        thermal_limit_c=thermal_limit,
+                        progress_cb=lambda m: append_job_log(job_id, m),
+                    )
+                    for lk, lv in dubbed_raw.items():
+                        dubbed_langs_doc[lk] = {**lv, "path": _rel_output(Path(lv["path"]))}
+                except Exception as exc:
+                    append_job_log(job_id, f"Aviso na dublagem documental: {exc}")
+
+            (job_dir / "words.json").write_text(json.dumps(words_a, ensure_ascii=False), encoding="utf-8")
+            quality_report = {
+                "job_id": job_id,
+                "engine_style": "netflix_doc",
+                "flow_mode": flow_mode,
+                "doc_lang": doc_lang,
+                "thumb_3words": thumb_3words,
+                "aspect_ratio": aspect_ratio,
+                "resolution": f"{vid_w}x{vid_h}",
+                "lut_file": lut_file,
+                "chroma_key_filter": "active",
+                "retention_audit": doc_plan.get("retention_audit", {}),
+                "ab_thumbnails": ab_thumbs_doc,
+                "shorts_cascade": shorts_cascade,
+                "dubbed_languages": dubbed_langs_doc,
+                "scenes_count": render_info.get("scenes_count", len(doc_plan.get("scenes", []))),
+                "duration_s": round(duration_s, 2),
+            }
+            (job_dir / "quality_report.json").write_text(json.dumps(quality_report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            now_done = datetime.now().isoformat(timespec="seconds")
+            update_job(
+                job_id,
+                status="completed",
+                progress=100,
+                stage="Documentário Cinema Concluído • 3 Thumbs + 5 Shorts Prontos",
+                master_path=_rel_output(master_mp4),
+                hook_a_path=_rel_output(master_mp4),
+                hook_b_path="",
+                tiktok_path=_rel_output(Path(sh_variants["tiktok"]["path"])),
+                reels_path=_rel_output(Path(sh_variants["reels"]["path"])),
+                shorts_path=_rel_output(Path(sh_variants["shorts"]["path"])),
+                preview_path=_rel_output(preview_mp4),
+                capcut_zip_path=_rel_output(capcut_zip) if capcut_zip.exists() else "",
+                otio_path=_rel_output(otio_path) if otio_path.exists() else "",
+                cover_path=_rel_output(cover_png),
+                duration_s=round(duration_s, 2),
+                completed_at=now_done,
+            )
+            append_job_log(
+                job_id,
+                f"DOCUMENTÁRIO CINEMA FINALIZADO COM SUCESSO! ({duration_s:.1f}s | {vid_w}x{vid_h} | 3 Thumbs A/B + {len(shorts_cascade)} Shorts)",
+                progress=100,
+            )
+            return {"job_id": job_id, "status": "completed", "engine_style": "netflix_doc", "master_path": str(master_mp4)}
+
+        # =====================================================================
+        # BRANCH C: CINEMATIC VIRAL / BESPOKE 2.5D ENGINE (cinematic_broll)
+        # =====================================================================
         if custom_script:
             script = custom_script
         else:
@@ -392,7 +688,6 @@ async def run_video_job(
         hook_b_text = str(script.get("hook_b", hook_a_text)).strip()
         body_lines = [str(x).strip() for x in script.get("body_lines", []) if str(x).strip()]
         closing_line = str(script.get("closing_line") or script.get("loop_bridge") or "").strip()
-        # Safety: never leave dangling ellipsis like "porque..."
         if closing_line.endswith("..."):
             closing_line = closing_line.rstrip(".") + " e transforme seus resultados hoje."
         full_text_a = " ".join([hook_a_text, *body_lines, closing_line]).strip()
@@ -412,7 +707,6 @@ async def run_video_job(
             voice_blend=voice_blend,
             prefix="narr_a",
         )
-        # Final video duration includes 0.40s breathing tail for clean audio finish
         duration_s = round(speech_dur + 0.40, 3)
 
         hook_word_count = max(3, len(hook_a_text.split()))
@@ -424,7 +718,7 @@ async def run_video_job(
 
         append_job_log(
             job_id,
-            f"Narração PT-BR concluída ({speech_dur:.2f}s voz + 0.40s cauda = {duration_s:.2f}s | {len(words_a)} palavras)",
+            f"Narração concluída ({speech_dur:.2f}s voz + 0.40s cauda = {duration_s:.2f}s | {len(words_a)} palavras)",
             progress=28,
             stage="Baixando Filmagens Reais HD (Troca a cada ~3.5s)",
         )
@@ -496,6 +790,11 @@ async def run_video_job(
 
         # 4. Broadcast FM Audio Mastering + 0.40s Tail + Smooth Music Fadeout + Timed SFX
         music_file = ASSETS_DIR / "music" / preset.get("music_file", "dark_pulse.mp3")
+        if use_flow_music and fetch_or_generate_flow_music is not None:
+            try:
+                music_file = await fetch_or_generate_flow_music(topic, duration_s)
+            except Exception:
+                pass
         sfx_dir = ASSETS_DIR / "sfx"
         motion_cards = _schedule_motion_cards(script.get("motion_cards", []), duration_s)
 
@@ -584,7 +883,6 @@ async def run_video_job(
             await asyncio.to_thread(prepare_styled_scene, raw_b, bg_b_styled, dur_b, lut_file, n_scenes + 1)
 
             hook_b_intro = work_dir / "hook_b_intro.mp4"
-            # ZERO debug cards on Hook B — clean real footage + Hormozi captions only!
             await asyncio.to_thread(
                 compositor.composite_onto_video,
                 bg_b_styled,
@@ -643,7 +941,6 @@ async def run_video_job(
             otio_path,
         )
 
-        # Extract a clean frame from real footage for editorial 9:16 Cover
         frame_snap = work_dir / "cover_bg.png"
         try:
             await asyncio.to_thread(
@@ -663,15 +960,15 @@ async def run_video_job(
             frame_snap if frame_snap.exists() else None,
         )
 
-        ab_thumbs_live: Dict[str, str] = {}
-        if aspect_ratio == "16:9" or opts.get("generate_thumbnails_ab"):
+        ab_thumbs_live: Dict[str, Any] = {}
+        if aspect_ratio == "16:9" or opts.get("generate_thumbnails_ab") or thumb_3words:
             append_job_log(job_id, "Gerando 3 Thumbnails Magnéticas 1280x720 (Skia C++ + rembg u2netp)...", progress=94, stage="Gerando 3 Thumbnails A/B 1280x720")
-            raw_thumbs = await asyncio.to_thread(generate_ab_thumbnails_16x9, master_mp4, str(script.get("title", topic)), job_dir)
+            raw_thumbs = await asyncio.to_thread(_call_generate_ab_thumbnails, master_mp4, str(script.get("title", topic)), job_dir, thumb_3words)
             ab_thumbs_live = {
                 "thumb_a": _rel_output(Path(raw_thumbs["thumb_a"])),
                 "thumb_b": _rel_output(Path(raw_thumbs["thumb_b"])),
                 "thumb_c": _rel_output(Path(raw_thumbs["thumb_c"])),
-                "headline_words": raw_thumbs["headline_words"],
+                "headline_words": raw_thumbs.get("headline_words", thumb_3words or ""),
             }
 
         dubbed_langs_live: Dict[str, Any] = {}
@@ -692,9 +989,12 @@ async def run_video_job(
         (job_dir / "words.json").write_text(json.dumps(words_a, ensure_ascii=False), encoding="utf-8")
         quality_report = {
             "job_id": job_id,
+            "engine_style": "cinematic_broll",
+            "flow_mode": flow_mode,
+            "max_credits_cap": max_credits_cap,
             "aspect_ratio": aspect_ratio,
             "chroma_key_filter": "active",
-            "chroma_key_threshold": 0.35,
+            "chroma_key_threshold": 0.30,
             "font_verified": compositor.font_info,
             "retention_audit": script.get("retention_audit", {}),
             "ab_thumbnails": ab_thumbs_live,
@@ -732,7 +1032,7 @@ async def run_video_job(
             f"FINALIZADO COM SUCESSO! {n_scenes} cenas reais HD + Legendas Hormozi + Pacote VIP prontos.",
             progress=100,
         )
-        return {"job_id": job_id, "status": "completed", "master_path": str(master_mp4)}
+        return {"job_id": job_id, "status": "completed", "engine_style": "cinematic_broll", "master_path": str(master_mp4)}
 
     except Exception as exc:
         update_job(job_id, status="error", stage=f"Erro: {str(exc)[:100]}")

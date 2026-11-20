@@ -1,10 +1,18 @@
 """FrimeRise Local Commercial SaaS Studio — FastAPI Server (http://localhost:8000).
 100% permissive licenses (MIT / Apache-2.0 / BSD-3).
+Unifies:
+  - 3 Master Engines (cinematic_broll, cartoon_2d, netflix_doc)
+  - 2 Pre-Registered High-RPM Twin Channels ("Dossiê Capital" BR & "Vault Files" US) + 10-Episode Ready Queue
+  - Multimodal URL & .mp4 Cloner with 3x3 Storyboard Contact Sheet X-Ray & 1-Click Save DNA as Preset
+  - Google Flow & Flow Music Pro Controls (10,000 cr badge, 3 Credit-Guarded Modes, Persistent Camoufox Login)
+  - VIP Gallery (3 A/B Thumbnails 1280x720 + 5 Vertical Shorts 9:16 + Multi-Language Dubbing + B2B 1-Click)
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import re
 import shutil
 import uuid
 from datetime import datetime
@@ -13,7 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -23,6 +31,7 @@ from agents.llm_router import list_skills
 from database import (
     create_schedule,
     get_client,
+    get_conn,
     get_job,
     get_preset,
     get_settings,
@@ -44,25 +53,83 @@ from publisher.stealth_uploader import (
     open_stealth_login_session,
     publish_video_stealth,
 )
+from seed_channels import (
+    get_doc_episode,
+    get_twin_channels_queue,
+    seed_twin_channels_and_queue,
+)
+
+# Defensive imports for Worker 1-4 modules
+try:
+    from engine.google_flow_bridge import (
+        FLOW_MODES,
+        get_google_flow_credits_status,
+        open_google_flow_login_session,
+    )
+except ImportError:
+    FLOW_MODES = {
+        "economico_pro": {"id": "economico_pro", "label": "🟢 Econômico Pro (Nano Banana 2 + 2.5D CPU)", "est_credits": 0},
+        "gancho_de_ouro": {"id": "gancho_de_ouro", "label": "🟡 Gancho de Ouro (~15 cr • Veo 3.1 Cena 1)", "est_credits": 15},
+        "cinema_full_veo": {"id": "cinema_full_veo", "label": "🔴 Cinema Full Veo (Com Teto de Créditos)", "est_credits": 45},
+    }
+    get_google_flow_credits_status = None  # type: ignore
+    open_google_flow_login_session = None  # type: ignore
+
+try:
+    from engine.b2b_pitch_maker import generate_b2b_pitch_bundle
+except ImportError:
+    generate_b2b_pitch_bundle = None  # type: ignore
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "assets"
 OUTPUTS_DIR = BASE_DIR / "outputs"
+DATA_DIR = BASE_DIR / "data"
 WEB_DIR = BASE_DIR / "web"
-UPLOAD_LOGOS_DIR = BASE_DIR / "data" / "logos"
+UPLOAD_LOGOS_DIR = DATA_DIR / "logos"
 UPLOAD_LOGOS_DIR.mkdir(parents=True, exist_ok=True)
+(DATA_DIR / "ref_cache").mkdir(parents=True, exist_ok=True)
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="FrimeRise Studio", version="1.0.0")
+app = FastAPI(title="FrimeRise Studio", version="2.0.0")
 
 app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
 app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="outputs")
+app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data")
 templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
 
 # Sequential job queue worker so Acer Aspire 5 Core i5 never overloads RAM/thermals
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 SCHEDULER = AsyncIOScheduler()
+
+
+async def _get_flow_status_safe() -> Dict[str, Any]:
+    """Read Google Flow Pro credit balance & session status with defensive fallback."""
+    default_status = {
+        "credits_remaining": 10000,
+        "credits_total": 10000,
+        "plan": "Google AI Pro",
+        "logged_in": False,
+        "profile_dir": "data/profiles/google_flow_pro",
+        "active_mode": "economico_pro",
+        "modes": FLOW_MODES,
+    }
+    if get_google_flow_credits_status is None:
+        return default_status
+    try:
+        res = get_google_flow_credits_status()
+        if inspect.isawaitable(res):
+            res = await res
+        if isinstance(res, dict):
+            return {
+                **default_status,
+                **res,
+                "credits_remaining": int(res.get("credits_remaining", res.get("credits", 10000))),
+                "credits_total": int(res.get("credits_total", 10000)),
+            }
+    except Exception:
+        pass
+    return default_status
 
 
 async def _job_worker() -> None:
@@ -115,6 +182,7 @@ async def _check_due_schedules() -> None:
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db()
+    seed_twin_channels_and_queue()
     probe_quicksync()
     asyncio.create_task(_job_worker())
     SCHEDULER.add_job(_check_due_schedules, "interval", seconds=45, id="autopilot_tick", replace_existing=True)
@@ -167,12 +235,19 @@ class VoicePreviewPayload(BaseModel):
 class ManufacturePayload(BaseModel):
     client_id: int = 1
     mode: str = "single"  # single | batch | clone_url
-    engine_style: str = "cinematic_broll"  # cinematic_broll | cartoon_2d
+    engine_style: str = "cinematic_broll"  # cinematic_broll | cartoon_2d | netflix_doc
     aspect_ratio: str = "9:16"  # 9:16 | 16:9
     cartoon_tone: str = "Comédia Nordestina/BR"
     cartoon_fps: int = 60  # 30 | 60
     cartoon_voice_engine: str = "gemini_tts"  # gemini_tts | edge
     clone_languages: bool = False  # [🌎 Clonar Idiomas: Inglês (US) + Espanhol]
+    flow_mode: str = "economico_pro"  # economico_pro | gancho_de_ouro | cinema_full_veo
+    max_credits_cap: int = 45
+    use_flow_music: bool = False
+    doc_lang: str = "pt_br"  # pt_br | en_us
+    target_minutes: float = 0.5
+    thumb_3words: Optional[str] = None
+    auto_shorts_cascade: bool = True
     topic: str = ""
     batch_topics: List[str] = []
     source_url: str = ""
@@ -185,11 +260,38 @@ class ManufacturePayload(BaseModel):
     dual_hook_ab: bool = True
 
 
+class DocQueueManufacturePayload(BaseModel):
+    episode_id: int
+    target: str = "both"  # pt_br | en_us | both
+    aspect_ratio: str = "16:9"
+    target_minutes: float = 0.5
+    auto_shorts_cascade: bool = True
+    flow_mode: str = "economico_pro"
+    max_credits_cap: int = 45
+    use_flow_music: bool = False
+
+
+class AnalyzeUrlPayload(BaseModel):
+    source_url: str = ""
+    reference_mp4_path: str = ""
+
+
+class SaveDnaPresetPayload(BaseModel):
+    preset_name: str
+    blueprint: Dict[str, Any] = {}
+
+
+class FlowLoginPayload(BaseModel):
+    target: str = "flow"  # flow | flowmusic
+    warm_seconds: int = 180
+
+
 class B2BProspectPayload(BaseModel):
     client_id: int = 1
     company_name: str
     city: str
     product_service: str
+    niche: str = "Negócio Local"
     engine_style: str = "cinematic_broll"
 
 
@@ -220,7 +322,7 @@ async def index(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Routes: Telemetry & Setup
+# Routes: Telemetry, Google Flow Pro & Setup
 # ---------------------------------------------------------------------------
 @app.get("/api/telemetry")
 async def api_telemetry():
@@ -229,6 +331,7 @@ async def api_telemetry():
     cost = get_total_cost_stats()
     settings = get_settings()
     limit_c = float(settings.get("thermal_limit_c") or 85.0)
+    flow_status = await _get_flow_status_safe()
     return {
         "brand": "FrimeRise",
         "quicksync_on": qs["quicksync_on"],
@@ -244,6 +347,38 @@ async def api_telemetry():
         "total_cost_usd": cost["total_usd"],
         "total_tokens": cost["total_tokens"],
         "jobs_done": cost["jobs_done"],
+        "flow_pro": flow_status,
+    }
+
+
+@app.get("/api/flow/status")
+async def api_flow_status():
+    return await _get_flow_status_safe()
+
+
+@app.post("/api/flow/login")
+async def api_flow_login(payload: FlowLoginPayload, background_tasks: BackgroundTasks):
+    """Launch persistent C++ Camoufox window for Google Flow (flow.google) & Flow Music (flowmusic.app)."""
+    if open_google_flow_login_session is not None:
+        async def _runner():
+            try:
+                res = open_google_flow_login_session(target=payload.target, warm_seconds=payload.warm_seconds)
+                if inspect.isawaitable(res):
+                    await res
+            except Exception as exc:
+                print(f"[GoogleFlow Login] Aviso: {exc}")
+
+        background_tasks.add_task(_runner)
+    else:
+        background_tasks.add_task(open_stealth_login_session, 1, "youtube", payload.warm_seconds)
+
+    return {
+        "status": "launching_camoufox_flow",
+        "target": payload.target,
+        "message": (
+            f"Abrindo navegador blindado Camoufox (perfil persistente data/profiles/google_flow_pro) "
+            f"para autenticar sua assinatura Google AI Pro ({payload.target})."
+        ),
     }
 
 
@@ -269,6 +404,8 @@ async def api_bootstrap_data():
     luts = sorted([p.name for p in (ASSETS_DIR / "luts").glob("*.cube")])
     sfx = sorted([p.name for p in (ASSETS_DIR / "sfx").glob("*.wav")])
     music = sorted([p.name for p in (ASSETS_DIR / "music").glob("*.mp3")])
+    flow_status = await _get_flow_status_safe()
+    doc_queue = get_twin_channels_queue()
     return {
         "settings": get_settings(),
         "presets": list_presets(),
@@ -280,9 +417,84 @@ async def api_bootstrap_data():
         "edge_voices": PT_BR_EDGE_VOICES,
         "gemini_voices": GEMINI_EXPRESSIVE_VOICES,
         "rhubarb_ready": find_rhubarb_binary() is not None,
+        "flow_pro": flow_status,
+        "doc_queue": doc_queue,
         "jobs": [_enrich_job(j) for j in list_jobs(40)],
         "schedules": list_schedules(),
         "feedback": get_feedback_summary(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Routes: Twin Documentary Channels & Ready Queue of 10 Documentaries
+# ---------------------------------------------------------------------------
+@app.get("/api/doc-queue")
+async def api_get_doc_queue():
+    """Return the 2 pre-registered High-RPM Twin Channels ('Dossiê Capital' BR & 'Vault Files' US)
+    and the Ready Queue of 10 Investigative Documentaries.
+    """
+    return get_twin_channels_queue()
+
+
+@app.post("/api/doc-queue/manufacture")
+async def api_manufacture_doc_queue(payload: DocQueueManufacturePayload):
+    """1-Click Launch of any of the 10 pre-seeded Investigative Documentaries in BR ('Dossiê Capital'),
+    US ('Vault Files'), or Both simultaneously!
+    """
+    queue_data = get_twin_channels_queue()
+    ep = get_doc_episode(payload.episode_id)
+    if not ep:
+        raise HTTPException(status_code=404, detail=f"Episódio documental #{payload.episode_id} não encontrado na fila.")
+
+    target = payload.target.lower().strip()
+    if target not in ("pt_br", "en_us", "both"):
+        target = "both"
+
+    langs_to_launch = ["pt_br", "en_us"] if target == "both" else [target]
+    created_jobs: List[Dict[str, Any]] = []
+
+    for lang_key in langs_to_launch:
+        ch = queue_data["channels"][lang_key]
+        client_id = int(ch["client_id"])
+        topic = ep["title_pt"] if lang_key == "pt_br" else ep["title_en"]
+        thumb_hook = ep["thumb_hook_pt"] if lang_key == "pt_br" else ep["thumb_hook_en"]
+        opts = {
+            "engine_style": "netflix_doc",
+            "aspect_ratio": payload.aspect_ratio,
+            "preset_id": ch.get("preset_id", "magnates_doc"),
+            "lut_file": ch.get("lut_file", "02_dark_wealth.cube"),
+            "doc_lang": lang_key,
+            "target_minutes": payload.target_minutes,
+            "thumb_3words": thumb_hook,
+            "auto_shorts_cascade": payload.auto_shorts_cascade,
+            "flow_mode": payload.flow_mode,
+            "max_credits_cap": payload.max_credits_cap,
+            "use_flow_music": payload.use_flow_music,
+            "episode_id": ep["id"],
+            "episode_slug": ep["slug"],
+            "motion_cards": True,
+            "seamless_loop": True,
+            "dual_hook_ab": False,
+        }
+        job = enqueue_new_job(client_id, topic, "10_netflix_investigative_doc", "single", opts)
+        await JOB_QUEUE.put(
+            {
+                "job_id": job["id"],
+                "client_id": client_id,
+                "topic": topic,
+                "skill_id": "10_netflix_investigative_doc",
+                "mode": "single",
+                "options": opts,
+            }
+        )
+        created_jobs.append(job)
+
+    return {
+        "status": "queued",
+        "episode": ep,
+        "target": target,
+        "count": len(created_jobs),
+        "jobs": created_jobs,
     }
 
 
@@ -300,7 +512,6 @@ async def api_test_setup():
     qs = probe_quicksync(force=True)
     settings = get_settings()
 
-    # Real live validation of Gemini (supports BOTH AQ.... and AIza... keys via x-goog-api-key header!), DeepSeek & Pixabay!
     gkey = (settings.get("gemini_api_key") or "").strip()
     gem_ok, gem_detail = False, "Não configurada (opcional)"
     if gkey:
@@ -348,9 +559,9 @@ async def api_test_setup():
 
     checks = {
         "quicksync": {"ok": bool(qs["quicksync_on"]), "detail": str(qs["detail"])},
-        "skia": {"ok": True, "detail": "skia-python C++ (Cartoon v2 Line Boil 8fps + 2.5D Paralaxe)"},
+        "skia": {"ok": True, "detail": "skia-python C++ (3 Motores: Bespoke 2.5D + Cartoon 2D + Netflix Doc)"},
         "rhubarb_lipsync": {"ok": find_rhubarb_binary() is not None, "detail": "Rhubarb v1.14 (MIT • 9 Visemas Fonéticos)" if find_rhubarb_binary() else "Fallback RMS"},
-        "chroma_key_filter": {"ok": True, "detail": "active (bloqueia >35% verde puro G>200,R<80,B<80)"},
+        "chroma_key_filter": {"ok": True, "detail": "active (bloqueia >30% verde puro G>195,R<85,B<85)"},
         "temp_cpu": {"ok": read_cpu_temperature_c() < 85.0, "detail": f"{read_cpu_temperature_c()}°C"},
         "deepseek": {"ok": ds_ok, "detail": ds_detail},
         "gemini": {"ok": gem_ok, "detail": gem_detail},
@@ -416,24 +627,147 @@ async def api_connect_platform(client_id: int, platform: str, background_tasks: 
 
 
 # ---------------------------------------------------------------------------
-# Routes: Multi-Mode Factory (Single, Batch 50, Clone URL)
+# Routes: Multi-Mode Factory (Single, Batch 50, Clone URL + DNA X-Ray + Save Preset)
 # ---------------------------------------------------------------------------
+def _normalize_dna_xray(dna: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure DNA X-Ray response always has contact_sheet_url, scene_cadence, optical_flow, palette, and engine classification."""
+    if not isinstance(dna, dict):
+        return {}
+    cs_path = str(dna.get("contact_sheet_path") or "")
+    if cs_path and not cs_path.startswith("/"):
+        cs_url = "/" + cs_path.lstrip("/")
+    else:
+        cs_url = cs_path
+    blueprint = dna.get("cloned_style_blueprint") or dna.get("blueprint") or {}
+    return {
+        **dna,
+        "contact_sheet_url": cs_url,
+        "scene_cadence": dna.get("scene_cadence") or {
+            "avg_cut_seconds": round(float(dna.get("avg_scene_duration_s") or 2.8), 2),
+            "cuts_count": len(dna.get("scenes") or []) or 6,
+        },
+        "optical_flow": dna.get("optical_flow") or dna.get("camera_motion") or {
+            "dominant_motion": "punch_in",
+            "motion_profile": ["zoom_in", "pan", "punch_in"],
+        },
+        "dominant_palette": dna.get("dominant_palette") or dna.get("palette_hex") or ["#0B0713", "#FF2E93", "#B8FF01", "#FFD166"],
+        "classified_engine": (
+            dna.get("classified_engine")
+            or blueprint.get("classified_engine")
+            or ("cartoon_2d" if dna.get("style") in ("2d_cartoon_animation", "2d_cartoon") else ("netflix_doc" if dna.get("style") == "netflix_doc" else "cinematic_broll"))
+        ),
+    }
+
+
 @app.post("/api/factory/upload-reference")
 async def api_upload_reference_mp4(file: UploadFile = File(...)):
-    """Upload a reference .mp4 and immediately run VideoDNAExtractor to classify live_action vs 2d_cartoon_animation."""
+    """Upload a reference .mp4 and immediately run VideoDNAExtractor for full visual DNA X-Ray."""
     from engine.viral_cloner import VideoDNAExtractor
 
-    ref_dir = BASE_DIR / "data" / "references"
+    ref_dir = DATA_DIR / "references"
     ref_dir.mkdir(parents=True, exist_ok=True)
     ext = Path(file.filename or "ref.mp4").suffix.lower() or ".mp4"
     dest = ref_dir / f"ref_{uuid.uuid4().hex[:8]}{ext}"
     with open(dest, "wb") as f:
         shutil.copyfileobj(file.file, f)
-    dna = await asyncio.to_thread(VideoDNAExtractor().extract_from_local_mp4, dest, Path(file.filename or "Ref").stem)
+    raw_dna = await asyncio.to_thread(VideoDNAExtractor().extract_from_local_mp4, dest, Path(file.filename or "Ref").stem)
+    dna = _normalize_dna_xray(raw_dna)
     return {
         "status": "analyzed",
         "reference_mp4_path": str(dest.relative_to(BASE_DIR)),
         "dna": dna,
+    }
+
+
+@app.post("/api/factory/analyze-url")
+async def api_analyze_reference_url(payload: AnalyzeUrlPayload):
+    """Run VideoDNAExtractor on a competitor URL or local .mp4 to display the 3x3 Contact Sheet X-Ray."""
+    from engine.viral_cloner import VideoDNAExtractor
+
+    extractor = VideoDNAExtractor()
+    if payload.reference_mp4_path and (BASE_DIR / payload.reference_mp4_path).exists():
+        raw_dna = await asyncio.to_thread(extractor.extract_from_local_mp4, BASE_DIR / payload.reference_mp4_path, "Referência MP4")
+    elif payload.source_url.strip():
+        raw_dna = await asyncio.to_thread(extractor.extract_from_url, payload.source_url.strip())
+    else:
+        raise HTTPException(status_code=400, detail="Informe uma URL ou envie um arquivo .mp4 para o Raio-X de DNA.")
+
+    dna = _normalize_dna_xray(raw_dna)
+    return {"status": "analyzed", "dna": dna}
+
+
+@app.post("/api/factory/save-dna-preset")
+async def api_save_dna_as_preset(payload: SaveDnaPresetPayload):
+    """Save the extracted ClonedStyleBlueprint / VideoDNA as a permanent Preset in SQLite (presets table)."""
+    preset_name = payload.preset_name.strip() or f"DNA Clonado {datetime.now().strftime('%H:%M')}"
+    bp = payload.blueprint or {}
+
+    # Try Worker 1's save_blueprint_as_preset helper first
+    saved_preset: Optional[Dict[str, Any]] = None
+    try:
+        from engine.viral_cloner import save_blueprint_as_preset  # type: ignore
+
+        saved_preset = await asyncio.to_thread(save_blueprint_as_preset, bp, preset_name)
+    except Exception:
+        saved_preset = None
+
+    if not saved_preset or not isinstance(saved_preset, dict) or not saved_preset.get("id"):
+        slug = re.sub(r"[^a-z0-9]+", "_", preset_name.lower()).strip("_") or f"dna_{uuid.uuid4().hex[:6]}"
+        preset_id = f"dna_{slug[:24]}_{uuid.uuid4().hex[:4]}"
+        palette = bp.get("dominant_palette") or bp.get("palette_hex") or ["#FF2E93", "#B388FF", "#B8FF01", "#FFD166"]
+        while len(palette) < 4:
+            palette.append("#FFD166")
+        cadence = bp.get("scene_cadence") or {}
+        avg_cut = cadence.get("avg_cut_seconds") or bp.get("avg_scene_duration_s") or 2.8
+        style_tag = bp.get("classified_engine") or bp.get("style") or "dynamic_viral"
+        lut_file = "02_dark_wealth.cube" if style_tag == "netflix_doc" else "01_frimerise_signature.cube"
+        font_file = "Anton-Regular.ttf" if style_tag == "netflix_doc" else "Montserrat-Black.ttf"
+
+        row_dict = {
+            "id": preset_id,
+            "name": preset_name,
+            "tagline": f"DNA Clonado ({style_tag} • cortes a cada {avg_cut}s • OpenCV + 3x3 Vision)",
+            "is_default": 0,
+            "lut_file": lut_file,
+            "font_file": font_file,
+            "music_file": "dark_pulse.mp3",
+            "primary_color": str(palette[0]),
+            "secondary_color": str(palette[1]),
+            "highlight_color": str(palette[2]),
+            "accent_gold": str(palette[3]),
+            "bg_box_color": "#140E24CC",
+            "text_color": "#FFFFFF",
+            "stroke_color": "#0B0713",
+            "caption_style": "hormozi_bounce",
+            "voice_engine": "edge",
+            "voice_id": "pt-BR-AntonioNeural",
+            "voice_blend": json.dumps({"pf_dora": 0.25, "pm_alex": 0.75, "pm_santa": 0.0}),
+            "motion_cards": 1,
+            "sfx_intensity": "high",
+        }
+        with get_conn() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO presets (
+                    id, name, tagline, is_default, lut_file, font_file, music_file,
+                    primary_color, secondary_color, highlight_color, accent_gold,
+                    bg_box_color, text_color, stroke_color, caption_style,
+                    voice_engine, voice_id, voice_blend, motion_cards, sfx_intensity
+                ) VALUES (
+                    :id, :name, :tagline, :is_default, :lut_file, :font_file, :music_file,
+                    :primary_color, :secondary_color, :highlight_color, :accent_gold,
+                    :bg_box_color, :text_color, :stroke_color, :caption_style,
+                    :voice_engine, :voice_id, :voice_blend, :motion_cards, :sfx_intensity
+                )
+                """,
+                row_dict,
+            )
+        saved_preset = get_preset(preset_id)
+
+    return {
+        "status": "saved",
+        "preset": saved_preset,
+        "presets": list_presets(),
     }
 
 
@@ -449,6 +783,13 @@ async def api_manufacture(payload: ManufacturePayload):
         "cartoon_fps": payload.cartoon_fps,
         "cartoon_voice_engine": payload.cartoon_voice_engine,
         "clone_languages": payload.clone_languages,
+        "flow_mode": payload.flow_mode,
+        "max_credits_cap": payload.max_credits_cap,
+        "use_flow_music": payload.use_flow_music,
+        "doc_lang": payload.doc_lang,
+        "target_minutes": payload.target_minutes,
+        "thumb_3words": payload.thumb_3words,
+        "auto_shorts_cascade": payload.auto_shorts_cascade,
         "motion_cards": payload.motion_cards,
         "seamless_loop": payload.seamless_loop,
         "dual_hook_ab": payload.dual_hook_ab,
@@ -480,6 +821,8 @@ async def api_manufacture(payload: ManufacturePayload):
         if not topic:
             if payload.engine_style == "cartoon_2d":
                 topic = "Jonas tentando fugir de barco na tempestade"
+            elif payload.engine_style == "netflix_doc":
+                topic = "Como um Único Operador Quebrou o Banco Mais Antigo da Rainha (Nick Leeson / Barings Bank)"
             elif payload.mode == "clone_url":
                 topic = f"Clone Viral • {(payload.source_url or payload.reference_mp4_path)[:40]}"
             else:
@@ -546,9 +889,9 @@ async def api_extract_5_shorts(job_id: str):
 
 
 @app.post("/api/jobs/{job_id}/generate-thumbnails")
-async def api_generate_ab_thumbnails(job_id: str):
+async def api_generate_ab_thumbnails(job_id: str, custom_3words: Optional[str] = None):
     """Generate 3 magnetic 1280x720 A/B/C YouTube thumbnails (Skia C++ + rembg u2netp) for any job."""
-    from engine.thumbnail_studio import generate_ab_thumbnails_16x9
+    from engine.pipeline import _call_generate_ab_thumbnails
 
     job = get_job(job_id)
     if not job:
@@ -558,15 +901,23 @@ async def api_generate_ab_thumbnails(job_id: str):
     if not master_mp4.exists():
         raise HTTPException(status_code=400, detail="Master MP4 ainda não está pronto.")
 
-    raw = await asyncio.to_thread(generate_ab_thumbnails_16x9, master_mp4, str(job.get("topic", "Segredo Revelado")), job_dir)
+    qr_path = job_dir / "quality_report.json"
+    qr = json.loads(qr_path.read_text(encoding="utf-8")) if qr_path.exists() else {}
+    hook_3w = custom_3words or qr.get("thumb_3words")
+
+    raw = await asyncio.to_thread(
+        _call_generate_ab_thumbnails,
+        master_mp4,
+        str(job.get("topic", "Segredo Revelado")),
+        job_dir,
+        hook_3w,
+    )
     thumbs = {
         "thumb_a": str(Path(raw["thumb_a"]).resolve().relative_to(BASE_DIR.resolve())),
         "thumb_b": str(Path(raw["thumb_b"]).resolve().relative_to(BASE_DIR.resolve())),
         "thumb_c": str(Path(raw["thumb_c"]).resolve().relative_to(BASE_DIR.resolve())),
-        "headline_words": raw["headline_words"],
+        "headline_words": raw.get("headline_words", hook_3w or ""),
     }
-    qr_path = job_dir / "quality_report.json"
-    qr = json.loads(qr_path.read_text(encoding="utf-8")) if qr_path.exists() else {}
     qr["ab_thumbnails"] = thumbs
     qr_path.write_text(json.dumps(qr, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"status": "ok", "ab_thumbnails": thumbs}
@@ -575,7 +926,6 @@ async def api_generate_ab_thumbnails(job_id: str):
 @app.post("/api/jobs/{job_id}/dub-languages")
 async def api_dub_job_languages(job_id: str):
     """On-demand Multi-Language Dubbing & Re-Timing (EN-US + ES) for an existing job."""
-    from database import get_client, get_preset
     from engine.global_scaler import dub_video_job_multi_language
 
     job = get_job(job_id)
@@ -620,11 +970,31 @@ async def api_b2b_prospect(payload: B2BProspectPayload):
     """
     from engine.global_scaler import build_b2b_commercial_script_and_pitch
 
-    script, whatsapp_pitch = build_b2b_commercial_script_and_pitch(
-        payload.company_name,
-        payload.city,
-        payload.product_service,
-    )
+    if generate_b2b_pitch_bundle is not None:
+        try:
+            bundle = generate_b2b_pitch_bundle(
+                company_name=payload.company_name,
+                city=payload.city,
+                product_service=payload.product_service,
+                niche=payload.niche,
+            )
+            script = bundle.get("script") or bundle
+            whatsapp_pitch = bundle.get("whatsapp_pitch") or bundle.get("whatsapp_copy") or ""
+            if not whatsapp_pitch:
+                _, whatsapp_pitch = build_b2b_commercial_script_and_pitch(
+                    payload.company_name, payload.city, payload.product_service
+                )
+        except Exception:
+            script, whatsapp_pitch = build_b2b_commercial_script_and_pitch(
+                payload.company_name, payload.city, payload.product_service
+            )
+    else:
+        script, whatsapp_pitch = build_b2b_commercial_script_and_pitch(
+            payload.company_name,
+            payload.city,
+            payload.product_service,
+        )
+
     topic = f"B2B • {payload.company_name.strip()} ({payload.city.strip()}) — {payload.product_service.strip()}"
     opts = {
         "engine_style": payload.engine_style,

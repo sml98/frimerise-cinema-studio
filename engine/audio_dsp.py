@@ -185,11 +185,13 @@ def trim_silence_vad(
     words: List[Dict[str, Any]],
     max_pause_s: float = 0.28,
     consonant_pad_s: float = 0.085,
+    thermal_limit_c: float = 85.0,
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
     """Tighten long pauses while strictly preserving final consonants (+85ms tail)."""
     raw_16k = output_wav.with_name(output_wav.stem + "_16k.wav")
     run_ffmpeg_safe(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(input_audio), "-ac", "1", "-ar", "16000", str(raw_16k)]
+        ["ffmpeg", "-y", "-v", "error", "-i", str(input_audio), "-ac", "1", "-ar", "16000", str(raw_16k)],
+        thermal_limit_c=thermal_limit_c,
     )
 
     with wave.open(str(raw_16k), "rb") as wf:
@@ -257,7 +259,8 @@ def trim_silence_vad(
     if len(kept_indices) < max(5, int(n_frames * 0.2)):
         # Safety: if audio was very quiet, keep untouched
         run_ffmpeg_safe(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(input_audio), "-ac", "2", "-ar", "48000", str(output_wav)]
+            ["ffmpeg", "-y", "-v", "error", "-i", str(input_audio), "-ac", "2", "-ar", "48000", str(output_wav)],
+            thermal_limit_c=thermal_limit_c,
         )
         raw_16k.unlink(missing_ok=True)
         return output_wav, words, _get_wav_duration(output_wav)
@@ -265,7 +268,8 @@ def trim_silence_vad(
     # Decode original at 48kHz for zero quality loss while cutting
     raw_48k = output_wav.with_name(output_wav.stem + "_48k.wav")
     run_ffmpeg_safe(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(input_audio), "-ac", "2", "-ar", "48000", str(raw_48k)]
+        ["ffmpeg", "-y", "-v", "error", "-i", str(input_audio), "-ac", "2", "-ar", "48000", str(raw_48k)],
+        thermal_limit_c=thermal_limit_c,
     )
     with wave.open(str(raw_48k), "rb") as wf:
         pcm48 = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).reshape(-1, 2)
@@ -319,6 +323,7 @@ def master_broadcast_audio(
     duration_s: float,
     music_volume: float = 0.19,
     tail_pad_s: float = 0.40,
+    thermal_limit_c: float = 85.0,
 ) -> Tuple[Path, float]:
     """Apply Broadcast FM Chain:
     highpass=85Hz -> De-Esser 6500Hz -> Presence 3200Hz -> loudnorm=-14 LUFS
@@ -405,7 +410,7 @@ def master_broadcast_audio(
         "48000",
         str(output_m4a),
     ]
-    run_ffmpeg_safe(cmd)
+    run_ffmpeg_safe(cmd, thermal_limit_c=thermal_limit_c)
     return output_m4a, final_dur
 
 
@@ -416,6 +421,7 @@ async def generate_narration(
     voice_id: str = "pt-BR-AntonioNeural",
     voice_blend: Optional[Dict[str, float]] = None,
     prefix: str = "narr",
+    thermal_limit_c: float = 85.0,
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
     """Unified narration entry point (Kokoro OpenVINO Blend -> Edge-TTS -> espeak-ng) + VAD trim."""
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -462,4 +468,4 @@ async def generate_narration(
         except Exception:
             source_audio, words = _synthesize_espeak_fallback(text, raw_wav)
 
-    return trim_silence_vad(source_audio, trimmed_wav, words)
+    return trim_silence_vad(source_audio, trimmed_wav, words, thermal_limit_c=thermal_limit_c)

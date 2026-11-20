@@ -1,4 +1,4 @@
-/* FrimeRise Dashboard Client Logic */
+/* FrimeRise Dashboard Client Logic — 3 Master Engines + Twin Channels + DNA X-Ray + Google Flow Pro */
 let STATE = {
   settings: {},
   presets: [],
@@ -6,22 +6,27 @@ let STATE = {
   skills: [],
   luts: [],
   edge_voices: [],
+  gemini_voices: [],
+  flow_pro: { credits_remaining: 10000, credits_total: 10000 },
+  doc_queue: { channels: {}, episodes: [] },
   jobs: [],
   schedules: [],
   feedback: [],
   activeMode: 'single',
   activeStyle: 'cinematic_broll',
   selectedVipJobId: null,
+  lastAnalyzedDna: null,
 };
 
 function showToast(msg, isError = false) {
   const box = document.getElementById('toast-box');
+  if (!box) return;
   box.textContent = msg;
   box.style.borderColor = isError ? '#FF2E93' : '#B8FF01';
   box.style.color = isError ? '#FFB3D9' : '#B8FF01';
   box.classList.remove('hidden');
   clearTimeout(window.__toastTimer);
-  window.__toastTimer = setTimeout(() => box.classList.add('hidden'), 4600);
+  window.__toastTimer = setTimeout(() => box.classList.add('hidden'), 4800);
 }
 
 async function api(url, opts = {}) {
@@ -47,6 +52,22 @@ document.querySelectorAll('.nav-tab').forEach((btn) => {
   });
 });
 
+function updateManufactureCtaText() {
+  const cta = document.getElementById('btn-manufacture');
+  if (!cta) return;
+  if (STATE.activeMode === 'batch') {
+    cta.innerHTML = '<span>⚡ FABRICAR LOTE DE VÍDEOS</span>';
+  } else if (STATE.activeMode === 'clone_url') {
+    cta.innerHTML = '<span>🧬 CLONAR DNA & FABRICAR VÍDEO</span>';
+  } else if (STATE.activeStyle === 'cartoon_2d') {
+    cta.innerHTML = '<span>🎭 FABRICAR ANIMAÇÃO 2D CARTOON</span>';
+  } else if (STATE.activeStyle === 'netflix_doc') {
+    cta.innerHTML = '<span>🎞️ FABRICAR DOCUMENTÁRIO CINEMA NETFLIX</span>';
+  } else {
+    cta.innerHTML = '<span>⚡ FABRICAR VÍDEO DINÂMICO / BESPOKE 2.5D</span>';
+  }
+}
+
 document.querySelectorAll('.mode-btn').forEach((btn) => {
   btn.addEventListener('click', () => {
     STATE.activeMode = btn.dataset.mode;
@@ -60,11 +81,7 @@ document.querySelectorAll('.mode-btn').forEach((btn) => {
     document.getElementById('mode-single-wrap').classList.toggle('hidden', STATE.activeMode !== 'single');
     document.getElementById('mode-batch-wrap').classList.toggle('hidden', STATE.activeMode !== 'batch');
     document.getElementById('mode-clone-wrap').classList.toggle('hidden', STATE.activeMode !== 'clone_url');
-
-    const cta = document.getElementById('btn-manufacture');
-    if (STATE.activeMode === 'batch') cta.innerHTML = '<span>⚡ FABRICAR LOTE DE VÍDEOS</span>';
-    else if (STATE.activeMode === 'clone_url') cta.innerHTML = '<span>🧬 CLONAR DNA & FABRICAR VÍDEO</span>';
-    else cta.innerHTML = STATE.activeStyle === 'cartoon_2d' ? '<span>🎭 FABRICAR ANIMAÇÃO 2D CARTOON</span>' : '<span>⚡ FABRICAR VÍDEO AGORA</span>';
+    updateManufactureCtaText();
   });
 });
 
@@ -77,41 +94,274 @@ function selectEngineStyle(style) {
     b.classList.toggle('border-[rgba(179,136,255,0.22)]', !isSel);
   });
   document.getElementById('cartoon-2d-options').classList.toggle('hidden', style !== 'cartoon_2d');
-  if (style === 'cartoon_2d') {
-    const sk = document.getElementById('fac-skill');
-    if (sk && Array.from(sk.options).some((o) => o.value === '09_cartoon_comedy_dialogue')) {
-      sk.value = '09_cartoon_comedy_dialogue';
+  document.getElementById('netflix-doc-options').classList.toggle('hidden', style !== 'netflix_doc');
+
+  const sk = document.getElementById('fac-skill');
+  if (sk) {
+    if (style === 'cartoon_2d') {
+      const match = Array.from(sk.options).find((o) => o.value.includes('09_cartoon'));
+      if (match) sk.value = match.value;
+    } else if (style === 'netflix_doc') {
+      const match = Array.from(sk.options).find((o) => o.value.includes('10_netflix') || o.value.includes('02_curiosity'));
+      if (match) sk.value = match.value;
+      syncDocChannelSelection();
     }
   }
-  const cta = document.getElementById('btn-manufacture');
-  if (STATE.activeMode === 'single') {
-    cta.innerHTML = style === 'cartoon_2d' ? '<span>🎭 FABRICAR ANIMAÇÃO 2D CARTOON</span>' : '<span>⚡ FABRICAR VÍDEO AGORA</span>';
-  }
+  updateManufactureCtaText();
 }
 
 document.querySelectorAll('.style-btn').forEach((btn) => {
   btn.addEventListener('click', () => selectEngineStyle(btn.dataset.style));
 });
 
+function syncDocChannelSelection() {
+  const lang = document.getElementById('doc-lang')?.value || 'pt_br';
+  const targetName = lang === 'en_us' ? 'Vault Files' : 'Dossiê Capital';
+  const found = (STATE.clients || []).find((c) => c.name === targetName);
+  const cliSel = document.getElementById('fac-client');
+  if (found && cliSel) {
+    cliSel.value = String(found.id);
+  }
+}
+
+/* -------------------- Google Flow & Flow Music Pro Controls -------------------- */
+function toggleFlowCreditsCap() {
+  const mode = document.getElementById('fac-flow-mode')?.value || 'economico_pro';
+  const capInput = document.getElementById('fac-flow-cap');
+  const pill = document.getElementById('flow-mode-pill');
+  if (!capInput || !pill) return;
+  if (mode === 'economico_pro') {
+    pill.textContent = '🟢 0 Créditos Veo • 2.5D CPU + Nano Banana 2';
+    pill.className = 'text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-frimelime/15 text-frimelime border border-frimelime/40';
+  } else if (mode === 'gancho_de_ouro') {
+    pill.textContent = '🟡 ~15 Créditos • Cena 1 Veo 3.1 Light + 2.5D CPU';
+    pill.className = 'text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-frimegold/20 text-frimegold border border-frimegold/45';
+  } else {
+    pill.textContent = `🔴 Teto Ativo: máx ${capInput.value || 45} cr • Cofre FlowVault`;
+    pill.className = 'text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-frimepink/20 text-frimepink border border-frimepink/45';
+  }
+}
+
+async function loginGoogleFlow(target = 'flow') {
+  try {
+    const res = await api('/api/flow/login', {
+      method: 'POST',
+      body: JSON.stringify({ target, warm_seconds: 180 }),
+    });
+    showToast(`🌊 ${res.message}`);
+  } catch (e) {
+    showToast(`Erro ao iniciar login Google Flow: ${e.message}`, true);
+  }
+}
+
+/* -------------------- Multimodal Cloner: URL + Upload .mp4 + Visual DNA X-Ray -------------------- */
+function renderDnaXrayPanel(dna) {
+  if (!dna) return;
+  STATE.lastAnalyzedDna = dna;
+  const panel = document.getElementById('dna-xray-panel');
+  const badge = document.getElementById('dna-status-badge');
+  const pill = document.getElementById('dna-engine-pill');
+  const img = document.getElementById('dna-contact-sheet-img');
+  const metrics = document.getElementById('dna-metrics-text');
+  const swatches = document.getElementById('dna-palette-swatches');
+  const presetInput = document.getElementById('dna-preset-name');
+
+  panel.classList.remove('hidden');
+  const eng = dna.classified_engine || (dna.style === '2d_cartoon_animation' ? 'cartoon_2d' : 'cinematic_broll');
+  const engLabels = {
+    cinematic_broll: '🎬 Vídeo Dinâmico Viral / Bespoke 2.5D',
+    cartoon_2d: '🎭 Animação 2D Cartoon Multi-Personagens',
+    netflix_doc: '🎞️ Documentário Cinema Netflix / MagnatesMedia',
+  };
+  pill.textContent = engLabels[eng] || eng;
+  badge.innerHTML = `<strong class="text-frimelime">✔ DNA Extraído: ${engLabels[eng] || eng}</strong>`;
+
+  if (dna.contact_sheet_url) {
+    img.src = `${dna.contact_sheet_url}?t=${Date.now()}`;
+  }
+
+  const cadence = dna.scene_cadence || {};
+  const optFlow = dna.optical_flow || {};
+  const avgCut = cadence.avg_cut_seconds || dna.avg_scene_duration_s || 2.8;
+  const cutsCount = cadence.cuts_count || (dna.scenes ? dna.scenes.length : 6);
+  const domMotion = optFlow.dominant_motion || 'punch_in';
+  metrics.innerHTML = `
+    <div>⏱️ <strong>Cadência OpenCV:</strong> corte a cada <span class="text-frimelime font-bold">${avgCut}s</span> (${cutsCount} cenas • ${dna.duration_s || 25}s total)</div>
+    <div>🎥 <strong>Optical Flow Farneback:</strong> movimento dominante <span class="text-frimegold font-bold">${domMotion}</span> (${dna.aspect_ratio || '9:16'})</div>
+    <div>🎙️ <strong>Tom / Subtítulos:</strong> <span class="text-frimelilac">${dna.detected_tone || 'Alta Retenção'}</span></div>
+  `;
+
+  const palette = dna.dominant_palette || ['#0B0713', '#FF2E93', '#B8FF01', '#FFD166'];
+  swatches.innerHTML = `<span class="text-[11px] text-[#B6A9D4] mr-1">Paleta HEX:</span>` + palette.map((hex) => `
+    <span class="px-2 py-0.5 rounded text-[10px] font-mono font-bold border border-white/20" style="background:${hex};color:#fff;text-shadow:0 1px 2px #000">${hex}</span>
+  `).join('');
+
+  if (presetInput && !presetInput.value) {
+    presetInput.value = `DNA ${(dna.title || 'Viral').slice(0, 22)}`;
+  }
+
+  selectEngineStyle(eng);
+}
+
 async function uploadReferenceMp4(input) {
   if (!input.files || !input.files[0]) return;
   const badge = document.getElementById('dna-status-badge');
-  badge.textContent = '🧬 Analisando DNA visual (OpenCV + Whisper)...';
+  badge.textContent = '🧬 Extraindo Storyboard 3×3 + Cadência OpenCV + Whisper...';
   const fd = new FormData();
   fd.append('file', input.files[0]);
   try {
     const res = await fetch('/api/factory/upload-reference', { method: 'POST', body: fd });
     const data = await res.json();
     document.getElementById('fac-ref-mp4-path').value = data.reference_mp4_path;
-    const isCartoon = data.dna && data.dna.style === '2d_cartoon_animation';
-    badge.innerHTML = isCartoon
-      ? `<strong class="text-frimelime">🎭 2D Cartoon detectado (${Math.round((data.dna.confidence || 0.8) * 100)}%) — motor Cartoon 2D ativado!</strong>`
-      : `<strong class="text-frimegold">🎬 Filmagem Real detectada — motor Cinematográfico ativado!</strong>`;
-    if (isCartoon) selectEngineStyle('cartoon_2d');
-    showToast('DNA do vídeo de referência extraído com sucesso!');
+    renderDnaXrayPanel(data.dna);
+    showToast('🔬 Raio-X de DNA do arquivo .mp4 concluído!');
   } catch (e) {
     badge.textContent = 'Erro ao analisar MP4.';
     showToast('Falha ao analisar MP4 de referência.', true);
+  }
+}
+
+async function analyzeReferenceUrl() {
+  const url = document.getElementById('fac-url').value.trim();
+  const refMp4 = document.getElementById('fac-ref-mp4-path').value.trim();
+  if (!url && !refMp4) {
+    return showToast('Cole uma URL concorrente ou envie um arquivo .mp4 primeiro.', true);
+  }
+  const btn = document.getElementById('btn-analyze-url');
+  const badge = document.getElementById('dna-status-badge');
+  btn.disabled = true;
+  btn.textContent = '⏳ Analisando 3×3...';
+  badge.textContent = '🧬 Baixando referência e gerando contact_sheet.jpg (OpenCV + Storyboard 3×3)...';
+  try {
+    const res = await api('/api/factory/analyze-url', {
+      method: 'POST',
+      body: JSON.stringify({ source_url: url, reference_mp4_path: refMp4 }),
+    });
+    renderDnaXrayPanel(res.dna);
+    showToast('🔬 Raio-X Multimodal de DNA concluído com sucesso!');
+  } catch (e) {
+    badge.textContent = `Erro: ${e.message}`;
+    showToast(`Falha no Raio-X de DNA: ${e.message}`, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🧬 Raio-X DNA';
+  }
+}
+
+async function saveDnaAsPreset() {
+  const nameInput = document.getElementById('dna-preset-name');
+  const presetName = (nameInput?.value || '').trim() || 'DNA Viral Clonado';
+  const btn = document.getElementById('btn-save-dna-preset');
+  btn.disabled = true;
+  btn.textContent = '⏳ Salvando...';
+  try {
+    const res = await api('/api/factory/save-dna-preset', {
+      method: 'POST',
+      body: JSON.stringify({
+        preset_name: presetName,
+        blueprint: STATE.lastAnalyzedDna || {},
+      }),
+    });
+    STATE.presets = res.presets || STATE.presets;
+    if (res.preset && res.preset.id) {
+      document.getElementById('cli-preset-id').value = res.preset.id;
+    }
+    renderPresetsGrid();
+    showToast(`💾 Preset "${res.preset?.name || presetName}" salvo permanentemente no SQLite!`);
+  } catch (e) {
+    showToast(`Erro ao salvar DNA como Preset: ${e.message}`, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '💾 Salvar DNA como Novo Preset';
+  }
+}
+
+/* -------------------- Twin Channels & 10-Episode Ready Queue -------------------- */
+function renderDocQueue() {
+  const dq = STATE.doc_queue || {};
+  const channels = dq.channels || {};
+  const episodes = dq.episodes || [];
+
+  const headerCards = document.getElementById('twin-channels-header-cards');
+  if (headerCards && (channels.pt_br || channels.en_us)) {
+    const br = channels.pt_br || {};
+    const us = channels.en_us || {};
+    headerCards.innerHTML = `
+      <div class="p-3 rounded-xl bg-[#0B0713]/90 border border-frimegold/45 space-y-1">
+        <div class="flex items-center gap-2">
+          <span class="text-sm font-black text-frimegold">🇧🇷 ${br.name || 'Dossiê Capital'}</span>
+          <span class="text-[10px] px-2 py-0.5 rounded-full bg-frimegold/15 text-frimegold font-bold">${br.format || '16:9 Documentário Cinema'}</span>
+        </div>
+        <div class="text-[11px] text-[#B6A9D4]">LUT: <code class="text-frimelilac">${br.lut_file || '02_dark_wealth.cube'}</code> • Voz: <code class="text-frimelime">${br.voice_id || 'pt-BR-AntonioNeural'}</code> • Cascata: <strong>5 Shorts</strong></div>
+      </div>
+      <div class="p-3 rounded-xl bg-[#0B0713]/90 border border-frimelime/45 space-y-1">
+        <div class="flex items-center gap-2">
+          <span class="text-sm font-black text-frimelime">🇺🇸 ${us.name || 'Vault Files'}</span>
+          <span class="text-[10px] px-2 py-0.5 rounded-full bg-frimelime/15 text-frimelime font-bold">${us.format || '16:9 Documentário Cinema'}</span>
+        </div>
+        <div class="text-[11px] text-[#B6A9D4]">LUT: <code class="text-frimelilac">${us.lut_file || '02_dark_wealth.cube'}</code> • Voz: <code class="text-frimegold">${us.voice_id || 'en-US-AndrewMultilingualNeural'}</code> • Cascata: <strong>5 Shorts</strong></div>
+      </div>
+    `;
+  }
+
+  const grid = document.getElementById('doc-queue-grid');
+  if (!grid) return;
+  if (!episodes.length) {
+    grid.innerHTML = '<div class="text-xs text-[#B6A9D4]">Carregando fila de 10 documentários...</div>';
+    return;
+  }
+
+  grid.innerHTML = episodes.map((ep) => `
+    <div class="p-4 rounded-xl bg-[#0B0713]/90 border border-[rgba(179,136,255,0.25)] hover:border-frimegold/60 transition flex flex-col justify-between gap-3">
+      <div class="space-y-2">
+        <div class="flex items-center justify-between gap-2">
+          <span class="text-xs font-black px-2.5 py-0.5 rounded-full bg-frimepink/20 text-frimepink border border-frimepink/40">EPISÓDIO #${String(ep.id).padStart(2, '0')} • ${ep.category || 'Investigativo'}</span>
+          <span class="text-[11px] font-extrabold text-frimelilac">${ep.short_name}</span>
+        </div>
+        <div class="text-xs font-bold text-white leading-snug">🇧🇷 ${ep.title_pt}</div>
+        <div class="text-[11px] text-[#B6A9D4] leading-snug">🇺🇸 ${ep.title_en}</div>
+        <div class="flex flex-wrap items-center gap-2 pt-1">
+          <span class="text-[10px] font-black px-2 py-0.5 rounded bg-frimegold/15 text-frimegold border border-frimegold/35">🖼️ Thumb BR: "${ep.thumb_hook_pt}"</span>
+          <span class="text-[10px] font-black px-2 py-0.5 rounded bg-frimelime/15 text-frimelime border border-frimelime/35">🖼️ Thumb US: "${ep.thumb_hook_en}"</span>
+        </div>
+      </div>
+      <div class="grid grid-cols-3 gap-2 pt-2 border-t border-[rgba(179,136,255,0.14)]">
+        <button type="button" onclick="launchDocQueueEpisode(${ep.id}, 'pt_br')" class="btn-ghost py-2 px-2 text-[11px] font-extrabold hover:border-frimegold text-frimegold">
+          🇧🇷 Dossiê Capital
+        </button>
+        <button type="button" onclick="launchDocQueueEpisode(${ep.id}, 'en_us')" class="btn-ghost py-2 px-2 text-[11px] font-extrabold hover:border-frimelime text-frimelime">
+          🇺🇸 Vault Files
+        </button>
+        <button type="button" onclick="launchDocQueueEpisode(${ep.id}, 'both')" class="btn-lime py-2 px-2 text-[11px] font-black">
+          🌎 Ambos (BR+US)
+        </button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function launchDocQueueEpisode(episodeId, target = 'both') {
+  try {
+    const payload = {
+      episode_id: Number(episodeId),
+      target,
+      aspect_ratio: document.getElementById('doc-aspect')?.value || '16:9',
+      target_minutes: Number(document.getElementById('doc-minutes')?.value || 0.5),
+      auto_shorts_cascade: true,
+      flow_mode: document.getElementById('fac-flow-mode')?.value || 'economico_pro',
+      max_credits_cap: Number(document.getElementById('fac-flow-cap')?.value || 45),
+      use_flow_music: Boolean(document.getElementById('opt-flow-music')?.checked),
+    };
+    const res = await api('/api/doc-queue/manufacture', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    const label = target === 'both' ? 'Dossiê Capital (BR) + Vault Files (US)' : (target === 'pt_br' ? 'Dossiê Capital (BR)' : 'Vault Files (US)');
+    showToast(`🎞️ Episódio #${episodeId} (${res.episode.short_name}) enviado para fabricação em ${label}!`);
+    selectEngineStyle('netflix_doc');
+    await refreshAll();
+  } catch (e) {
+    showToast(`Erro ao lançar documentário: ${e.message}`, true);
   }
 }
 
@@ -151,6 +401,15 @@ async function pollTelemetry() {
     tempEl.style.color = t.cpu_temp_c >= t.thermal_limit_c ? '#FF2E93' : (t.cpu_temp_c >= 75 ? '#FFD166' : '#B8FF01');
     document.getElementById('txt-cost').textContent = `$${Number(t.total_cost_usd).toFixed(4)}`;
     document.getElementById('live-queue-badge').textContent = `Fila: ${t.queue_size}`;
+
+    if (t.flow_pro) {
+      STATE.flow_pro = t.flow_pro;
+      const cr = Number(t.flow_pro.credits_remaining ?? 10000).toLocaleString('pt-BR');
+      const flowEl = document.getElementById('txt-flow-credits');
+      if (flowEl) {
+        flowEl.textContent = `🌊 Flow Pro: ${cr} cr`;
+      }
+    }
   } catch (e) {
     // ignore transient poll errors
   }
@@ -161,7 +420,13 @@ async function refreshAll() {
   try {
     const data = await api('/api/bootstrap-data');
     STATE = { ...STATE, ...data };
+    if (data.flow_pro) {
+      const cr = Number(data.flow_pro.credits_remaining ?? 10000).toLocaleString('pt-BR');
+      const flowEl = document.getElementById('txt-flow-credits');
+      if (flowEl) flowEl.textContent = `🌊 Flow Pro: ${cr} cr`;
+    }
     renderSelectors();
+    renderDocQueue();
     renderPresetsGrid();
     renderClientChips();
     renderSettingsForm();
@@ -178,7 +443,9 @@ function renderSelectors() {
   const cliSel = document.getElementById('fac-client');
   const prevCli = cliSel.value;
   cliSel.innerHTML = STATE.clients.map((c) => `<option value="${c.id}">${c.name} (${c.niche})</option>`).join('');
-  if (prevCli) cliSel.value = prevCli;
+  if (prevCli && STATE.clients.some((c) => String(c.id) === String(prevCli))) {
+    cliSel.value = prevCli;
+  }
 
   // Skills
   const skSel = document.getElementById('fac-skill');
@@ -190,7 +457,7 @@ function renderSelectors() {
   const lutSel = document.getElementById('cli-lut');
   lutSel.innerHTML = STATE.luts.map((l) => `<option value="${l}">${l.replace('.cube', '').replaceAll('_', ' ')}</option>`).join('');
 
-  // Voice list synced to selected voice engine (Gemini TTS or Edge-TTS)
+  // Voice list synced to selected voice engine
   syncVoiceListForEngine();
 
   // Load first client into form if empty
@@ -203,7 +470,12 @@ function syncVoiceListForEngine(preferredVoiceId = null) {
   const eng = document.getElementById('cli-voice-engine').value || 'edge';
   const vSel = document.getElementById('cli-voice-id');
   const prev = preferredVoiceId || vSel.value;
-  const list = eng === 'gemini_tts' ? (STATE.gemini_voices || []) : (STATE.edge_voices || []);
+  const edgeWithUs = [
+    ...(STATE.edge_voices || []),
+    { id: 'en-US-AndrewMultilingualNeural', name: 'Andrew Multilingual (EN-US • Vault Files Grave)' },
+    { id: 'es-MX-DaliaNeural', name: 'Dalia Neural (ES-MX • Espanhol Nativo)' },
+  ];
+  const list = eng === 'gemini_tts' ? (STATE.gemini_voices || []) : edgeWithUs;
   vSel.innerHTML = list.map((v) => `<option value="${v.id}">${v.name}</option>`).join('');
   if (prev && list.some((v) => v.id === prev)) {
     vSel.value = prev;
@@ -248,15 +520,19 @@ function selectPreset(presetId) {
 
 function renderClientChips() {
   const wrap = document.getElementById('clients-chips');
-  wrap.innerHTML = STATE.clients.map((c) => `
-    <button type="button" onclick='loadClientIntoForm(${JSON.stringify(c).replace(/'/g, "&apos;")})'
-      class="btn-ghost px-3 py-1.5 text-xs font-bold flex items-center gap-2">
-      <span>${c.name}</span>
-      ${c.tiktok_connected ? '<span class="text-frimelime">●TT</span>' : ''}
-      ${c.youtube_connected ? '<span class="text-frimegold">●YT</span>' : ''}
-      ${c.facebook_connected ? '<span class="text-frimelilac">●FB</span>' : ''}
-    </button>
-  `).join('');
+  wrap.innerHTML = STATE.clients.map((c) => {
+    const isTwin = c.name === 'Dossiê Capital' || c.name === 'Vault Files';
+    const flag = c.name === 'Dossiê Capital' ? '🇧🇷 ' : (c.name === 'Vault Files' ? '🇺🇸 ' : '');
+    return `
+      <button type="button" onclick='loadClientIntoForm(${JSON.stringify(c).replace(/'/g, "&apos;")})'
+        class="btn-ghost px-3 py-1.5 text-xs font-bold flex items-center gap-2 ${isTwin ? 'border-frimegold/50' : ''}">
+        <span>${flag}${c.name}</span>
+        ${c.tiktok_connected ? '<span class="text-frimelime">●TT</span>' : ''}
+        ${c.youtube_connected ? '<span class="text-frimegold">●YT</span>' : ''}
+        ${c.facebook_connected ? '<span class="text-frimelilac">●FB</span>' : ''}
+      </button>
+    `;
+  }).join('');
 }
 
 function loadClientIntoForm(c) {
@@ -393,15 +669,27 @@ document.getElementById('btn-manufacture').addEventListener('click', async () =>
       .map((s) => s.trim())
       .filter(Boolean);
 
+    const isDoc = STATE.activeStyle === 'netflix_doc';
+    const aspectRatio = isDoc
+      ? (document.getElementById('doc-aspect')?.value || '16:9')
+      : (document.getElementById('fac-aspect')?.value || '9:16');
+
     const payload = {
       client_id: Number(document.getElementById('fac-client').value || 1),
       mode: STATE.activeMode,
       engine_style: STATE.activeStyle,
-      aspect_ratio: document.getElementById('fac-aspect').value || '9:16',
-      cartoon_tone: document.getElementById('fac-tone').value || 'Comédia Nordestina/BR',
+      aspect_ratio: aspectRatio,
+      cartoon_tone: document.getElementById('fac-tone')?.value || 'Comédia Nordestina/BR',
       cartoon_fps: Number(document.getElementById('fac-fps')?.value || 60),
       cartoon_voice_engine: document.getElementById('fac-cartoon-voice')?.value || 'gemini_tts',
       clone_languages: Boolean(document.getElementById('opt-clone-langs')?.checked),
+      flow_mode: document.getElementById('fac-flow-mode')?.value || 'economico_pro',
+      max_credits_cap: Number(document.getElementById('fac-flow-cap')?.value || 45),
+      use_flow_music: Boolean(document.getElementById('opt-flow-music')?.checked),
+      doc_lang: document.getElementById('doc-lang')?.value || 'pt_br',
+      target_minutes: Number(document.getElementById('doc-minutes')?.value || 0.5),
+      thumb_3words: (document.getElementById('doc-thumb-hook')?.value || '').trim() || null,
+      auto_shorts_cascade: Boolean(document.getElementById('opt-ab')?.checked),
       topic: document.getElementById('fac-topic').value.trim(),
       batch_topics: batchLines,
       source_url: document.getElementById('fac-url').value.trim(),
@@ -415,7 +703,7 @@ document.getElementById('btn-manufacture').addEventListener('click', async () =>
       method: 'POST',
       body: JSON.stringify(payload),
     });
-    showToast(`🚀 ${res.count} vídeo(s) enviado(s) para a fábrica FrimeRise!`);
+    showToast(`🚀 ${res.count} vídeo(s) enviado(s) para a fábrica FrimeRise (${STATE.activeStyle})!`);
     await refreshAll();
   } catch (e) {
     showToast(`Erro ao enfileirar: ${e.message}`, true);
@@ -427,7 +715,6 @@ document.getElementById('btn-manufacture').addEventListener('click', async () =>
 /* -------------------- Jobs & VIP Delivery Center -------------------- */
 function renderJobs() {
   const jobs = STATE.jobs || [];
-  // Active monitor
   const active = jobs.find((j) => j.status === 'running' || j.status === 'queued') || jobs[0];
   if (active) {
     document.getElementById('active-job-title').textContent = active.topic;
@@ -439,15 +726,16 @@ function renderJobs() {
     logEl.scrollTop = logEl.scrollHeight;
   }
 
-  // Recent list
   const listEl = document.getElementById('recent-jobs-list');
   if (!jobs.length) {
-    listEl.innerHTML = '<div class="text-xs text-[#B6A9D4]">Nenhuma produção ainda. Clique em Fabricar Vídeo acima!</div>';
+    listEl.innerHTML = '<div class="text-xs text-[#B6A9D4]">Nenhuma produção ainda. Clique em Fabricar Vídeo ou lance um Documentário da Fila Pronta acima!</div>';
   } else {
     listEl.innerHTML = jobs.slice(0, 9).map((j) => {
       const badgeColor = j.status === 'completed' ? 'text-frimelime border-frimelime/40 bg-frimelime/10'
         : j.status === 'error' ? 'text-frimepink border-frimepink/40 bg-frimepink/10'
         : 'text-frimegold border-frimegold/40 bg-frimegold/10';
+      const eng = (j.quality_report && j.quality_report.engine_style) || '';
+      const engTag = eng === 'netflix_doc' ? '🎞️ Doc Cinema' : (eng === 'cartoon_2d' ? '🎭 Cartoon 2D' : '🎬 Viral 2.5D');
       return `
         <div class="p-3.5 rounded-xl bg-[#0B0713]/85 border border-[rgba(179,136,255,0.2)] space-y-2">
           <div class="flex items-start justify-between gap-2">
@@ -455,7 +743,7 @@ function renderJobs() {
             <span class="text-[10px] font-bold px-2 py-0.5 rounded-full border ${badgeColor} shrink-0">${j.status}</span>
           </div>
           <div class="flex items-center justify-between text-[11px] text-[#B6A9D4]">
-            <span>${j.client_name || 'FrimeRise'} • ${j.duration_s || 0}s</span>
+            <span>${j.client_name || 'FrimeRise'} • ${engTag} • ${j.duration_s || 0}s</span>
             <span class="text-frimegold font-bold">${j.views_count || 0} views</span>
           </div>
           ${j.status === 'completed' ? `<button type="button" onclick="openInVip('${j.id}')" class="btn-gold w-full py-1.5 text-[11px]">👑 Abrir na Central VIP</button>` : `<div class="lime-progress-track"><div class="lime-progress-fill" style="width:${j.progress}%"></div></div>`}
@@ -464,12 +752,11 @@ function renderJobs() {
     }).join('');
   }
 
-  // VIP selector & Publish/Feedback selectors
   const completed = jobs.filter((j) => j.status === 'completed');
   const vipSel = document.getElementById('vip-job-select');
   const pubSel = document.getElementById('pub-job');
   const fbSel = document.getElementById('fb-job');
-  const optsHtml = completed.map((j) => `<option value="${j.id}">${j.topic.slice(0, 48)} (${j.duration_s}s)</option>`).join('');
+  const optsHtml = completed.map((j) => `<option value="${j.id}">${j.topic.slice(0, 52)} (${j.duration_s}s)</option>`).join('');
   vipSel.innerHTML = optsHtml || '<option value="">Nenhum vídeo finalizado ainda</option>';
   pubSel.innerHTML = optsHtml;
   fbSel.innerHTML = optsHtml;
@@ -526,12 +813,12 @@ function renderVipJob(jobId) {
   if (job.cover_path) {
     document.getElementById('vip-cover-img').src = `/${job.cover_path}`;
   }
+  const qr = job.quality_report || {};
   document.getElementById('vip-job-meta').innerHTML = `
     <strong class="text-white block text-sm mb-1">${job.topic}</strong>
-    Duração: <span class="text-frimelime font-bold">${job.duration_s}s</span> • Skill: <span class="text-frimelilac font-bold">${job.skill_id}</span> • Tokens: <span class="text-frimegold font-bold">${job.tokens_used}</span> ($${Number(job.cost_usd || 0).toFixed(5)})
+    Motor: <span class="text-frimepink font-bold">${qr.engine_style || 'cinematic_broll'}</span> • Duração: <span class="text-frimelime font-bold">${job.duration_s}s</span> • Formato: <span class="text-frimelilac font-bold">${qr.aspect_ratio || '9:16'}</span> • Custo: <span class="text-frimegold font-bold">$${Number(job.cost_usd || 0).toFixed(5)}</span>
   `;
 
-  const qr = job.quality_report || {};
   const ra = qr.retention_audit || {};
   const retBadge = document.getElementById('vip-retention-badge');
   if (retBadge) {

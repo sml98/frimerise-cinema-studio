@@ -30,12 +30,19 @@ import skia
 
 from agents.llm_router import _extract_json, get_settings, record_token_usage
 from agents.retention_doctor import audit_cartoon_episode_plan
-from engine.audio_dsp import _estimate_word_timestamps, master_broadcast_audio
+from engine.audio_dsp import (
+    _estimate_word_timestamps,
+    _synthesize_espeak_fallback,
+    master_broadcast_audio,
+    synthesize_kokoro_blended,
+)
 from engine.cartoon_v2_renderer import (
     draw_cartoon_puppet_v2,
     draw_comic_speed_lines,
     draw_foreground_boat_v2,
     draw_parallax_scenery_v2,
+    draw_rhubarb_mouth_v2,
+    make_handdrawn_ink,
 )
 from engine.gemini_tts import has_valid_gemini_key, synthesize_gemini_tts_line
 from engine.intel_vaapi import (
@@ -71,7 +78,7 @@ SceneEnvType = Literal["sea_storm", "boat_whale", "desert", "palace", "office", 
 
 
 class VoicePreset(BaseModel):
-    engine: Literal["edge", "kokoro"] = "edge"
+    engine: Literal["edge", "kokoro", "gemini_tts"] = "edge"
     voice_id: str = "pt-BR-AntonioNeural"
     pitch: str = "+0Hz"
     rate: str = "+8%"
@@ -86,6 +93,7 @@ class VisualRig(BaseModel):
     secondary_color: str = "#B388FF"
     hair_color: str = "#2A1B12"
     pill_color_index: int = 0
+    custom_mascot_png: Optional[str] = None
 
 
 class CartoonCharacter(BaseModel):
@@ -317,8 +325,10 @@ def generate_cartoon_episode_plan(
     """Generate a validated CartoonEpisodePlan via LLM (if key configured) or high-craft built-in comedy."""
     settings = get_settings()
     model_choice = settings.get("default_llm") or "gemini-3.5-flash-lite"
-    skill_path = SKILLS_DIR / "09_cartoon_comedy_dialogue.md"
-    skill_md = skill_path.read_text(encoding="utf-8")[:1200] if skill_path.exists() else ""
+    skill_path = SKILLS_DIR / "09_cartoon_dialogue.md"
+    if not skill_path.exists():
+        skill_path = SKILLS_DIR / "09_cartoon_comedy_dialogue.md"
+    skill_md = skill_path.read_text(encoding="utf-8")[:1400] if skill_path.exists() else ""
 
     sys_prompt = (
         "Você é roteirista de Animação 2D Cartoon viral no Brasil (estilo @animabible7 e OverSimplified). "
@@ -425,15 +435,21 @@ async def _synthesize_character_line(
     voice_engine: str = "edge",
     emotion: str = "neutral",
     speaker_slot: int = 0,
+    thermal_limit_c: float = 85.0,
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
-    """Synthesize a single character dialogue line using Google Gemini Expressive TTS (when selected & valid)
-    or Edge-TTS with custom pitch/rate and exact WordBoundary timing.
+    """Synthesize a single character dialogue line using:
+    1) Google Gemini Expressive TTS (when selected & valid API key)
+    2) Kokoro-ONNX local expressive voices (pm_alex, pf_dora, pm_santa) when engine=='kokoro'
+    3) Edge-TTS with distinct per-character pitch/rate and exact WordBoundary timing
+    4) Offline espeak-ng PT-BR fallback if network is unavailable.
     """
     mp3_path = work_dir / f"{tag}.mp3"
     wav_path = work_dir / f"{tag}.wav"
     words: List[Dict[str, Any]] = []
 
-    if voice_engine == "gemini_tts":
+    effective_engine = voice_engine if voice_engine in ("gemini_tts", "kokoro", "edge") else (voice_preset.engine or "edge")
+
+    if effective_engine == "gemini_tts":
         has_gkey, gkey = has_valid_gemini_key()
         if has_gkey:
             try:
@@ -452,7 +468,31 @@ async def _synthesize_character_line(
             except Exception as exc:
                 print(f"[Cartoon2D] Gemini TTS fallback para Edge-TTS ({tag}): {str(exc)[:100]}", flush=True)
 
-    active_voices = [voice_preset.voice_id, "pt-BR-AntonioNeural", "pt-BR-FranciscaNeural"]
+    if effective_engine == "kokoro" or voice_preset.engine == "kokoro":
+        try:
+            k_voice = voice_preset.kokoro_voice or ("pm_alex" if speaker_slot % 2 == 0 else "pm_santa")
+            if k_voice not in ("pm_alex", "pf_dora", "pm_santa"):
+                k_voice = "pm_alex"
+            raw_kokoro = work_dir / f"{tag}_kokoro.wav"
+            _, words = await asyncio.to_thread(
+                synthesize_kokoro_blended,
+                text,
+                raw_kokoro,
+                {k_voice: 1.0},
+                1.10 if emotion in ("shocked", "angry") else 1.06,
+            )
+            run_ffmpeg_safe(
+                ["ffmpeg", "-y", "-v", "error", "-i", str(raw_kokoro), "-ac", "2", "-ar", "48000", str(wav_path)],
+                thermal_limit_c=thermal_limit_c,
+            )
+            raw_kokoro.unlink(missing_ok=True)
+            with wave.open(str(wav_path), "rb") as wf:
+                dur_s = wf.getnframes() / float(wf.getframerate())
+            return wav_path, words, round(dur_s, 3)
+        except Exception:
+            pass
+
+    active_voices = [voice_preset.voice_id, "pt-BR-AntonioNeural", "pt-BR-FranciscaNeural", "pt-BR-ThalitaMultilingualNeural"]
     synthesized = False
     for v_try in active_voices:
         try:
@@ -474,14 +514,45 @@ async def _synthesize_character_line(
                     words.append({"word": str(ch["text"]).strip(), "start": round(st, 3), "end": round(st + max(0.06, dur), 3)})
             if chunks:
                 mp3_path.write_bytes(bytes(chunks))
-                run_ffmpeg_safe(["ffmpeg", "-y", "-v", "error", "-i", str(mp3_path), "-ac", "2", "-ar", "48000", str(wav_path)])
+                run_ffmpeg_safe(
+                    ["ffmpeg", "-y", "-v", "error", "-i", str(mp3_path), "-ac", "2", "-ar", "48000", str(wav_path)],
+                    thermal_limit_c=thermal_limit_c,
+                )
                 synthesized = True
                 break
         except Exception:
             continue
 
     if not synthesized:
-        raise RuntimeError(f"Não foi possível sintetizar a fala via Edge-TTS: {text[:40]}")
+        try:
+            raw_espeak = work_dir / f"{tag}_espeak.wav"
+            _, words = _synthesize_espeak_fallback(text, raw_espeak)
+            run_ffmpeg_safe(
+                ["ffmpeg", "-y", "-v", "error", "-i", str(raw_espeak), "-ac", "2", "-ar", "48000", str(wav_path)],
+                thermal_limit_c=thermal_limit_c,
+            )
+            raw_espeak.unlink(missing_ok=True)
+        except Exception:
+            # Pure-Python syllable-modulated fallback WAV so offline/DNS blips never crash
+            words = _estimate_word_timestamps(text, max(1.8, min(6.5, len(text.split()) * 0.36)))
+            dur_est = words[-1]["end"] + 0.15 if words else 2.2
+            sr = 48000
+            t_arr = np.linspace(0.0, dur_est, int(sr * dur_est), endpoint=False, dtype=np.float32)
+            env = np.zeros_like(t_arr)
+            for wd in words:
+                mask = (t_arr >= wd["start"]) & (t_arr <= wd["end"])
+                if np.any(mask):
+                    w_t = (t_arr[mask] - wd["start"]) / max(0.05, wd["end"] - wd["start"])
+                    env[mask] = np.sin(np.pi * w_t) * (0.65 + 0.35 * np.sin(2.0 * np.pi * 4.0 * w_t))
+            f0 = 155.0 if speaker_slot % 2 == 0 else 118.0
+            sig = env * (0.55 * np.sin(2.0 * np.pi * f0 * t_arr) + 0.30 * np.sin(2.0 * np.pi * f0 * 2.0 * t_arr) + 0.15 * np.sin(2.0 * np.pi * f0 * 3.0 * t_arr))
+            pcm16 = np.clip(sig * 14000.0, -32000.0, 32000.0).astype(np.int16)
+            stereo = np.column_stack([pcm16, pcm16])
+            with wave.open(str(wav_path), "wb") as wf:
+                wf.setnchannels(2)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(stereo.tobytes())
 
     with wave.open(str(wav_path), "rb") as wf:
         dur_s = wf.getnframes() / float(wf.getframerate())
@@ -837,6 +908,34 @@ def _draw_mouth_viseme(canvas: skia.Canvas, viseme: str, stroke_p: skia.Paint) -
             canvas.drawLine(tx, -15, tx, 17, thin)
 
 
+_CUSTOM_MASCOT_CACHE: Dict[str, Optional[skia.Image]] = {}
+
+
+def _resolve_custom_mascot_image(char: CartoonCharacter) -> Optional[skia.Image]:
+    """Load custom PNG mascot from char.visual_rig.custom_mascot_png or data/characters/<char_id>.png."""
+    candidates: List[Path] = []
+    raw_custom = getattr(char.visual_rig, "custom_mascot_png", None)
+    if raw_custom:
+        p = Path(str(raw_custom))
+        candidates.append(p if p.is_absolute() else (BASE_DIR / p))
+        candidates.append(BASE_DIR / "data" / "characters" / p.name)
+    candidates.append(BASE_DIR / "data" / "characters" / f"{char.char_id}.png")
+    candidates.append(BASE_DIR / "data" / "characters" / char.char_id / "character.png")
+
+    for cand in candidates:
+        if cand.exists() and cand.is_file():
+            key = str(cand.resolve())
+            if key in _CUSTOM_MASCOT_CACHE:
+                return _CUSTOM_MASCOT_CACHE[key]
+            try:
+                img = skia.Image.open(key)
+                _CUSTOM_MASCOT_CACHE[key] = img
+                return img
+            except Exception:
+                _CUSTOM_MASCOT_CACHE[key] = None
+    return None
+
+
 def _draw_cartoon_puppet(
     canvas: skia.Canvas,
     char: CartoonCharacter,
@@ -851,7 +950,9 @@ def _draw_cartoon_puppet(
     t: float,
     blink_offset: float = 0.0,
 ) -> None:
-    """Render an articulated, expressive 2D vector cartoon character with StrokeWidth=8."""
+    """Render an articulated, expressive 2D vector cartoon character with StrokeWidth=8
+    (or custom uploaded PNG mascot with elastic Squash & Stretch + animated Lip-Sync mouth).
+    """
     rig = char.visual_rig
     outline = skia.Paint(
         AntiAlias=True,
@@ -873,6 +974,21 @@ def _draw_cartoon_puppet(
     canvas.save()
     canvas.translate(cx, cy + breath + speak_bob)
     canvas.scale(scale, scale)
+
+    custom_img = _resolve_custom_mascot_image(char)
+    if custom_img is not None:
+        sq_y = 1.0 + (0.065 * speech_energy if is_speaking else 0.0)
+        sq_x = 1.0 - (0.038 * speech_energy if is_speaking else 0.0)
+        canvas.save()
+        canvas.scale(sq_x * (1.0 if facing >= 0 else -1.0), sq_y)
+        canvas.drawImageRect(custom_img, skia.Rect.MakeXYWH(-135, -210, 270, 400))
+        canvas.restore()
+        canvas.save()
+        canvas.translate(facing * 6.0, -36.0)
+        _draw_mouth_viseme(canvas, viseme if is_speaking else "fechada_neutra", outline)
+        canvas.restore()
+        canvas.restore()
+        return
 
     # 1. Optional Royal Cape behind torso for king_crown
     if rig.outfit == "king_crown":
@@ -1173,7 +1289,8 @@ async def render_cartoon_episode(
     pause_gap_s = 0.22
     gap_wav = work_dir / "_gap.wav"
     run_ffmpeg_safe(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", f"{pause_gap_s:.2f}", str(gap_wav)]
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", f"{pause_gap_s:.2f}", str(gap_wav)],
+        thermal_limit_c=thermal_limit_c,
     )
 
     lipsync_engine = "rhubarb_v1.14_phonetic_9visemes"
@@ -1192,10 +1309,30 @@ async def render_cartoon_episode(
                 voice_engine=voice_engine,
                 emotion=dl.emotion,
                 speaker_slot=sp_slot,
+                thermal_limit_c=thermal_limit_c,
             )
             visemes, energies, lipsync_engine = await asyncio.to_thread(
                 extract_rhubarb_visemes, wav_p, fps, dl.emotion
             )
+            rms_vis6, rms_eng = await asyncio.to_thread(
+                _compute_visemes_for_wav, wav_p, words, dl.emotion, fps
+            )
+            # Fuse Rhubarb 9-visemes with RMS 6-viseme vowel dynamics so active speech always cycles mouth shapes
+            v6_to_v9 = {
+                "fechada_neutra": "X",
+                "fechada_sorriso": "A",
+                "aberta_media_E": "C",
+                "aberta_grande_A_com_lingua": "D",
+                "bico_O_U": "F",
+                "dentes_raiva": "B",
+            }
+            for fi_v in range(min(len(visemes), len(rms_vis6))):
+                e_val = energies[fi_v] if fi_v < len(energies) else rms_eng[fi_v]
+                if e_val >= 0.16 and visemes[fi_v] in ("X", "A"):
+                    visemes[fi_v] = v6_to_v9.get(rms_vis6[fi_v], "C")
+                elif fi_v >= 2 and e_val >= 0.22 and visemes[fi_v] == visemes[fi_v - 1] == visemes[fi_v - 2]:
+                    alt_v = v6_to_v9.get(rms_vis6[fi_v], "D")
+                    visemes[fi_v] = alt_v if alt_v != visemes[fi_v] else ("D" if visemes[fi_v] != "D" else "C")
 
             # Offset word timestamps onto master timeline
             for wd in words:
@@ -1236,7 +1373,8 @@ async def render_cartoon_episode(
     concat_txt.write_text("\n".join(f"file '{p.resolve()}'" for p in audio_parts), encoding="utf-8")
     raw_dialogue_wav = work_dir / "dialogue_full.wav"
     run_ffmpeg_safe(
-        ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(concat_txt), "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(raw_dialogue_wav)]
+        ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(concat_txt), "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(raw_dialogue_wav)],
+        thermal_limit_c=thermal_limit_c,
     )
 
     if progress_cb:
@@ -1253,6 +1391,7 @@ async def render_cartoon_episode(
         cursor_t,
         0.15,
         0.40,
+        thermal_limit_c=thermal_limit_c,
     )
 
     if progress_cb:
@@ -1378,6 +1517,11 @@ async def render_cartoon_episode(
             draw_parallax_scenery_v2(c, 0, 0, w, h, scene.scene_type, scene.weather_fx, t, cam_pan_x=cam_pan_x)
 
             # 2. Both 2D Puppets v2 (Organic Bean Head, 2-Tone Cel-Shading, 2-Segment IK Arms, Legs, Rhubarb 9-Visemes!)
+            # If a 3rd/4th character speaks in this scene, place them in the right-hand slot dynamically
+            active_right_char = right_char
+            if speaker_id != left_char.char_id and speaker_id in char_map:
+                active_right_char = char_map[speaker_id]
+
             puppet_scale = 1.20 if plan.aspect_ratio == "9:16" else 1.12
             py = h * (0.555 if plan.aspect_ratio == "9:16" else 0.585)
             lx = w * (0.28 if plan.aspect_ratio == "9:16" else 0.30)
@@ -1385,30 +1529,53 @@ async def render_cartoon_episode(
 
             boat_bob = math.cos(t * 4.2) * 12.0 if scene.scene_type in ("boat_whale", "sea_storm", "boat_deck") else 0.0
             left_is_sp = (speaker_id == left_char.char_id) and is_within_speech
-            right_is_sp = (speaker_id == right_char.char_id) and is_within_speech
+            right_is_sp = (speaker_id == active_right_char.char_id) and is_within_speech and not left_is_sp
 
-            draw_cartoon_puppet_v2(
-                c, left_char, lx, py + boat_bob, puppet_scale, +1,
-                emotion=ev["emotion"] if speaker_id == left_char.char_id else listener_emotion,
-                viseme=active_viseme if left_is_sp else "X",
-                speech_energy=active_energy if left_is_sp else 0.0,
-                is_speaking=left_is_sp,
-                t=t,
-                blink_offset=0.0,
-                pose="standing",
-                dark_storm_lighting=is_storm_scene,
-            )
-            draw_cartoon_puppet_v2(
-                c, right_char, rx, py + boat_bob, puppet_scale, -1,
-                emotion=ev["emotion"] if speaker_id == right_char.char_id else listener_emotion,
-                viseme=active_viseme if right_is_sp else "X",
-                speech_energy=active_energy if right_is_sp else 0.0,
-                is_speaking=right_is_sp,
-                t=t,
-                blink_offset=1.45,
-                pose="standing",
-                dark_storm_lighting=is_storm_scene,
-            )
+            if _resolve_custom_mascot_image(left_char) is not None and getattr(left_char.visual_rig, "custom_mascot_png", None):
+                _draw_cartoon_puppet(
+                    c, left_char, lx, py + boat_bob, puppet_scale, +1,
+                    emotion=ev["emotion"] if left_is_sp else listener_emotion,
+                    viseme=active_viseme if left_is_sp else "fechada_neutra",
+                    speech_energy=active_energy if left_is_sp else 0.0,
+                    is_speaking=left_is_sp,
+                    t=t,
+                    blink_offset=0.0,
+                )
+            else:
+                draw_cartoon_puppet_v2(
+                    c, left_char, lx, py + boat_bob, puppet_scale, +1,
+                    emotion=ev["emotion"] if left_is_sp else listener_emotion,
+                    viseme=active_viseme if left_is_sp else "X",
+                    speech_energy=active_energy if left_is_sp else 0.0,
+                    is_speaking=left_is_sp,
+                    t=t,
+                    blink_offset=0.0,
+                    pose="standing",
+                    dark_storm_lighting=is_storm_scene,
+                )
+
+            if _resolve_custom_mascot_image(active_right_char) is not None and getattr(active_right_char.visual_rig, "custom_mascot_png", None):
+                _draw_cartoon_puppet(
+                    c, active_right_char, rx, py + boat_bob, puppet_scale, -1,
+                    emotion=ev["emotion"] if right_is_sp else listener_emotion,
+                    viseme=active_viseme if right_is_sp else "fechada_neutra",
+                    speech_energy=active_energy if right_is_sp else 0.0,
+                    is_speaking=right_is_sp,
+                    t=t,
+                    blink_offset=1.45,
+                )
+            else:
+                draw_cartoon_puppet_v2(
+                    c, active_right_char, rx, py + boat_bob, puppet_scale, -1,
+                    emotion=ev["emotion"] if right_is_sp else listener_emotion,
+                    viseme=active_viseme if right_is_sp else "X",
+                    speech_energy=active_energy if right_is_sp else 0.0,
+                    is_speaking=right_is_sp,
+                    t=t,
+                    blink_offset=1.45,
+                    pose="standing",
+                    dark_storm_lighting=is_storm_scene,
+                )
 
             # 3. Foreground rocking boat & foaming crest waves (1.25x parallax) + Comic Speed Lines!
             draw_foreground_boat_v2(c, 0, 0, w, h, scene.scene_type, scene.weather_fx, t)
