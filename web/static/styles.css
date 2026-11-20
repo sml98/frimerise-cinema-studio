@@ -1,0 +1,300 @@
+/* FrimeRise Cyber-Luxury Design System
+ * Obsidian Violet #0B0713 | Card #140E24 | Border rgba(179,136,255,0.18)
+ * Rosa Frime #FF2E93 | Lilás #B388FF | Verde Lima #B8FF01 | Dourado #FFD166
+ */
+
+:root {
+  color-scheme: dark;
+  --bg-obsidian: #0B0713;
+  --bg-card: #140E24;
+  --bg-card-elevated: #1B1330;
+  --border-glass: rgba(179, 136, 255, 0.18);
+  --border-glass-strong: rgba(179, 136, 255, 0.42);
+  --frime-pink: #FF2E93;
+  --frime-lilac: #B388FF;
+  --frime-lime: #B8FF01;
+  --frime-gold: #FFD166;
+  --text-main: #F8F5FF;
+  --text-muted: #B6A9D4;
+
+  /* Brand-consistent native form accent (>= 3:1 contrast on dark #0B0713) */
+  accent-color: var(--frime-lime);
+
+  /* Modern scrollbar styling */
+  --scrollbar-thumb: rgba(179, 136, 255, 0.45);
+  --scrollbar-track: #0B0713;
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  scrollbar-width: thin;
+}
+
+@supports not (scrollbar-color: auto) {
+  :root,
+  .custom-scroll {
+    scrollbar-width: auto;
+  }
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: 999px;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-obsidian);
+  color: var(--text-main);
+  font-family: "Plus Jakarta Sans", "Inter", system-ui, -apple-system, sans-serif;
+  min-height: 100vh;
+}
+
+body {
+  background-image:
+    radial-gradient(circle at 12% 8%, rgba(255, 46, 147, 0.14), transparent 34%),
+    radial-gradient(circle at 88% 12%, rgba(179, 136, 255, 0.16), transparent 36%),
+    radial-gradient(circle at 50% 96%, rgba(184, 255, 1, 0.06), transparent 40%);
+  background-attachment: fixed;
+}
+
+/* Glassmorphism surfaces */
+.glass-card {
+  background: linear-gradient(155deg, rgba(20, 14, 36, 0.92), rgba(14, 9, 26, 0.88));
+  border: 1px solid var(--border-glass);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+  border-radius: 1.25rem;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.glass-card-vip {
+  background: linear-gradient(155deg, rgba(28, 19, 48, 0.95), rgba(15, 10, 28, 0.92));
+  border: 1px solid rgba(255, 209, 102, 0.36);
+  box-shadow: 0 20px 54px rgba(0, 0, 0, 0.55), 0 0 30px rgba(255, 209, 102, 0.08);
+  border-radius: 1.25rem;
+}
+
+/* Brand Gradient Text & Buttons */
+.brand-gradient-text {
+  background: linear-gradient(135deg, var(--frime-pink), var(--frime-lilac));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.btn-lime {
+  background: var(--frime-lime);
+  color: #0B0713;
+  font-weight: 800;
+  border: none;
+  border-radius: 0.9rem;
+  cursor: pointer;
+  transition: transform 0.16s ease, box-shadow 0.16s ease, filter 0.16s ease;
+  box-shadow: 0 0 24px rgba(184, 255, 1, 0.34);
+}
+.btn-lime:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.06);
+  box-shadow: 0 0 34px rgba(184, 255, 1, 0.5);
+}
+.btn-lime:active {
+  transform: translateY(0);
+}
+
+.btn-pink-lilac {
+  background: linear-gradient(135deg, var(--frime-pink), var(--frime-lilac));
+  color: #FFFFFF;
+  font-weight: 700;
+  border: none;
+  border-radius: 0.85rem;
+  cursor: pointer;
+  transition: transform 0.16s ease, box-shadow 0.16s ease;
+  box-shadow: 0 8px 24px rgba(255, 46, 147, 0.28);
+}
+.btn-pink-lilac:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 12px 30px rgba(255, 46, 147, 0.42);
+}
+
+.btn-gold {
+  background: linear-gradient(135deg, #FFD166, #F4A261);
+  color: #0B0713;
+  font-weight: 800;
+  border: none;
+  border-radius: 0.85rem;
+  cursor: pointer;
+  transition: transform 0.16s ease, box-shadow 0.16s ease;
+  box-shadow: 0 8px 22px rgba(255, 209, 102, 0.28);
+}
+.btn-gold:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 28px rgba(255, 209, 102, 0.45);
+}
+
+.btn-ghost {
+  background: rgba(179, 136, 255, 0.08);
+  color: var(--text-main);
+  border: 1px solid var(--border-glass);
+  border-radius: 0.8rem;
+  cursor: pointer;
+  transition: border-color 0.16s ease, background 0.16s ease;
+}
+.btn-ghost:hover {
+  border-color: var(--frime-lilac);
+  background: rgba(179, 136, 255, 0.16);
+}
+
+/* Tabs */
+.nav-tab {
+  color: var(--text-muted);
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 0.85rem;
+  padding: 0.65rem 1.05rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+.nav-tab:hover {
+  color: var(--text-main);
+  background: rgba(179, 136, 255, 0.08);
+}
+.nav-tab.active {
+  color: #FFFFFF;
+  background: linear-gradient(135deg, rgba(255, 46, 147, 0.22), rgba(179, 136, 255, 0.24));
+  border-color: var(--frime-lilac);
+  box-shadow: 0 0 18px rgba(179, 136, 255, 0.22);
+}
+
+/* Inputs */
+.fr-input {
+  width: 100%;
+  background: rgba(11, 7, 19, 0.82);
+  border: 1px solid var(--border-glass);
+  border-radius: 0.78rem;
+  color: var(--text-main);
+  padding: 0.68rem 0.9rem;
+  font-size: 0.92rem;
+  outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.fr-input:focus {
+  border-color: var(--frime-lilac);
+  box-shadow: 0 0 0 3px rgba(179, 136, 255, 0.22);
+}
+
+/* Preset Card */
+.preset-card {
+  border: 1px solid var(--border-glass);
+  background: rgba(11, 7, 19, 0.65);
+  border-radius: 1rem;
+  padding: 0.9rem;
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+.preset-card:hover {
+  border-color: rgba(179, 136, 255, 0.55);
+  transform: translateY(-2px);
+}
+.preset-card.selected {
+  border-color: var(--frime-lime);
+  box-shadow: 0 0 22px rgba(184, 255, 1, 0.2);
+  background: rgba(20, 14, 36, 0.96);
+}
+
+/* 9:16 Vertical Phone Frame */
+.phone-frame {
+  aspect-ratio: 9 / 16;
+  width: 100%;
+  max-width: 280px;
+  background: #07040D;
+  border-radius: 1.5rem;
+  border: 2px solid rgba(179, 136, 255, 0.34);
+  overflow: hidden;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65);
+}
+
+/* Native <dialog> best practices (from modern-web-guidance) */
+dialog.fr-dialog {
+  background: var(--bg-card);
+  color: var(--text-main);
+  border: 1px solid var(--border-glass-strong);
+  border-radius: 1.25rem;
+  padding: 1.5rem;
+  max-width: 560px;
+  width: calc(100% - 2rem);
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.78);
+}
+dialog.fr-dialog:modal {
+  overscroll-behavior: contain;
+}
+dialog.fr-dialog::backdrop {
+  background: rgba(7, 4, 14, 0.76);
+  backdrop-filter: blur(6px);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+/* Progressive enhancement fallback for browsers without accent-color */
+@supports not (accent-color: #B8FF01) {
+  input[type="checkbox"].fr-check {
+    position: absolute !important;
+    clip-path: inset(50%) !important;
+    overflow: hidden !important;
+    width: 1px !important;
+    height: 1px !important;
+  }
+  input[type="checkbox"].fr-check + span::before {
+    content: "";
+    display: inline-block;
+    width: 1.1rem;
+    height: 1.1rem;
+    margin-right: 0.5rem;
+    border: 2px solid var(--frime-lilac);
+    border-radius: 4px;
+    vertical-align: middle;
+  }
+  input[type="checkbox"].fr-check:checked + span::before {
+    background: var(--frime-lime);
+    border-color: var(--frime-lime);
+  }
+}
+
+/* Progress bar */
+.lime-progress-track {
+  width: 100%;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(179, 136, 255, 0.14);
+  overflow: hidden;
+}
+.lime-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--frime-pink), var(--frime-lilac), var(--frime-lime));
+  border-radius: 999px;
+  transition: width 0.35s ease;
+}
+
+/* Pulse dot */
+@keyframes pulseGlow {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.6; transform: scale(1.18); }
+}
+.pulse-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  background: var(--frime-lime);
+  box-shadow: 0 0 12px var(--frime-lime);
+  animation: pulseGlow 1.8s infinite;
+}

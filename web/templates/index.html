@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <title>FrimeRise — Estúdio SaaS Local de Vídeos Virais</title>
+  <link rel="icon" type="image/png" href="/assets/brand/frimerise_logo.png" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            obsidian: '#0B0713',
+            cardbg: '#140E24',
+            frimepink: '#FF2E93',
+            frimelilac: '#B388FF',
+            frimelime: '#B8FF01',
+            frimegold: '#FFD166',
+          }
+        }
+      }
+    }
+  </script>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body class="antialiased selection:bg-frimepink selection:text-white">
+
+  <!-- ==================== 1. TOPBAR AO VIVO FRIMERISE ==================== -->
+  <header class="sticky top-0 z-40 border-b border-[rgba(179,136,255,0.18)] bg-[#0B0713]/90 backdrop-blur-xl">
+    <div class="max-w-[1440px] mx-auto px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-4">
+      <!-- Brand Identity -->
+      <div class="flex items-center gap-3">
+        <img src="/assets/brand/frimerise_logo.png" alt="Logo FrimeRise" class="w-11 h-11 rounded-2xl shadow-lg ring-1 ring-frimelilac/40" />
+        <div>
+          <div class="flex items-center gap-2">
+            <h1 class="text-2xl font-black tracking-tight brand-gradient-text leading-none">FrimeRise</h1>
+            <span class="text-[11px] font-extrabold uppercase tracking-wider px-2 py-0.5 rounded-full bg-frimepink/20 text-frimepink border border-frimepink/40">Studio Pro</span>
+          </div>
+          <p class="text-xs text-[#B6A9D4]">Acer Aspire 5 • Intel Core i5 Local SaaS • 100% Comercial</p>
+        </div>
+      </div>
+
+      <!-- Live Telemetry Badges -->
+      <div class="flex flex-wrap items-center gap-2.5 text-xs font-bold">
+        <!-- QuickSync ON (Lime Green) -->
+        <div id="badge-quicksync" class="flex items-center gap-2 px-3 py-1.5 rounded-full bg-frimelime/15 border border-frimelime/50 text-frimelime">
+          <span class="pulse-dot"></span>
+          <span id="txt-quicksync">Intel QuickSync iHD</span>
+        </div>
+
+        <!-- Skia C++ (Lilac) -->
+        <div class="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-frimelilac/15 border border-frimelilac/40 text-frimelilac">
+          <span>⚡</span>
+          <span>Skia C++ 200+ FPS</span>
+        </div>
+
+        <!-- Core i5 Temp -->
+        <div id="badge-temp" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-[#140E24] border border-[rgba(179,136,255,0.28)] text-white">
+          <span>🌡️</span>
+          <span>Core i5: <strong id="txt-temp">--°C</strong></span>
+        </div>
+
+        <!-- Cost in Gold -->
+        <div class="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-frimegold/15 border border-frimegold/45 text-frimegold">
+          <span>★</span>
+          <span>Custo IA: <strong id="txt-cost">$0.0000</strong></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Navigation Tabs -->
+    <nav class="max-w-[1440px] mx-auto px-4 sm:px-6 pb-3 flex flex-wrap items-center gap-2" aria-label="Navegação Principal">
+      <button type="button" class="nav-tab active" data-tab="factory">🎬 Fábrica Multi-Modo</button>
+      <button type="button" class="nav-tab" data-tab="vip">👑 Central VIP & Cascata 16:9</button>
+      <button type="button" class="nav-tab" data-tab="b2b">💼 Vender p/ Empresas (B2B)</button>
+      <button type="button" class="nav-tab" data-tab="clients">🎨 Estúdio de Clientes & Voz</button>
+      <button type="button" class="nav-tab" data-tab="autopilot">🚀 Piloto Automático & Views</button>
+      <button type="button" class="nav-tab" data-tab="setup">⚙️ Setup Rápido 1-Clique</button>
+    </nav>
+  </header>
+
+  <!-- Toast Banner -->
+  <div id="toast-box" class="fixed bottom-5 right-5 z-50 hidden max-w-md glass-card px-4 py-3 border-frimelime/60 text-sm font-semibold shadow-2xl"></div>
+
+  <main class="max-w-[1440px] mx-auto px-4 sm:px-6 py-6 space-y-6">
+
+    <!-- ==================== TAB 1: FÁBRICA MULTI-MODO ==================== -->
+    <section id="tab-factory" class="tab-panel space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <!-- Left: Manufacture Form -->
+        <div class="lg:col-span-7 glass-card p-6 space-y-5">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h2 class="text-xl font-black text-white">Fábrica Multi-Modo <span class="text-frimepink">FrimeRise</span></h2>
+              <p class="text-xs text-[#B6A9D4]">Produza 1 vídeo, lote de até 50 vídeos ou clone um viral concorrente.</p>
+            </div>
+            <!-- Mode Switcher -->
+            <div class="flex bg-[#0B0713] p-1 rounded-xl border border-[rgba(179,136,255,0.2)] text-xs font-bold">
+              <button type="button" class="mode-btn px-3 py-1.5 rounded-lg bg-frimepink text-white" data-mode="single">Tema Único</button>
+              <button type="button" class="mode-btn px-3 py-1.5 rounded-lg text-[#B6A9D4]" data-mode="batch">Lote 50 Vídeos</button>
+              <button type="button" class="mode-btn px-3 py-1.5 rounded-lg text-[#B6A9D4]" data-mode="clone_url">Clonar URL</button>
+            </div>
+          </div>
+
+          <!-- Seletor de Estilo Master -->
+          <div class="space-y-2">
+            <span class="block text-xs font-bold text-frimegold uppercase">Estilo Master do Vídeo</span>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <button type="button" class="style-btn text-left p-3.5 rounded-xl border border-frimelime bg-[#0B0713]/90 transition" data-style="cinematic_broll">
+                <div class="text-sm font-black text-white">🎬 Vídeo Dinâmico Cinematográfico</div>
+                <div class="text-[11px] text-[#B6A9D4] mt-0.5">Filmagens reais HD + Motion Graphics Skia + LUT 3D</div>
+              </button>
+              <button type="button" class="style-btn text-left p-3.5 rounded-xl border border-[rgba(179,136,255,0.22)] bg-[#0B0713]/70 transition" data-style="cartoon_2d">
+                <div class="text-sm font-black text-white">🎭 Animação 2D Cartoon v2 (Storytelling / Humor)</div>
+                <div class="text-[11px] text-[#B6A9D4] mt-0.5">60 FPS • Line Boil 8fps • Rhubarb 9-Visemas • Vozes Gemini TTS</div>
+              </button>
+            </div>
+          </div>
+
+          <!-- Opções Exclusivas de Animação 2D Cartoon Studio v2 -->
+          <div id="cartoon-2d-options" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl bg-[#0B0713]/85 border border-frimepink/40">
+            <div>
+              <label for="fac-aspect" class="block text-xs font-bold text-frimepink uppercase mb-1.5">Formato da Animação</label>
+              <select id="fac-aspect" class="fr-input">
+                <option value="9:16">📱 Vertical 9:16 — Shorts / TikTok / Reels (1080×1920)</option>
+                <option value="16:9">📺 Horizontal 16:9 — YouTube Longo 3-5 min (1920×1080)</option>
+              </select>
+            </div>
+            <div>
+              <label for="fac-tone" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Tom de Humor / Narração</label>
+              <select id="fac-tone" class="fr-input">
+                <option value="Comédia Nordestina/BR">😂 Comédia Nordestina / BR (Gírias e Quebras)</option>
+                <option value="Explicativo Ácido">🧠 Explicativo Ácido (OverSimplified / Paint)</option>
+                <option value="Sério Épico">⚔️ Sério Épico (Dramático com Virada)</option>
+              </select>
+            </div>
+            <div>
+              <label for="fac-fps" class="block text-xs font-bold text-frimelime uppercase mb-1.5">Fluidez da Animação (CPU Skia C++)</label>
+              <select id="fac-fps" class="fr-input">
+                <option value="60" selected>⚡ 60 FPS Ultra-Fluido (Line Boil 8fps + Paralaxe 2.5D)</option>
+                <option value="30">🎞️ 30 FPS Padrão (Render 2× Mais Rápido)</option>
+              </select>
+            </div>
+            <div>
+              <label for="fac-cartoon-voice" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Motor de Voz dos Personagens</label>
+              <select id="fac-cartoon-voice" class="fr-input">
+                <option value="gemini_tts" selected>🎭 Google Gemini TTS Expressivo (Atuação Real + Auto-Fallback)</option>
+                <option value="edge">⚡ Edge-TTS Instantâneo (Zero Custo / Ilimitado)</option>
+              </select>
+            </div>
+            <div class="sm:col-span-2 flex flex-wrap items-center gap-2 text-[11px] text-[#B6A9D4] pt-1">
+              <span class="px-2 py-0.5 rounded bg-frimelime/15 text-frimelime font-bold border border-frimelime/30">Rhubarb v1.14 (9 Visemas MIT)</span>
+              <span class="px-2 py-0.5 rounded bg-frimepink/15 text-frimepink font-bold border border-frimepink/30">Line Boil 8fps + Cel-Shading</span>
+              <span class="px-2 py-0.5 rounded bg-frimelilac/15 text-frimelilac font-bold border border-frimelilac/30">Braços IK + Pernas + Paralaxe 2.5D (0 tokens/frame)</span>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label for="fac-client" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Cliente / Canal</label>
+              <select id="fac-client" class="fr-input"></select>
+            </div>
+            <div>
+              <label for="fac-skill" class="block text-xs font-bold text-frimepink uppercase mb-1.5">Skill Viral (Cofre de Skills)</label>
+              <select id="fac-skill" class="fr-input"></select>
+            </div>
+          </div>
+
+          <!-- Mode Single -->
+          <div id="mode-single-wrap">
+            <label for="fac-topic" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Tema ou História do Vídeo</label>
+            <input id="fac-topic" type="text" class="fr-input" placeholder="Ex: Jonas tentando fugir de barco na tempestade (ou tema comercial/financeiro)" />
+          </div>
+
+          <!-- Mode Batch 50 -->
+          <div id="mode-batch-wrap" class="hidden">
+            <label for="fac-batch" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Lista de Temas (1 por linha — até 50 vídeos na fila)</label>
+            <textarea id="fac-batch" rows="5" class="fr-input" placeholder="Tema 1: Como economizar 3h por dia com IA&#10;Tema 2: O segredo da Starbucks para lucrar bilhões&#10;Tema 3: Por que seu anúncio local não vende"></textarea>
+          </div>
+
+          <!-- Mode Clone URL / Upload MP4 -->
+          <div id="mode-clone-wrap" class="hidden space-y-3">
+            <div>
+              <label for="fac-url" class="block text-xs font-bold text-frimepink uppercase mb-1.5">URL Concorrente (YouTube / TikTok / Reels — ex: @animabible7)</label>
+              <input id="fac-url" type="url" class="fr-input" placeholder="https://www.youtube.com/shorts/..." />
+            </div>
+            <div class="flex flex-wrap items-center gap-3">
+              <label class="btn-ghost px-3.5 py-2 text-xs font-bold cursor-pointer">
+                📂 Ou Subir MP4 de Referência
+                <input id="fac-ref-mp4" type="file" accept="video/mp4,video/webm" class="hidden" onchange="uploadReferenceMp4(this)" />
+              </label>
+              <input type="hidden" id="fac-ref-mp4-path" />
+              <span id="dna-status-badge" class="text-xs text-frimelilac"></span>
+            </div>
+            <p class="text-xs text-[#B6A9D4]">🧬 O <code class="text-frimelime">VideoDNAExtractor</code> detecta automaticamente se a referência é <strong>Filmagem Real</strong> ou <strong>Animação 2D Cartoon</strong> e chaveia o motor certo!</p>
+          </div>
+
+          <!-- Pro Options Checkboxes + Multi-Language Global Cloning -->
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+            <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.18)] cursor-pointer hover:border-frimelilac/50">
+              <input id="opt-motion" type="checkbox" class="fr-check w-4 h-4" checked />
+              <span class="text-xs font-bold text-white">Motion Graphics Skia</span>
+            </label>
+            <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.18)] cursor-pointer hover:border-frimelilac/50">
+              <input id="opt-loop" type="checkbox" class="fr-check w-4 h-4" checked />
+              <span class="text-xs font-bold text-white">Loop Infinito + Retention Doctor</span>
+            </label>
+            <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.18)] cursor-pointer hover:border-frimelilac/50">
+              <input id="opt-ab" type="checkbox" class="fr-check w-4 h-4" checked />
+              <span class="text-xs font-bold text-white">Teste A/B de Gancho</span>
+            </label>
+            <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/90 border border-frimegold/45 cursor-pointer hover:border-frimegold">
+              <input id="opt-clone-langs" type="checkbox" class="fr-check w-4 h-4" />
+              <span class="text-xs font-extrabold text-frimegold">🌎 Clonar Idiomas: Inglês (US) + Espanhol</span>
+            </label>
+          </div>
+
+          <!-- Primary CTA in Lime Green (#B8FF01) with Dark Text (#0B0713) -->
+          <button id="btn-manufacture" type="button" class="btn-lime w-full py-4 text-base tracking-wide flex items-center justify-center gap-2">
+            <span>⚡ FABRICAR VÍDEO AGORA</span>
+          </button>
+        </div>
+
+        <!-- Right: Live Render Pipeline & Queue -->
+        <div class="lg:col-span-5 glass-card p-6 flex flex-col justify-between space-y-4">
+          <div class="space-y-4">
+            <div class="flex items-center justify-between">
+              <h3 class="text-lg font-extrabold text-white">Monitor de Produção Ao Vivo</h3>
+              <span id="live-queue-badge" class="text-xs font-bold px-2.5 py-1 rounded-full bg-frimelilac/15 text-frimelilac border border-frimelilac/35">Fila: 0</span>
+            </div>
+
+            <div id="active-job-card" class="p-4 rounded-xl bg-[#0B0713]/90 border border-[rgba(179,136,255,0.22)] space-y-3">
+              <div class="flex items-center justify-between gap-2">
+                <span id="active-job-title" class="text-sm font-bold text-white truncate">Pronto para fabricar</span>
+                <span id="active-job-pct" class="text-sm font-black text-frimelime">0%</span>
+              </div>
+              <div class="lime-progress-track">
+                <div id="active-job-bar" class="lime-progress-fill" style="width: 0%;"></div>
+              </div>
+              <p id="active-job-stage" class="text-xs text-frimelilac font-semibold">Aguardando comando...</p>
+              <pre id="active-job-log" class="text-[11px] leading-relaxed text-[#B6A9D4] bg-[#07040D] p-3 rounded-lg h-44 overflow-y-auto custom-scroll whitespace-pre-wrap">Motor Skia C++ e Intel QuickSync iHD prontos em standby.</pre>
+            </div>
+          </div>
+
+          <!-- Hardware Guard Info -->
+          <div class="grid grid-cols-3 gap-2 text-center text-xs">
+            <div class="p-2.5 rounded-xl bg-[#0B0713]/70 border border-[rgba(179,136,255,0.16)]">
+              <div class="text-[#B6A9D4]">Encoder</div>
+              <div class="font-extrabold text-frimelime">h264_vaapi</div>
+            </div>
+            <div class="p-2.5 rounded-xl bg-[#0B0713]/70 border border-[rgba(179,136,255,0.16)]">
+              <div class="text-[#B6A9D4]">Áudio FM</div>
+              <div class="font-extrabold text-frimelilac">-14 LUFS</div>
+            </div>
+            <div class="p-2.5 rounded-xl bg-[#0B0713]/70 border border-[rgba(179,136,255,0.16)]">
+              <div class="text-[#B6A9D4]">Guardião</div>
+              <div class="font-extrabold text-frimegold">≤ 85°C Auto</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Recent Productions Strip -->
+      <div class="glass-card p-5 space-y-3">
+        <div class="flex items-center justify-between">
+          <h3 class="text-base font-extrabold text-white">Produções Recentes</h3>
+          <button type="button" onclick="refreshAll()" class="btn-ghost px-3 py-1.5 text-xs font-bold">↻ Atualizar</button>
+        </div>
+        <div id="recent-jobs-list" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3"></div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 2: CENTRAL VIP DE ENTREGAS ==================== -->
+    <section id="tab-vip" class="tab-panel hidden space-y-6">
+      <div class="glass-card-vip p-6 space-y-6">
+        <div class="flex flex-wrap items-center justify-between gap-4">
+          <div>
+            <div class="flex items-center gap-2">
+              <span class="text-frimegold text-xl">👑</span>
+              <h2 class="text-2xl font-black text-white">Central VIP de Vendas e Entregas</h2>
+            </div>
+            <p class="text-xs text-[#B6A9D4]">Compare Gancho A vs. Gancho B em 9:16 e baixe o pacote comercial completo em 1 clique.</p>
+          </div>
+          <div class="flex items-center gap-2">
+            <label for="vip-job-select" class="text-xs font-bold text-frimegold uppercase">Vídeo Selecionado:</label>
+            <select id="vip-job-select" class="fr-input !w-auto min-w-[260px]"></select>
+          </div>
+        </div>
+
+        <!-- Dual 9:16 Player (A vs B) + Commercial Package -->
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          <!-- Dual Vertical Players -->
+          <div class="lg:col-span-6 grid grid-cols-1 sm:grid-cols-2 gap-4 justify-items-center">
+            <div class="space-y-2 text-center w-full flex flex-col items-center">
+              <span class="text-xs font-extrabold px-3 py-1 rounded-full bg-frimepink/20 text-frimepink border border-frimepink/40">VERSÃO A • GANCHO PRINCIPAL</span>
+              <div class="phone-frame">
+                <video id="player-hook-a" controls playsinline class="w-full h-full object-cover bg-black"></video>
+              </div>
+            </div>
+            <div class="space-y-2 text-center w-full flex flex-col items-center">
+              <span class="text-xs font-extrabold px-3 py-1 rounded-full bg-frimelilac/20 text-frimelilac border border-frimelilac/40">VERSÃO B • TESTE A/B (CONCAT COPY)</span>
+              <div class="phone-frame">
+                <video id="player-hook-b" controls playsinline class="w-full h-full object-cover bg-black"></video>
+              </div>
+            </div>
+          </div>
+
+          <!-- 1-Click VIP Downloads + Cover Preview + Publish -->
+          <div class="lg:col-span-6 space-y-5">
+            <!-- VIP Deliverables Grid -->
+            <div class="space-y-2.5">
+              <h3 class="text-sm font-black uppercase tracking-wider text-frimegold">★ Pacote Comercial VIP (Downloads 1-Clique)</h3>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <a id="dl-master" href="#" class="btn-gold px-4 py-3 text-xs flex items-center justify-between no-underline">
+                  <span>🎬 Master MP4 1080p</span><span>↓</span>
+                </a>
+                <a id="dl-capcut" href="#" class="btn-gold px-4 py-3 text-xs flex items-center justify-between no-underline">
+                  <span>✂️ Projeto Editável CapCut (.zip)</span><span>↓</span>
+                </a>
+                <a id="dl-preview" href="#" class="btn-pink-lilac px-4 py-3 text-xs flex items-center justify-between no-underline">
+                  <span>💬 Prévia 540p WhatsApp (FRIMERISE)</span><span>↓</span>
+                </a>
+                <a id="dl-otio" href="#" class="btn-ghost px-4 py-3 text-xs font-bold flex items-center justify-between no-underline">
+                  <span>🎞️ Timeline Kdenlive Linux (.otio)</span><span>↓</span>
+                </a>
+                <a id="dl-cover" href="#" class="btn-ghost px-4 py-3 text-xs font-bold flex items-center justify-between no-underline">
+                  <span>🖼️ Capa 9:16 Skia HD (.png)</span><span>↓</span>
+                </a>
+                <a id="dl-hookb" href="#" class="btn-ghost px-4 py-3 text-xs font-bold flex items-center justify-between no-underline">
+                  <span>🧪 Master Versão B (A/B)</span><span>↓</span>
+                </a>
+              </div>
+            </div>
+
+            <!-- 3 ShadowHash Anti-Shadowban Mutations -->
+            <div class="p-4 rounded-xl bg-[#0B0713]/85 border border-frimelilac/30 space-y-2.5">
+              <div class="flex items-center justify-between">
+                <h4 class="text-xs font-extrabold uppercase text-frimelilac">🛡️ 3 Mutações ShadowHash (Zero Lavf • iPhone 16 Pro)</h4>
+                <span class="text-[10px] font-bold text-frimelime">Hashes Exclusivos</span>
+              </div>
+              <div class="grid grid-cols-3 gap-2">
+                <a id="dl-tiktok" href="#" class="btn-ghost py-2.5 px-3 text-xs font-bold text-center no-underline hover:border-frimepink">TikTok MP4 ↓</a>
+                <a id="dl-reels" href="#" class="btn-ghost py-2.5 px-3 text-xs font-bold text-center no-underline hover:border-frimelilac">Reels MP4 ↓</a>
+                <a id="dl-shorts" href="#" class="btn-ghost py-2.5 px-3 text-xs font-bold text-center no-underline hover:border-frimegold">Shorts MP4 ↓</a>
+              </div>
+            </div>
+
+            <!-- Cover Preview + Quick Publish Action -->
+            <div class="flex flex-col sm:flex-row items-center gap-4 p-4 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.2)]">
+              <img id="vip-cover-img" src="/assets/brand/frimerise_logo.png" alt="Capa 9:16 HD" class="w-24 h-40 object-cover rounded-xl border border-frimegold/40 bg-black" />
+              <div class="flex-1 space-y-3 w-full">
+                <div class="text-xs text-[#B6A9D4]" id="vip-job-meta">Selecione um vídeo concluído para inspecionar métricas e publicar.</div>
+                <div id="vip-retention-badge" class="text-[11px] text-frimelime font-bold">🩺 Retention Doctor: Open Loop a cada 15-25s ativo • 0 clichês robóticos</div>
+                <div class="flex flex-wrap gap-2">
+                  <button type="button" onclick="openPublishModal('tiktok')" class="btn-lime px-4 py-2.5 text-xs">🚀 Publicar Agora (TikTok)</button>
+                  <button type="button" onclick="openPublishModal('youtube')" class="btn-lime px-4 py-2.5 text-xs">▶ Publicar Shorts</button>
+                  <button type="button" onclick="openPublishModal('facebook')" class="btn-pink-lilac px-4 py-2.5 text-xs">📘 Publicar FB Reels</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ==================== GLOBAL SCALE & CONTENT CASCADE (16:9 -> 5 SHORTS + 3 THUMBS A/B + MULTI-LANGUAGE) ==================== -->
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 pt-4 border-t border-[rgba(179,136,255,0.22)]">
+          <!-- 1. Estúdio de 3 Thumbnails Magnéticas 1280x720 (Skia C++ + rembg u2netp) -->
+          <div class="lg:col-span-7 p-5 rounded-xl bg-[#0B0713]/90 border border-frimegold/35 space-y-4">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h3 class="text-sm font-black uppercase text-frimegold">🖼️ Estúdio de 3 Thumbnails Magnéticas 1280×720 (Teste A/B/C)</h3>
+                <p class="text-[11px] text-[#B6A9D4]">Skia C++ + <code class="text-frimelime">rembg (u2netp)</code> • Sujeito recortado, Tarja True Crime, Setas & Anton/Montserrat-Black (máx 3 palavras).</p>
+              </div>
+              <button type="button" id="btn-gen-thumbs" onclick="generateVipThumbnails()" class="btn-gold px-3.5 py-2 text-xs">🖼️ Gerar 3 Thumbnails A/B (1280×720)</button>
+            </div>
+            <div id="vip-thumbs-grid" class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div class="text-xs text-[#B6A9D4] sm:col-span-3">Geradas automaticamente para vídeos 16:9 ou clique no botão acima para criar o Trio A/B/C agora.</div>
+            </div>
+          </div>
+
+          <!-- 2. Cascata 16:9 -> 5 Cortes Virais 9:16 (Zero Tokens) + Dublagem Multi-Idioma (EN-US + ES) -->
+          <div class="lg:col-span-5 p-5 rounded-xl bg-[#0B0713]/90 border border-frimepink/35 space-y-4">
+            <div class="space-y-2">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <h3 class="text-sm font-black uppercase text-frimelime">⚡ Cascata 16:9 → 5 Shorts 9:16</h3>
+                <button type="button" id="btn-extract-shorts" onclick="extract5ViralShorts()" class="btn-lime px-3.5 py-2 text-xs">⚡ Extrair 5 Cortes Virais 9:16 (Zero Tokens)</button>
+              </div>
+              <p class="text-[11px] text-[#B6A9D4]">Re-enquadramento inteligente <code class="text-frimelilac">1920×1080 → 1080×1920</code> via MediaPipe / Centro de Interesse + Legenda Vertical + CTA pro vídeo longo.</p>
+              <div id="vip-shorts-list" class="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1"></div>
+            </div>
+
+            <div class="pt-3 border-t border-[rgba(179,136,255,0.2)] space-y-2">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <h3 class="text-sm font-black uppercase text-frimelilac">🌎 Dublagem Multi-Idioma (USD / EUR)</h3>
+                <button type="button" id="btn-dub-langs" onclick="dubVipJobLanguages()" class="btn-pink-lilac px-3.5 py-1.5 text-xs">🌎 Clonar EN-US + ES Agora</button>
+              </div>
+              <p class="text-[11px] text-[#B6A9D4]">Tradução cultural (&lt;500 tokens) + vozes nativas + Re-Timing automático de cenas e Lip-Sync 2D.</p>
+              <div id="vip-dubs-list" class="flex flex-wrap gap-2 pt-1"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 2.5: PROSPECÇÃO B2B EM 1 CLIQUE ("VENDER P/ EMPRESAS") ==================== -->
+    <section id="tab-b2b" class="tab-panel hidden space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <div class="lg:col-span-6 glass-card-vip p-6 space-y-5">
+          <div>
+            <span class="text-xs font-extrabold px-2.5 py-1 rounded-full bg-frimegold/20 text-frimegold border border-frimegold/40">MÁQUINA DE FECHAMENTO B2B</span>
+            <h2 class="text-2xl font-black text-white mt-2">Gerador de Prospecção B2B em 1 Clique</h2>
+            <p class="text-xs text-[#B6A9D4]">Digite apenas <strong>Empresa + Cidade + Produto/Serviço</strong>: o FrimeRise fabrica o vídeo demonstrativo em <strong>540p</strong> com a marca d'água diagonal translúcida <code class="text-frimepink">PRÉVIA EXCLUSIVA • FRIMERISE</code> e entrega a abordagem pronta para o WhatsApp!</p>
+          </div>
+
+          <div class="space-y-4">
+            <div>
+              <label for="b2b-company" class="block text-xs font-bold text-frimegold uppercase mb-1">Nome da Empresa / Negócio Local</label>
+              <input id="b2b-company" type="text" class="fr-input" placeholder="Ex: Clínica OdontoPrime" value="Clínica OdontoPrime" />
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <label for="b2b-city" class="block text-xs font-bold text-frimelilac uppercase mb-1">Cidade / Região</label>
+                <input id="b2b-city" type="text" class="fr-input" placeholder="Ex: Fortaleza" value="Fortaleza" />
+              </div>
+              <div>
+                <label for="b2b-product" class="block text-xs font-bold text-frimepink uppercase mb-1">Produto ou Serviço</label>
+                <input id="b2b-product" type="text" class="fr-input" placeholder="Ex: Lentes de Contato Dental" value="Lentes de Contato Dental" />
+              </div>
+            </div>
+            <div>
+              <label for="b2b-style" class="block text-xs font-bold text-frimelime uppercase mb-1">Estilo do Vídeo Demonstrativo</label>
+              <select id="b2b-style" class="fr-input">
+                <option value="cinematic_broll">🎬 Comercial Dinâmico Real HD + Card de Oferta Local</option>
+                <option value="cartoon_2d">🎭 Animação 2D Cartoon Humor Comercial (60 FPS)</option>
+              </select>
+            </div>
+
+            <button type="button" id="btn-b2b-generate" onclick="generateB2BProspect()" class="btn-lime w-full py-4 text-sm tracking-wide">
+              ⚡ GERAR PRÉVIA 540p + SCRIPT DE ABORDAGEM WHATSAPP
+            </button>
+          </div>
+        </div>
+
+        <div class="lg:col-span-6 glass-card p-6 space-y-4 flex flex-col justify-between">
+          <div class="space-y-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <h3 class="text-base font-black text-white">💬 Mensagem Comercial Pronta p/ WhatsApp</h3>
+              <span class="copy inline-flex items-center gap-2">
+                <button type="button" class="copy-button btn-gold px-3.5 py-2 text-xs min-w-[24px] min-h-[24px]" command="--copy" commandfor="b2b-pitch-text">
+                  📋 Copiar Abordagem WhatsApp
+                </button>
+                <span class="tip text-xs font-extrabold text-frimelime" role="status"></span>
+              </span>
+            </div>
+            <textarea id="b2b-pitch-text" rows="11" readonly class="fr-input text-xs leading-relaxed">Clique em "GERAR PRÉVIA 540p + SCRIPT DE ABORDAGEM WHATSAPP" ao lado para criar o vídeo com marca d'água diagonal "PRÉVIA EXCLUSIVA • FRIMERISE" e o texto persuasivo personalizado para a empresa.</textarea>
+          </div>
+
+          <div id="b2b-result-box" class="p-4 rounded-xl bg-[#0B0713]/85 border border-frimepink/35 text-xs text-[#B6A9D4]">
+            🎯 Assim que a fabricação iniciar, você pode acompanhar o progresso na Fábrica e baixar o arquivo <code class="text-frimelime">_PREVIA_540p_WhatsApp.mp4</code> na Central VIP.
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 3: ESTÚDIO DE CLIENTES / CANAIS ==================== -->
+    <section id="tab-clients" class="tab-panel hidden space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <!-- Client Selector & Form -->
+        <div class="lg:col-span-7 glass-card p-6 space-y-5">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-xl font-black text-white">Estúdio de Clientes & Canais</h2>
+              <p class="text-xs text-[#B6A9D4]">Configure presets, LUTs, Voice Blender PT-BR, Proxy GeoIP e contas Stealth.</p>
+            </div>
+            <button type="button" onclick="resetClientForm()" class="btn-ghost px-3 py-1.5 text-xs font-bold">+ Novo Cliente</button>
+          </div>
+
+          <div class="flex flex-wrap gap-2" id="clients-chips"></div>
+
+          <input type="hidden" id="cli-id" />
+          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label for="cli-name" class="block text-xs font-bold text-frimelilac uppercase mb-1">Nome do Cliente / Canal</label>
+              <input id="cli-name" type="text" class="fr-input" placeholder="Ex: Clínica Estética Prime" />
+            </div>
+            <div>
+              <label for="cli-niche" class="block text-xs font-bold text-frimelilac uppercase mb-1">Nicho de Mercado</label>
+              <input id="cli-niche" type="text" class="fr-input" placeholder="Ex: Saúde, Finanças, Negócio Local" />
+            </div>
+            <div>
+              <label for="cli-lut" class="block text-xs font-bold text-frimegold uppercase mb-1">3D LUT de Cinema (.cube)</label>
+              <select id="cli-lut" class="fr-input"></select>
+            </div>
+            <div>
+              <label for="cli-watermark" class="block text-xs font-bold text-frimepink uppercase mb-1">Marca d'Água (Prévia WhatsApp)</label>
+              <input id="cli-watermark" type="text" class="fr-input" value="PRÉVIA • FRIMERISE" />
+            </div>
+            <div>
+              <label for="cli-proxy" class="block text-xs font-bold text-frimelilac uppercase mb-1">Proxy Residencial (geoip=True)</label>
+              <input id="cli-proxy" type="text" class="fr-input" placeholder="http://user:pass@ip:porta (opcional)" />
+            </div>
+            <div>
+              <label for="cli-logo-file" class="block text-xs font-bold text-frimelilac uppercase mb-1">Logotipo do Cliente (PNG)</label>
+              <div class="flex gap-2">
+                <input id="cli-logo-path" type="text" class="fr-input text-xs" value="assets/brand/frimerise_logo.png" />
+                <label class="btn-ghost px-3 py-2 text-xs font-bold whitespace-nowrap cursor-pointer">
+                  Upload <input id="cli-logo-file" type="file" accept="image/*" class="hidden" onchange="uploadClientLogo(this)" />
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <!-- Voice Blender PT-BR -->
+          <div class="p-4 rounded-xl bg-[#0B0713]/85 border border-frimelilac/25 space-y-4">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <h3 class="text-sm font-extrabold text-white">🎙️ Voice Blender PT-BR (Kokoro OpenVINO + Edge-TTS)</h3>
+              <button type="button" id="btn-voice-preview" onclick="previewVoice()" class="btn-pink-lilac px-3.5 py-1.5 text-xs">▶ Ouvir Prévia</button>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label for="cli-voice-engine" class="block text-[11px] font-bold text-[#B6A9D4] mb-1">Motor de Voz</label>
+                <select id="cli-voice-engine" class="fr-input" onchange="syncVoiceListForEngine()">
+                  <option value="gemini_tts">Google Gemini TTS Expressivo (Atuação Real PT-BR)</option>
+                  <option value="edge">Edge-TTS Instantâneo (WordBoundary 0.1s)</option>
+                  <option value="kokoro">Kokoro-ONNX + OpenVINO (Voice Blender Local)</option>
+                </select>
+              </div>
+              <div>
+                <label for="cli-voice-id" class="block text-[11px] font-bold text-[#B6A9D4] mb-1">Voz Principal PT-BR</label>
+                <select id="cli-voice-id" class="fr-input"></select>
+              </div>
+            </div>
+            <div class="grid grid-cols-3 gap-3 text-xs">
+              <div>
+                <div class="flex justify-between mb-1"><span>pf_dora</span><strong id="lbl-dora" class="text-frimepink">35%</strong></div>
+                <input id="blend-dora" type="range" min="0" max="100" value="35" class="w-full" oninput="updateBlendLabels()" />
+              </div>
+              <div>
+                <div class="flex justify-between mb-1"><span>pm_alex</span><strong id="lbl-alex" class="text-frimelime">65%</strong></div>
+                <input id="blend-alex" type="range" min="0" max="100" value="65" class="w-full" oninput="updateBlendLabels()" />
+              </div>
+              <div>
+                <div class="flex justify-between mb-1"><span>pm_santa</span><strong id="lbl-santa" class="text-frimegold">0%</strong></div>
+                <input id="blend-santa" type="range" min="0" max="100" value="0" class="w-full" oninput="updateBlendLabels()" />
+              </div>
+            </div>
+            <audio id="voice-preview-audio" controls class="w-full hidden"></audio>
+          </div>
+
+          <!-- Stealth Camoufox Account Connections -->
+          <div class="p-4 rounded-xl bg-[#0B0713]/85 border border-frimepink/30 space-y-2.5">
+            <h3 class="text-xs font-extrabold uppercase text-frimepink">🦊 Conectar Contas via Camoufox Stealth (Perfil Isolado)</h3>
+            <div class="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+              <button type="button" onclick="connectSocial('tiktok')" class="btn-ghost py-2.5 px-3 text-xs font-bold hover:border-frimepink">🎵 Conectar TikTok</button>
+              <button type="button" onclick="connectSocial('youtube')" class="btn-ghost py-2.5 px-3 text-xs font-bold hover:border-frimegold">▶ Conectar YouTube</button>
+              <button type="button" onclick="connectSocial('facebook')" class="btn-ghost py-2.5 px-3 text-xs font-bold hover:border-frimelilac">📘 Conectar Facebook</button>
+            </div>
+          </div>
+
+          <button type="button" onclick="saveClient()" class="btn-lime w-full py-3.5 text-sm">💾 SALVAR CONFIGURAÇÃO DO CLIENTE</button>
+        </div>
+
+        <!-- 7 Visual Presets Selector -->
+        <div class="lg:col-span-5 glass-card p-6 space-y-4">
+          <div>
+            <h3 class="text-lg font-black text-white">7 Presets Visuais <span class="text-frimegold">1-Clique</span></h3>
+            <p class="text-xs text-[#B6A9D4]">Clique para aplicar tipografia, cores, LUT e trilha sonora do canal.</p>
+          </div>
+          <input type="hidden" id="cli-preset-id" value="frimerise_signature" />
+          <div id="presets-grid" class="space-y-2.5 max-h-[680px] overflow-y-auto custom-scroll pr-1"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 4: PILOTO AUTOMÁTICO & RETROALIMENTAÇÃO ==================== -->
+    <section id="tab-autopilot" class="tab-panel hidden space-y-6">
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <!-- Autopilot Schedule Calendar -->
+        <div class="lg:col-span-7 glass-card p-6 space-y-4">
+          <div class="flex items-center justify-between">
+            <div>
+              <h2 class="text-xl font-black text-white">Calendário de Piloto Automático</h2>
+              <p class="text-xs text-[#B6A9D4]">Agenda em Horário de Brasília (America/Sao_Paulo) com conversão automática para Asia/Shanghai no Facebook Reels.</p>
+            </div>
+            <button type="button" onclick="openPublishModal('tiktok')" class="btn-lime px-4 py-2 text-xs">+ Agendar Post</button>
+          </div>
+          <div id="schedules-list" class="space-y-2.5"></div>
+        </div>
+
+        <!-- Real Views Retro-Feedback Loop -->
+        <div class="lg:col-span-5 glass-card p-6 space-y-4">
+          <div>
+            <h3 class="text-lg font-black text-white">📈 Retroalimentação de Views Reais</h3>
+            <p class="text-xs text-[#B6A9D4]">Alimente os resultados reais no SQLite para os agentes priorizarem os ganchos campeões.</p>
+          </div>
+          <div class="space-y-3">
+            <select id="fb-job" class="fr-input"></select>
+            <div class="grid grid-cols-2 gap-3">
+              <select id="fb-platform" class="fr-input">
+                <option value="tiktok">TikTok</option>
+                <option value="reels">Instagram / FB Reels</option>
+                <option value="shorts">YouTube Shorts</option>
+              </select>
+              <select id="fb-variant" class="fr-input">
+                <option value="A">Gancho A</option>
+                <option value="B">Gancho B</option>
+              </select>
+            </div>
+            <div class="grid grid-cols-3 gap-2">
+              <input id="fb-views" type="number" min="0" class="fr-input" placeholder="Views" />
+              <input id="fb-likes" type="number" min="0" class="fr-input" placeholder="Likes" />
+              <input id="fb-ret" type="number" min="0" max="200" step="0.5" class="fr-input" placeholder="Ret %" />
+            </div>
+            <button type="button" onclick="submitFeedback()" class="btn-gold w-full py-2.5 text-xs">★ Registrar Métricas Campeãs</button>
+          </div>
+          <div class="pt-2 space-y-2">
+            <h4 class="text-xs font-extrabold uppercase text-frimegold">Ranking de Skills no SQLite</h4>
+            <div id="feedback-leaderboard" class="space-y-1.5 text-xs"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ==================== TAB 5: SETUP RÁPIDO 1-CLIQUE ==================== -->
+    <section id="tab-setup" class="tab-panel hidden space-y-6">
+      <div class="glass-card p-6 space-y-5 max-w-4xl mx-auto">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 class="text-xl font-black text-white">Setup Rápido 1-Clique <span class="text-frimelime">(Zero Terminal / Zero .env)</span></h2>
+            <p class="text-xs text-[#B6A9D4]">Todas as chaves são opcionais e ficam salvas localmente em <code class="text-frimelilac">data/frimerise.db</code>.</p>
+          </div>
+          <button type="button" onclick="testSetup()" class="btn-pink-lilac px-4 py-2.5 text-xs">🔍 Testar Conexões & Hardware</button>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <label for="set-gemini" class="text-xs font-bold text-frimelilac">Gemini API Key (LLM + Vozes Expressivas Gemini TTS)</label>
+              <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener" class="text-[11px] text-frimelime underline">Pegar grátis ↗</a>
+            </div>
+            <input id="set-gemini" type="password" class="fr-input" placeholder="AQ.... ou AIza..." />
+          </div>
+
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <label for="set-deepseek" class="text-xs font-bold text-frimelilac">DeepSeek API Key (deepseek-flash)</label>
+              <a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener" class="text-[11px] text-frimelime underline">Criar chave ↗</a>
+            </div>
+            <input id="set-deepseek" type="password" class="fr-input" placeholder="sk-..." />
+          </div>
+
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <label for="set-pixabay" class="text-xs font-bold text-frimelime">Pixabay Video API Key (Recomendado — Aprovação Instantânea)</label>
+              <a href="https://pixabay.com" target="_blank" rel="noopener" class="text-[11px] text-frimelime underline">Pegar na hora ↗</a>
+            </div>
+            <input id="set-pixabay" type="password" class="fr-input" placeholder="Chave Pixabay (liberada imediatamente)..." />
+          </div>
+
+          <div>
+            <div class="flex justify-between items-center mb-1">
+              <label for="set-pexels" class="text-xs font-bold text-[#B6A9D4]">Pexels Video API Key (Opcional Secundário)</label>
+              <a href="https://www.pexels.com/api/" target="_blank" rel="noopener" class="text-[11px] text-frimelilac underline">Opcional ↗</a>
+            </div>
+            <input id="set-pexels" type="password" class="fr-input" placeholder="Opcional (busca automática zero-key já ativa via yt-dlp + Wikimedia + Archive)..." />
+          </div>
+
+          <div>
+            <label for="set-llm" class="block text-xs font-bold text-frimepink mb-1">Motor IA Padrão (&lt; 1.800 tokens/vídeo)</label>
+            <select id="set-llm" class="fr-input">
+              <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite (Context Caching)</option>
+              <option value="gemini-3.8-flash">Gemini 3.8 Flash (Context Caching)</option>
+              <option value="deepseek-flash">DeepSeek Flash (Ultra Econômico)</option>
+              <option value="ollama">Ollama Local (100% Offline Gratuito)</option>
+            </select>
+          </div>
+
+          <div>
+            <label for="set-ollama" class="block text-xs font-bold text-frimelilac mb-1">URL Ollama Local & Limite Térmico (°C)</label>
+            <div class="flex gap-2">
+              <input id="set-ollama" type="text" class="fr-input" value="http://localhost:11434" />
+              <input id="set-thermal" type="number" min="70" max="95" class="fr-input !w-24 text-center" value="85" title="Pausa Térmica Core i5 (°C)" />
+            </div>
+          </div>
+        </div>
+
+        <div id="setup-test-results" class="hidden grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs"></div>
+
+        <button type="button" onclick="saveSettingsForm()" class="btn-lime w-full py-3.5 text-sm">💾 SALVAR CHAVES & PREFERÊNCIAS</button>
+      </div>
+    </section>
+  </main>
+
+  <!-- ==================== NATIVE <dialog> MODAL: PUBLICAR / AGENDAR ==================== -->
+  <dialog id="publish-dialog" class="fr-dialog" closedby="any" aria-labelledby="pub-dialog-title">
+    <div class="space-y-4">
+      <div class="flex items-center justify-between">
+        <h2 id="pub-dialog-title" class="text-lg font-black brand-gradient-text">Publicação Blindada Camoufox</h2>
+        <button type="button" onclick="document.getElementById('publish-dialog').close('cancel')" class="btn-ghost px-2.5 py-1 text-xs" aria-label="Fechar modal">✕</button>
+      </div>
+
+      <div class="space-y-3 text-xs">
+        <div>
+          <label for="pub-job" class="block font-bold text-frimelilac mb-1">Vídeo (Mutação ShadowHash automática)</label>
+          <select id="pub-job" class="fr-input"></select>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label for="pub-platform" class="block font-bold text-frimepink mb-1">Plataforma</label>
+            <select id="pub-platform" class="fr-input">
+              <option value="tiktok">TikTok (_tiktok.mp4)</option>
+              <option value="youtube">YouTube Shorts (_shorts.mp4)</option>
+              <option value="facebook">Facebook Reels (_reels.mp4 • TZ Shanghai)</option>
+            </select>
+          </div>
+          <div>
+            <label for="pub-schedule" class="block font-bold text-frimegold mb-1">Agendar (BRT — opcional)</label>
+            <input id="pub-schedule" type="datetime-local" class="fr-input" />
+          </div>
+        </div>
+        <div>
+          <label for="pub-caption" class="block font-bold text-frimelilac mb-1">Legenda & Hashtags</label>
+          <textarea id="pub-caption" rows="3" class="fr-input" placeholder="Descrição viral + #hashtags"></textarea>
+        </div>
+        <p class="text-[11px] text-[#B6A9D4]">🛡️ 1 navegador Camoufox por vez (<code class="text-frimelime">asyncio.Lock</code>) + Aquecedor Orgânico de 3 min + Proxy GeoIP.</p>
+      </div>
+
+      <div class="flex justify-end gap-2 pt-2">
+        <button type="button" onclick="submitSchedule()" class="btn-gold px-4 py-2.5 text-xs">📅 Agendar no Piloto Automático</button>
+        <button type="button" onclick="submitPublishNow()" class="btn-lime px-4 py-2.5 text-xs" autofocus>🚀 Publicar Agora</button>
+      </div>
+    </div>
+  </dialog>
+
+  <script src="/static/app.js?v=4"></script>
+</body>
+</html>

@@ -1,0 +1,36 @@
+# Python Virtual Environment & Bytecode
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Local SQLite Database (Contains User API Keys — NEVER COMMIT)
+data/frimerise.db
+data/frimerise.db-journal
+data/frimerise.db-wal
+data/frimerise.db-shm
+
+# Large Local Models, Browser Profiles, Caches & Generated Video Outputs
+data/models/
+data/broll_cache/
+data/cartoon_bg_cache/
+data/camoufox_profiles/
+data/references/
+outputs/
+
+# Heavy Local Binary Bundles (Reproducible via bootstrap_assets.py / start_frimerise.sh)
+vendor/syslibs/
+vendor/rhubarb/
+vendor/pyCapCut/.git/
+vendor/ShadowHash/.git/
+vendor/social-auto-upload/.git/
+vendor/pycaps/.git/
+
+# OS & Temp files
+.DS_Store
+*.log
+*.tmp
+
+data/media_cache/
+data/ref_cache/
