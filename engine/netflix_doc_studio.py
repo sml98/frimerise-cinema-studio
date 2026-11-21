@@ -2354,6 +2354,7 @@ async def _synthesize_doc_scene_narration(
                     lang,
                     thermal_limit_c,
                 )
+                raw_dur = _probe_wav_duration_s(raw_wav)
                 # Trim dead leading/trailing room-tone hiss AND cap any glitched >0.42s silence gaps
                 out_wav, _, out_dur = await asyncio.to_thread(
                     trim_silence_vad,
@@ -2365,14 +2366,18 @@ async def _synthesize_doc_scene_narration(
                     thermal_limit_c,
                     True,
                 )
-                if out_dur > max_sane_dur and gem_try == 0:
+                had_hiss_tail_glitch = (raw_dur > out_dur * 1.85) and ((raw_dur - out_dur) > 8.0)
+                min_sane_dur = max(1.6, len(spoken_text.split()) * 0.24)
+                if (out_dur > max_sane_dur or had_hiss_tail_glitch or out_dur < min_sane_dur) and gem_try == 0:
                     print(
-                        f"[NetflixDoc] Gemini TTS clip unusually long ({out_dur:.1f}s > {max_sane_dur:.1f}s) on {tag}, retrying briskly...",
+                        f"[NetflixDoc] Gemini TTS anomaly (raw={raw_dur:.1f}s, trim={out_dur:.1f}s, words={len(spoken_text.split())}) on {tag}, retrying cleanly...",
                         flush=True,
                     )
                     continue
                 if out_dur > max_sane_dur * 1.45:
                     raise RuntimeError(f"Gemini TTS duration glitch ({out_dur:.1f}s for {len(spoken_text.split())} words)")
+                if had_hiss_tail_glitch and out_dur < min_sane_dur * 1.15:
+                    raise RuntimeError(f"Gemini TTS dropped tail words (raw={raw_dur:.1f}s, trim={out_dur:.1f}s)")
                 aligned_words = await asyncio.to_thread(
                     align_script_words_to_audio,
                     out_wav,

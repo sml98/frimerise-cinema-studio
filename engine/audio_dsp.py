@@ -320,8 +320,8 @@ def trim_silence_vad(
     # Adaptive energy + zero-crossing speech detector (immune to long Gemini TTS trailing room-tone hiss!)
     frames = pcm[: n_frames * frame_len].reshape(n_frames, frame_len) if n_frames > 0 else np.zeros((0, frame_len), dtype=np.float32)
     rms_energy = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-10) if n_frames > 0 else np.zeros(0, dtype=np.float32)
-    peak_speech_ref = float(np.percentile(rms_energy, 92)) if n_frames > 10 else 0.05
-    energy_floor = max(0.014, peak_speech_ref * 0.11)
+    peak_speech_ref = float(np.percentile(rms_energy, 98)) if n_frames > 10 else 0.05
+    energy_floor = max(0.012, peak_speech_ref * 0.09)
 
     if silero_path.exists():
         try:
@@ -394,8 +394,9 @@ def trim_silence_vad(
 
     # Build time remapping table to shift WordBoundary timestamps accurately
     kept_indices = np.where(keep_mask)[0]
-    if len(kept_indices) < max(5, int(n_frames * 0.2)):
-        # Safety: if audio was very quiet, keep untouched
+    min_kept_frames = max(5, int(0.40 / frame_s))
+    if len(kept_indices) < min_kept_frames:
+        # Safety: only abort trim if <0.40s total speech was detected (never abort just because a glitched TTS tail is >80% of raw length)
         run_ffmpeg_safe(
             ["ffmpeg", "-y", "-v", "error", "-i", str(input_audio), "-ac", "2", "-ar", "48000", str(output_wav)],
             thermal_limit_c=thermal_limit_c,
@@ -547,14 +548,24 @@ def align_script_words_to_audio(
                         run_end += 1
                     t_left = aligned[-1]["end"] if aligned else speech_start
                     t_right = anchors[run_end][0] if run_end < n_t else speech_end
+                    if run_end == n_t and t_left >= dur_total - 0.12:
+                        # Narrator already finished at audio end (e.g. skipped a trailing fragment); avoid phantom out-of-bounds captions
+                        break
                     if t_right <= t_left + 0.05:
-                        h_i = min(n_h - 1, int(idx * n_h / n_t))
-                        t_right = max(t_left + 0.14 * (run_end - idx), heard[min(n_h - 1, h_i + (run_end - idx))][1])
-                    span = max(0.08 * (run_end - idx), t_right - t_left)
+                        if run_end == n_t:
+                            t_right = dur_total
+                        else:
+                            h_i = min(n_h - 1, int(idx * n_h / n_t))
+                            t_right = min(
+                                dur_total,
+                                max(t_left + 0.12 * (run_end - idx), heard[min(n_h - 1, h_i + (run_end - idx))][1]),
+                            )
+                    t_right = min(dur_total, max(t_left + 0.06, t_right))
+                    span = max(0.06, t_right - t_left)
                     step = span / float(run_end - idx)
                     for k, j_tok in enumerate(range(idx, run_end)):
-                        st = t_left + k * step
-                        en = min(dur_total, st + max(0.06, step * 0.92))
+                        st = min(max(0.0, t_left + k * step), max(0.0, dur_total - 0.05))
+                        en = min(dur_total, max(st + 0.04, st + max(0.05, step * 0.92)))
                         aligned.append({"word": tokens[j_tok], "start": round(st, 3), "end": round(en, 3)})
                     idx = run_end
             return aligned
