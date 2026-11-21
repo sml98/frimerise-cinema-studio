@@ -50,6 +50,21 @@ SAMPLE_RATE = 48000
 # Musical Mood Profiles (48kHz Broadcast Stereo Instrumental Beds)
 # ---------------------------------------------------------------------------
 MOOD_PROFILES: Dict[str, Dict[str, Any]] = {
+    "dark_horror_cinema": {
+        "bpm": 68.0,
+        "key": "D Phrygian / Minor (Gothic Horror & Dark History)",
+        "chords": [
+            [73.42, 110.00, 146.83, 155.56],  # Dm(b9) haunting cello drone
+            [69.30, 103.83, 138.59, 164.81],  # Eb/D tension
+            [65.41, 98.00, 130.81, 155.56],   # Cm dark swell
+            [73.42, 110.00, 138.59, 174.61],  # D diminished/minor suspense
+        ],
+        "bass_notes": [36.71, 38.89, 32.70, 36.71],
+        "motif_intervals": [1.0, 1.059, 1.498, 1.189, 1.0, 0.944, 1.414, 1.0],
+        "cutoff_hz": 3600.0,
+        "sub_drive": 1.95,
+        "perc_style": "horror_heartbeat",
+    },
     "dark_investigative": {
         "bpm": 98.0,
         "key": "D Minor (Dorian/Aeolian Tension)",
@@ -143,6 +158,7 @@ MOOD_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 MOOD_KEYWORD_MAP: List[Tuple[Tuple[str, ...], str]] = [
+    (("horror", "macabr", "terror", "sombrio", "sombria", "krampus", "natal", "christmas", "pagan", "ocult", "occult", "demon", "brux", "witch", "ghost", "creep", "assombr", "dark_horror"), "dark_horror_cinema"),
     (("investig", "dark", "wealth", "dossie", "dossiê", "vault", "crime", "mister", "myster", "thriller", "suspense", "fraude", "fraud", "pulse"), "dark_investigative"),
     (("epic", "doc", "netflix", "magnates", "cinema", "histor", "war", "guerra", "empire", "bilh", "billion", "colapso", "collapse"), "epic_cinema"),
     (("cartoon", "comed", "coméd", "humor", "nordest", "funny", "2d", "bouncy", "meme", "anim"), "bouncy_cartoon"),
@@ -542,7 +558,13 @@ def _synthesize_flow_music_bed(
         right[start:end] += pad_r * pad_env * lfo
 
         # 2. Deep Sub-Bass & Harmonic Ostinato
-        if perc_style in ("investigative_pulse", "driving_viral"):
+        if perc_style == "horror_heartbeat":
+            swell = 0.50 + 0.50 * np.sin(np.pi * seg_t / max(0.1, seg_t[-1]))
+            eerie_det = 1.0 + 0.004 * np.sin(2.0 * np.pi * 0.35 * seg_t)
+            sub_wave = np.tanh(
+                sub_drive * (np.sin(2.0 * np.pi * (bass_f * eerie_det) * seg_t) + 0.45 * np.sin(2.0 * np.pi * (bass_f * 2.0) * seg_t))
+            ) * 0.32 * swell
+        elif perc_style in ("investigative_pulse", "driving_viral"):
             pulse_rate = (bpm / 60.0) * 2.0
             pulse_env = 0.55 + 0.45 * np.sin(2.0 * np.pi * pulse_rate * seg_t)
             sub_wave = np.tanh(sub_drive * np.sin(2.0 * np.pi * bass_f * seg_t)) * 0.27 * pulse_env
@@ -559,9 +581,11 @@ def _synthesize_flow_music_bed(
         left[start:end] += sub_wave
         right[start:end] += sub_wave
 
-        # 3. Signature Stereo Motif / Arpeggio Pluck (8th notes across the bar)
-        root_note = chord[0] * (2.0 if perc_style != "lofi_boom_bap" else 1.0)
+        # 3. Signature Stereo Motif / Arpeggio Pluck (or eerie sparse music-box bell for horror)
+        root_note = chord[0] * (4.0 if perc_style == "horror_heartbeat" else (2.0 if perc_style != "lofi_boom_bap" else 1.0))
         for st_idx in range(8):
+            if perc_style == "horror_heartbeat" and st_idx not in (0, 3, 6):
+                continue
             st_pos = start + st_idx * step_samples
             if st_pos >= end:
                 break
@@ -572,9 +596,10 @@ def _synthesize_flow_music_bed(
             nt = np.linspace(0.0, st_len / float(SAMPLE_RATE), st_len, endpoint=False)
             ratio = motif_intervals[(st_idx + (b_idx % 2)) % len(motif_intervals)]
             note_f = root_note * ratio
-            decay = 8.5 if perc_style == "bouncy_pizzicato" else 5.2
-            pluck_env = np.minimum(1.0, nt / 0.008) * np.exp(-decay * nt)
-            pluck = (np.sin(2.0 * np.pi * note_f * nt) + 0.35 * np.sin(2.0 * np.pi * (note_f * 2.0) * nt) * np.exp(-12.0 * nt)) * pluck_env * 0.11
+            decay = 2.6 if perc_style == "horror_heartbeat" else (8.5 if perc_style == "bouncy_pizzicato" else 5.2)
+            pluck_env = np.minimum(1.0, nt / 0.010) * np.exp(-decay * nt)
+            gain_p = 0.065 if perc_style == "horror_heartbeat" else 0.11
+            pluck = (np.sin(2.0 * np.pi * note_f * nt) + 0.35 * np.sin(2.0 * np.pi * (note_f * 2.0) * nt) * np.exp(-12.0 * nt)) * pluck_env * gain_p
             pan_alt = 0.72 if st_idx % 2 == 0 else 0.36
             left[st_pos:st_end] += pluck * pan_alt
             right[st_pos:st_end] += pluck * (1.08 - pan_alt)
@@ -589,6 +614,15 @@ def _synthesize_flow_music_bed(
         if k_len <= 16:
             continue
         kt = np.linspace(0.0, k_len / float(SAMPLE_RATE), k_len, endpoint=False)
+
+        if perc_style == "horror_heartbeat":
+            if bt % 4 == 0:
+                f_sweep = 78.0 * np.exp(-16.0 * kt) + 34.0
+                phase = 2.0 * np.pi * np.cumsum(f_sweep) / float(SAMPLE_RATE)
+                thump = np.tanh(1.6 * np.sin(phase)) * np.exp(-9.5 * kt) * 0.24
+                left[pos : pos + k_len] += thump
+                right[pos : pos + k_len] += thump
+            continue
 
         if bt % 2 == 0:
             # Punchy low kick / heartbeat pulse

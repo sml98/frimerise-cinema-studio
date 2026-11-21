@@ -23,7 +23,7 @@
       }
     }
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=7" />
+  <link rel="stylesheet" href="/static/styles.css?v=8" />
 </head>
 <body class="antialiased selection:bg-frimepink selection:text-white">
 
@@ -1190,6 +1190,49 @@
           <button id="btn-save-remote-auth" type="submit" class="btn-pink-lilac w-full py-3 text-sm">🔐 SALVAR CREDENCIAIS &amp; SEGURANÇA REMOTA</button>
         </form>
       </div>
+
+      <!-- Card: Backup Automático Google Drive (Pastas Nomeadas + Economia de SSD) -->
+      <div class="glass-card p-6 space-y-4 max-w-4xl mx-auto border-frimelime/30">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 id="gdrive-heading" class="text-lg font-black text-white">☁️ Backup Automático no Google Drive <span class="text-frimelime">(Pastas Nomeadas)</span></h3>
+            <p class="text-xs text-[#B6A9D4]">Salva cada vídeo, 3 thumbs A/B, Shorts e relatório em uma pasta separada <code>FrimeRise/&lt;Tema_Data&gt;/</code> para economizar espaço no Acer Aspire 5.</p>
+          </div>
+          <span id="gdrive-status-pill" class="text-[11px] font-extrabold px-3 py-1 rounded-full bg-frimegold/15 text-frimegold border border-frimegold/40">Verificando Drive...</span>
+        </div>
+
+        <div class="p-3.5 rounded-xl bg-[#0B0713]/85 border border-[rgba(179,136,255,0.2)] text-xs space-y-1.5">
+          <div id="gdrive-status-detail" class="text-[#E4DDF8] font-semibold">Verificando conexão do Google Drive...</div>
+          <p class="text-[11px] text-[#B6A9D4]">Para conectar em 1 comando no terminal: <code class="text-frimegold">./setup_gdrive.sh</code> (ou informe abaixo o caminho de uma pasta local sincronizada com o Drive).</p>
+        </div>
+
+        <form id="gdrive-settings-form" aria-labelledby="gdrive-heading" class="space-y-3">
+          <fieldset class="space-y-3 border border-[rgba(179,136,255,0.22)] rounded-xl p-4">
+            <legend class="px-2 text-xs font-extrabold uppercase tracking-wider text-frimelime">Preferências de Armazenamento</legend>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div class="space-y-1">
+                <label for="gdrive-root-folder" class="block text-xs font-bold text-frimelilac">Pasta Raiz no Google Drive</label>
+                <input id="gdrive-root-folder" name="gdrive_root_folder" type="text" class="fr-input" value="FrimeRise" autocomplete="off" />
+              </div>
+              <div class="space-y-1">
+                <label for="gdrive-local-dir" class="block text-xs font-bold text-frimelilac">Pasta Montada Opcional (GNOME / Drive Sync)</label>
+                <input id="gdrive-local-dir" name="gdrive_local_dir" type="text" class="fr-input" placeholder="Automático via rclone ou GVFS..." autocomplete="off" />
+              </div>
+            </div>
+            <div class="flex flex-wrap gap-4 pt-1 text-xs text-[#E4DDF8]">
+              <label class="inline-flex items-center gap-2 cursor-pointer">
+                <input id="gdrive-auto-upload" name="gdrive_auto_upload" type="checkbox" class="w-4 h-4 accent-[#B8FF01] rounded" checked />
+                <span>Enviar automaticamente cada vídeo pronto para pasta nomeada no Drive</span>
+              </label>
+              <label class="inline-flex items-center gap-2 cursor-pointer">
+                <input id="gdrive-prune-local" name="gdrive_prune_local" type="checkbox" class="w-4 h-4 accent-[#FF2E93] rounded" />
+                <span>Liberar espaço no SSD local após confirmar upload no Drive (mantém prévia 540p + thumbs)</span>
+              </label>
+            </div>
+          </fieldset>
+          <button id="btn-save-gdrive" type="submit" class="btn-lime w-full py-2.5 text-xs">☁️ SALVAR CONFIGURAÇÃO DO GOOGLE DRIVE</button>
+        </form>
+      </div>
     </section>
   </main>
 
@@ -1234,6 +1277,6 @@
     </div>
   </dialog>
 
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>

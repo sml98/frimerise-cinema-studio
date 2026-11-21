@@ -82,10 +82,9 @@ try:
 except ImportError:
     audit_netflix_doc_plan = None  # type: ignore
 
-try:
-    from engine.flow_vault import fetch_or_generate_flow_music
-except ImportError:
-    fetch_or_generate_flow_music = None  # type: ignore
+from engine.flow_vault import fetch_or_generate_flow_music
+from engine.gdrive_sync import upload_job_to_gdrive
+from engine.gemini_tts import has_valid_gemini_key
 
 try:
     from engine.bespoke_visuals import render_25d_parallax_clip, render_bespoke_scene_clip
@@ -173,6 +172,14 @@ def _resolve_voice_overrides(
     elif engine_style == "cartoon_2d":
         c_ve = str(opts.get("cartoon_voice_engine") or "gemini_tts").strip().lower()
         eff_engine = c_ve if c_ve in ("gemini_tts", "edge", "kokoro") else "gemini_tts"
+    elif engine_style == "netflix_doc":
+        gem_ok, _ = has_valid_gemini_key()
+        if gem_ok:
+            eff_engine = "gemini_tts"
+        else:
+            eff_engine = str(client.get("voice_engine") or preset.get("voice_engine") or "edge").strip().lower()
+            if eff_engine not in ("gemini_tts", "edge", "kokoro"):
+                eff_engine = "edge"
     else:
         eff_engine = str(client.get("voice_engine") or preset.get("voice_engine") or "edge").strip().lower()
         if eff_engine not in ("gemini_tts", "edge", "kokoro"):
@@ -183,7 +190,8 @@ def _resolve_voice_overrides(
     else:
         client_vid = str(client.get("voice_id") or preset.get("voice_id") or "").strip()
         if eff_engine == "gemini_tts":
-            eff_voice_id = client_vid if client_vid in _GEMINI_VOICE_IDS else "Puck"
+            default_gem = "Charon" if engine_style == "netflix_doc" else "Puck"
+            eff_voice_id = client_vid if client_vid in _GEMINI_VOICE_IDS else default_gem
         elif eff_engine == "kokoro":
             eff_voice_id = client_vid if client_vid in KOKORO_VOICES else "pm_alex"
         else:
@@ -1251,9 +1259,7 @@ async def run_video_job(
 
                 # Enforce user LUT, voice, caption style, directives & visual library mix on documentary plan
                 doc_plan["lut_file"] = lut_file
-                if eff_voice_engine == "edge" and eff_voice_id:
-                    doc_plan["voice_id"] = eff_voice_id
-                elif opts.get("voice_id") and "Neural" in eff_voice_id:
+                if eff_voice_id:
                     doc_plan["voice_id"] = eff_voice_id
                 doc_plan["caption_style"] = caption_style
                 if custom_directives:
@@ -1311,6 +1317,10 @@ async def run_video_job(
                 doc_render_kwargs["voice_pitch"] = voice_pitch
             if "resume" in doc_sig.parameters:
                 doc_render_kwargs["resume"] = is_resume
+            if "voice_engine" in doc_sig.parameters:
+                doc_render_kwargs["voice_engine"] = eff_voice_engine
+            if "cut_cadence_s" in doc_sig.parameters:
+                doc_render_kwargs["cut_cadence_s"] = cut_cadence_s
 
             render_info = await render_netflix_documentary(**doc_render_kwargs)
 
@@ -1427,6 +1437,18 @@ async def run_video_job(
                 except Exception as exc:
                     append_job_log(job_id, f"Aviso na dublagem documental: {exc}")
 
+            # Optional automatic Google Drive backup into named project folder (saves local disk space!)
+            gdrive_backup: Dict[str, Any] = {"status": "skipped"}
+            if settings.get("gdrive_auto_upload", "1") == "1":
+                append_job_log(job_id, "☁️ Verificando backup automático em pasta nomeada no Google Drive...", progress=98, stage="Sincronizando Google Drive")
+                gdrive_backup = await asyncio.to_thread(upload_job_to_gdrive, job_dir, doc_title, job_id)
+                if gdrive_backup.get("status") == "uploaded":
+                    append_job_log(
+                        job_id,
+                        f"☁️ Backup salvo no Google Drive: {gdrive_backup.get('remote_path')} ({gdrive_backup.get('files_uploaded')} arquivos, {gdrive_backup.get('total_mb')} MB)"
+                        + (f" | Liberados {gdrive_backup.get('freed_mb')} MB no SSD!" if gdrive_backup.get("pruned_local") else ""),
+                    )
+
             (job_dir / "words.json").write_text(json.dumps(words_a, ensure_ascii=False), encoding="utf-8")
             quality_report = {
                 "job_id": job_id,
@@ -1445,23 +1467,29 @@ async def run_video_job(
                 "ab_thumbnails": ab_thumbs_doc,
                 "shorts_cascade": shorts_cascade,
                 "dubbed_languages": dubbed_langs_doc,
+                "gdrive_backup": gdrive_backup,
                 "scenes_count": render_info.get("scenes_count", len(doc_plan.get("scenes", []))),
                 "duration_s": round(duration_s, 2),
             }
             (job_dir / "quality_report.json").write_text(json.dumps(quality_report, indent=2, ensure_ascii=False), encoding="utf-8")
 
             now_done = datetime.now().isoformat(timespec="seconds")
+            done_stage = (
+                f"Documentário Cinema Concluído • 3 Thumbs + {len(shorts_cascade)} Shorts Prontos"
+                if shorts_cascade
+                else "Documentário Cinema Concluído • 3 Thumbs A/B Prontas"
+            )
             update_job(
                 job_id,
                 status="completed",
                 progress=100,
-                stage="Documentário Cinema Concluído • 3 Thumbs + 5 Shorts Prontos",
-                master_path=_rel_output(master_mp4),
-                hook_a_path=_rel_output(master_mp4),
+                stage=done_stage,
+                master_path=_rel_output(master_mp4) if master_mp4.exists() else _rel_output(preview_mp4),
+                hook_a_path=_rel_output(master_mp4) if master_mp4.exists() else _rel_output(preview_mp4),
                 hook_b_path="",
-                tiktok_path=_rel_output(Path(sh_variants["tiktok"]["path"])),
-                reels_path=_rel_output(Path(sh_variants["reels"]["path"])),
-                shorts_path=_rel_output(Path(sh_variants["shorts"]["path"])),
+                tiktok_path=_rel_output(Path(sh_variants["tiktok"]["path"])) if Path(sh_variants["tiktok"]["path"]).exists() else "",
+                reels_path=_rel_output(Path(sh_variants["reels"]["path"])) if Path(sh_variants["reels"]["path"]).exists() else "",
+                shorts_path=_rel_output(Path(sh_variants["shorts"]["path"])) if Path(sh_variants["shorts"]["path"]).exists() else "",
                 preview_path=_rel_output(preview_mp4),
                 capcut_zip_path=_rel_output(capcut_zip) if capcut_zip.exists() else "",
                 otio_path=_rel_output(otio_path) if otio_path.exists() else "",
@@ -1471,7 +1499,8 @@ async def run_video_job(
             )
             append_job_log(
                 job_id,
-                f"DOCUMENTÁRIO CINEMA FINALIZADO COM SUCESSO! ({duration_s:.1f}s | {vid_w}x{vid_h} | 3 Thumbs A/B + {len(shorts_cascade)} Shorts)",
+                f"DOCUMENTÁRIO CINEMA FINALIZADO COM SUCESSO! ({duration_s:.1f}s | {vid_w}x{vid_h} @ {int(render_info.get('fps', resolved_fps))}fps | 3 Thumbs A/B"
+                + (f" + {len(shorts_cascade)} Shorts)" if shorts_cascade else ")"),
                 progress=100,
             )
             return {"job_id": job_id, "status": "completed", "engine_style": "netflix_doc", "master_path": str(master_mp4)}

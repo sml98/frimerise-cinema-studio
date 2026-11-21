@@ -86,6 +86,149 @@ PHOTO_BAD_WORDS = (
     "svg",
 )
 
+# Strict semantic off-topic blocklist so random stock junk (tile floors, butterflies, flowers,
+# bathrooms, pets, disco parties, abstract wallpapers) NEVER slips into serious documentaries!
+OFFTOPIC_MEDIA_TAGS = (
+    "floor",
+    "floors",
+    "flooring",
+    "tile",
+    "tiles",
+    "tiling",
+    "ceramic",
+    "pavement",
+    "sidewalk",
+    "carpet",
+    "rug",
+    "linoleum",
+    "parquet",
+    "butterfly",
+    "butterflies",
+    "insect",
+    "insects",
+    "moth",
+    "ladybug",
+    "bee",
+    "beetle",
+    "dragonfly",
+    "flower",
+    "flowers",
+    "petal",
+    "blossom",
+    "tulip",
+    "daisy",
+    "sunflower",
+    "bouquet",
+    "bathroom",
+    "toilet",
+    "shower",
+    "kitchen",
+    "bedroom",
+    "living room",
+    "sofa",
+    "couch",
+    "furniture",
+    "interior design",
+    "beach",
+    "tropical",
+    "palm tree",
+    "surf",
+    "swimming pool",
+    "bikini",
+    "yoga",
+    "fitness",
+    "gym",
+    "workout",
+    "selfie",
+    "makeup",
+    "cosmetics",
+    "fashion model",
+    "pizza",
+    "burger",
+    "coffee cup",
+    "cupcake",
+    "smoothie",
+    "puppy",
+    "kitten",
+    "cat",
+    "dog",
+    "hamster",
+    "aquarium",
+    "disco",
+    "confetti",
+    "balloon",
+    "balloons",
+    "birthday",
+    "wedding dress",
+    "baby",
+    "toddler",
+    "toy",
+    "toys",
+    "wallpaper",
+    "seamless",
+    "texture",
+    "abstract",
+    "glitter",
+    "sparkle",
+    "confetti",
+    "emoji",
+    "cartoon",
+    "anime",
+)
+
+DARK_HISTORY_EXTRA_BAD_TAGS = (
+    "office",
+    "laptop",
+    "smartphone",
+    "typing",
+    "skyscraper",
+    "traffic",
+    "highway",
+    "neon",
+    "cyberpunk",
+    "business",
+    "corporate",
+    "meeting",
+    "smiling",
+    "happy family",
+    "gift box",
+    "shopping mall",
+)
+
+
+def _is_offtopic_media_tags(tags_text: str, query: str = "", mood: str = "") -> bool:
+    """Reject off-topic stock hits (tile floors, butterflies, textures, modern offices in history docs)."""
+    t_low = f" {(tags_text or '').lower()} "
+    q_low = (query or "").lower()
+    for bad in OFFTOPIC_MEDIA_TAGS:
+        if bad in t_low and bad not in q_low:
+            return True
+    if mood in ("dark_horror", "epic_history"):
+        for bad in DARK_HISTORY_EXTRA_BAD_TAGS:
+            if bad in t_low and bad not in q_low:
+                return True
+    return False
+
+
+def _score_media_relevance(query: str, tags_text: str, mood: str = "") -> int:
+    """Score how well a candidate's tags/title actually match the requested query."""
+    if _is_offtopic_media_tags(tags_text, query=query, mood=mood):
+        return -100
+    t_low = (tags_text or "").lower()
+    q_tokens = [
+        tok for tok in re.findall(r"[a-z]{3,}", (query or "").lower())
+        if tok not in STOP_WORDS and tok not in ("dark", "night", "old", "vintage", "photo", "image", "cinema", "cinematic")
+    ]
+    if not q_tokens:
+        return 1
+    score = 0
+    for tok in q_tokens:
+        if tok in t_low:
+            score += 3
+        elif len(tok) >= 5 and tok[:5] in t_low:
+            score += 2
+    return score
+
 STOP_WORDS = {
     "the", "a", "an", "of", "in", "on", "at", "to", "for", "from", "with",
     "by", "and", "or", "as", "is", "was", "were", "into", "over", "under",
@@ -424,10 +567,11 @@ def _search_pixabay_photos(
     query: str,
     api_key: str,
     min_width: int = 640,
+    mood: str = "",
 ) -> List[Dict[str, str]]:
     if not api_key:
         return []
-    results: List[Dict[str, str]] = []
+    scored_results: List[Tuple[int, Dict[str, str]]] = []
     seen_urls: Set[str] = set()
 
     queries_to_try = [query]
@@ -443,8 +587,7 @@ def _search_pixabay_photos(
                     "key": api_key,
                     "q": q,
                     "image_type": "photo",
-                    "orientation": "horizontal",
-                    "per_page": 8,
+                    "per_page": 12,
                     "safesearch": "true",
                 },
                 timeout=10.0,
@@ -455,6 +598,9 @@ def _search_pixabay_photos(
                 tags = str(hit.get("tags") or "").lower()
                 if any(bad in tags for bad in PHOTO_BAD_WORDS):
                     continue
+                rel_score = _score_media_relevance(q, tags, mood=mood)
+                if rel_score <= 0:
+                    continue
                 img_w = int(hit.get("imageWidth") or hit.get("webformatWidth") or 0)
                 img_h = int(hit.get("imageHeight") or hit.get("webformatHeight") or 0)
                 if img_w and img_w < max(320, min_width):
@@ -464,18 +610,20 @@ def _search_pixabay_photos(
                 url = str(hit.get("largeImageURL") or hit.get("webformatURL") or "").strip()
                 if url and url not in seen_urls:
                     seen_urls.add(url)
-                    results.append({"source": "pixabay_photo", "url": url})
-            if results:
+                    scored_results.append((rel_score, {"source": "pixabay_photo", "url": url}))
+            if scored_results:
                 break
         except Exception:
             continue
-    return results
+    scored_results.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in scored_results]
 
 
 def _search_wikimedia_photos(
     client: httpx.Client,
     query: str,
     min_width: int = 640,
+    mood: str = "",
 ) -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
     seen_urls: Set[str] = set()
@@ -495,7 +643,7 @@ def _search_wikimedia_photos(
                     "generator": "search",
                     "gsrnamespace": 6,
                     "gsrsearch": q,
-                    "gsrlimit": 6,
+                    "gsrlimit": 10,
                     "prop": "imageinfo",
                     "iiprop": "url|size|mime",
                     "iiurlwidth": 1280,
@@ -510,6 +658,8 @@ def _search_wikimedia_photos(
             for page in pages.values():
                 title_l = str(page.get("title") or "").lower()
                 if any(bad in title_l for bad in PHOTO_BAD_WORDS):
+                    continue
+                if _is_offtopic_media_tags(title_l, query=q, mood=mood):
                     continue
                 ii = (page.get("imageinfo") or [{}])[0]
                 mime = str(ii.get("mime") or "").lower()
@@ -529,8 +679,8 @@ def _search_wikimedia_photos(
                     url = str(ii.get("url") or "").strip()
                 if not url or url in seen_urls:
                     continue
-                # Sort high-res candidates ahead of narrow archival scans
-                priority = 0 if w >= min_width else 1
+                rel_score = _score_media_relevance(q, title_l, mood=mood)
+                priority = (0 if w >= min_width else 10) - max(0, rel_score)
                 seen_urls.add(url)
                 results.append({"source": "wikimedia_photo", "url": url, "priority": str(priority)})
             if results:
@@ -929,7 +1079,7 @@ def fetch_doc_real_photo(
         def _try_pixabay() -> Optional[Path]:
             if not pixabay_key:
                 return None
-            for item in _search_pixabay_photos(client, norm_q, pixabay_key, min_width=eff_min_w):
+            for item in _search_pixabay_photos(client, norm_q, pixabay_key, min_width=eff_min_w, mood=resolved_mood):
                 url = item["url"]
                 if url in used:
                     continue
@@ -940,7 +1090,7 @@ def fetch_doc_real_photo(
             return None
 
         def _try_wikimedia() -> Optional[Path]:
-            wiki_candidates = _search_wikimedia_photos(client, norm_q, min_width=eff_min_w)
+            wiki_candidates = _search_wikimedia_photos(client, norm_q, min_width=eff_min_w, mood=resolved_mood)
             for req_w in (eff_min_w, 320):
                 for item in wiki_candidates:
                     url = item["url"]
@@ -954,15 +1104,36 @@ def fetch_doc_real_photo(
                     break
             return None
 
-        # a/b) Pixabay & Wikimedia Commons real archival photography
+        def _try_google_flow_bespoke() -> Optional[Path]:
+            try:
+                from engine.google_flow_bridge import generate_flow_bespoke_photo_sync
+
+                flow_prompt = bespoke_prompt_en.strip() if bespoke_prompt_en.strip() else norm_q
+                flow_target = DOC_PHOTO_CACHE_DIR / f"flow_{q_hash}.jpg"
+                flow_path = generate_flow_bespoke_photo_sync(
+                    prompt_en=flow_prompt,
+                    out_path=flow_target,
+                    aspect_ratio=aspect_ratio,
+                    mood=resolved_mood,
+                    try_browser=bool(prefer_gemini or _BESPOKE_HISTORY_FOLKLORE_RE.search(flow_prompt)),
+                )
+                if flow_path is not None and flow_path.exists():
+                    ok_v, fw, fh = _validate_photo_file(flow_path, min_width=320, min_height=200)
+                    if ok_v:
+                        return _record_and_return(flow_path, f"flow://{q_hash}", "google_flow_bespoke", fw, fh)
+            except Exception:
+                pass
+            return None
+
+        # a/b) Pixabay & Wikimedia Commons real archival photography (with Google Flow bespoke for folklore/macabre)
         if prefer_wiki_first:
-            hit = _try_wikimedia() or _try_pixabay()
+            hit = _try_wikimedia() or _try_google_flow_bespoke() or _try_pixabay()
         else:
             hit = _try_pixabay() or _try_wikimedia()
         if hit is not None:
             return hit
 
-        # c) Bespoke Gemini Native Image Generation if real stock missed
+        # c) Bespoke Gemini Native Image -> Google Flow (Nano Banana 2 / Pollinations Flux) when stock misses!
         if not gemini_tried:
             gem_prompt = bespoke_prompt_en.strip() if bespoke_prompt_en.strip() else norm_q
             gem_path = generate_doc_gemini_image(
@@ -977,6 +1148,10 @@ def fetch_doc_real_photo(
             if gem_path is not None:
                 return gem_path
 
+        flow_hit = _try_google_flow_bespoke()
+        if flow_hit is not None:
+            return flow_hit
+
         # d) Mood-curated real documentary photo queries fallback (NEVER financial banks for dark_horror/history!)
         fb_pool = list(mood_defaults)
         start_idx = int(q_hash[:4], 16) % len(fb_pool)
@@ -984,9 +1159,9 @@ def fetch_doc_real_photo(
             fb_q = fb_pool[(start_idx + offset) % len(fb_pool)]
             fb_candidates: List[Dict[str, str]] = []
             if pixabay_key:
-                fb_candidates.extend(_search_pixabay_photos(client, fb_q, pixabay_key, min_width=eff_min_w))
+                fb_candidates.extend(_search_pixabay_photos(client, fb_q, pixabay_key, min_width=eff_min_w, mood=resolved_mood))
             if not fb_candidates:
-                fb_candidates.extend(_search_wikimedia_photos(client, fb_q, min_width=320))
+                fb_candidates.extend(_search_wikimedia_photos(client, fb_q, min_width=320, mood=resolved_mood))
             for item in fb_candidates:
                 url = item["url"]
                 if url in used:
@@ -1247,8 +1422,9 @@ def _fetch_pixabay_doc_broll(
     api_key: str,
     used_hashes: Set[str],
     want_landscape: bool = True,
+    mood: str = "",
 ) -> Optional[Tuple[Path, str]]:
-    """Fast Pixabay HD B-roll search preferring 1080p/720p MP4s & caching in data/doc_broll_cache/."""
+    """Fast Pixabay HD B-roll search preferring 1080p/720p MP4s with strict anti-junk semantic filtering."""
     if not api_key:
         return None
     queries_to_try = [query]
@@ -1264,7 +1440,7 @@ def _fetch_pixabay_doc_broll(
                 params={
                     "key": api_key,
                     "q": clean_q,
-                    "per_page": 8,
+                    "per_page": 14,
                     "safesearch": "true",
                 },
                 timeout=10.0,
@@ -1275,10 +1451,19 @@ def _fetch_pixabay_doc_broll(
         except Exception:
             continue
 
+        # Rank hits strictly by semantic relevance & filter out butterflies/floor tiles/abstract junk!
+        ranked_hits: List[Tuple[int, Dict[str, Any]]] = []
         for hit in hits:
             tags = str(hit.get("tags") or "").lower()
             if any(bad in tags for bad in BAD_TAG_WORDS):
                 continue
+            rel_score = _score_media_relevance(q, tags, mood=mood)
+            if rel_score <= 0:
+                continue
+            ranked_hits.append((rel_score, hit))
+        ranked_hits.sort(key=lambda x: x[0], reverse=True)
+
+        for _, hit in ranked_hits:
             picked = _pick_cpu_friendly_pixabay_video_variant(
                 hit.get("videos") or {},
                 want_landscape=want_landscape,
@@ -1303,7 +1488,7 @@ def _fetch_pixabay_doc_broll(
                 used_hashes.add(hsh)
                 print(
                     f"[DocMedia] Real HD B-roll ready (pixabay {picked['width']}x{picked['height']}): "
-                    f"{local_path.name} | blur={qrep['blur_score']} | green={qrep['green_pixel_ratio']:.1%}",
+                    f"{local_path.name} | tags='{str(hit.get('tags') or '')[:45]}' | blur={qrep['blur_score']} | green={qrep['green_pixel_ratio']:.1%}",
                     flush=True,
                 )
                 return local_path, hsh
@@ -1352,13 +1537,14 @@ def fetch_doc_broll_clip(
     # 1. Fast HD 1080p/720p Pixabay B-roll pass (avoids downloading 100MB 4K clips on Core i5)
     if pixabay_key:
         with httpx.Client(follow_redirects=True, timeout=22.0) as client:
-            for q in all_queries[:5]:
+            for q in all_queries[:6]:
                 res = _fetch_pixabay_doc_broll(
                     client,
                     q,
                     api_key=pixabay_key,
                     used_hashes=used,
                     want_landscape=want_landscape,
+                    mood=resolved_mood,
                 )
                 if res is not None:
                     clip_path, hsh = res

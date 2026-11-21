@@ -295,8 +295,12 @@ def trim_silence_vad(
     max_pause_s: float = 0.28,
     consonant_pad_s: float = 0.085,
     thermal_limit_c: float = 85.0,
+    trim_edges_only: bool = False,
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
-    """Tighten long pauses while strictly preserving final consonants (+85ms tail)."""
+    """Tighten long pauses while strictly preserving final consonants (+85ms tail).
+    When `trim_edges_only=True` (Cinema Documentary mode), trims ONLY dead leading/trailing
+    silence and preserves 100% of internal natural breathing and dramatic punctuation pauses.
+    """
     raw_16k = output_wav.with_name(output_wav.stem + "_16k.wav")
     run_ffmpeg_safe(
         ["ffmpeg", "-y", "-v", "error", "-i", str(input_audio), "-ac", "1", "-ar", "16000", str(raw_16k)],
@@ -345,23 +349,30 @@ def trim_silence_vad(
         dilated = np.ones(n_frames, dtype=bool)
 
     # Keep natural micro-pauses up to max_pause_s; ALWAYS preserve final 250ms tail after last word
-    max_sil_frames = int(max_pause_s / frame_s)
-    keep_mask = np.zeros(n_frames, dtype=bool)
-    sil_run = 0
-    for i in range(n_frames):
-        if dilated[i]:
-            keep_mask[i] = True
-            sil_run = 0
-        else:
-            sil_run += 1
-            if sil_run <= max_sil_frames:
-                keep_mask[i] = True
-
     active_idx = np.where(dilated)[0]
-    if len(active_idx) > 0:
-        last_speech = int(active_idx[-1])
-        tail_frames = int(math.ceil(0.25 / frame_s))
-        keep_mask[last_speech : min(n_frames, last_speech + tail_frames)] = True
+    keep_mask = np.zeros(n_frames, dtype=bool)
+    if trim_edges_only and len(active_idx) > 0:
+        lead_frames = int(math.ceil(0.08 / frame_s))
+        tail_frames = int(math.ceil(0.28 / frame_s))
+        start_f = max(0, int(active_idx[0]) - lead_frames)
+        end_f = min(n_frames, int(active_idx[-1]) + tail_frames)
+        keep_mask[start_f:end_f] = True
+    else:
+        max_sil_frames = int(max_pause_s / frame_s)
+        sil_run = 0
+        for i in range(n_frames):
+            if dilated[i]:
+                keep_mask[i] = True
+                sil_run = 0
+            else:
+                sil_run += 1
+                if sil_run <= max_sil_frames:
+                    keep_mask[i] = True
+
+        if len(active_idx) > 0:
+            last_speech = int(active_idx[-1])
+            tail_frames = int(math.ceil(0.25 / frame_s))
+            keep_mask[last_speech : min(n_frames, last_speech + tail_frames)] = True
 
     # Build time remapping table to shift WordBoundary timestamps accurately
     kept_indices = np.where(keep_mask)[0]
@@ -419,6 +430,96 @@ def trim_silence_vad(
 
     dur = len(final_pcm) / 48000.0
     return output_wav, remapped_words, round(dur, 3)
+
+
+_WHISPER_ALIGN_MODEL = None
+
+
+def _get_whisper_align_model():
+    global _WHISPER_ALIGN_MODEL
+    if _WHISPER_ALIGN_MODEL is None:
+        from faster_whisper import WhisperModel
+
+        _WHISPER_ALIGN_MODEL = WhisperModel("tiny", device="cpu", compute_type="int8", cpu_threads=4)
+    return _WHISPER_ALIGN_MODEL
+
+
+def align_script_words_to_audio(
+    wav_path: Path,
+    script_text: str,
+    duration_s: float,
+    lang: str = "pt_br",
+) -> List[Dict[str, Any]]:
+    """Align script words to human TTS audio (Gemini TTS) using local faster-whisper int8
+    with punctuation-aware proportional fallback so captions sync tightly to breaths & pauses.
+    """
+    tokens = [w.strip() for w in (script_text or "").split() if w.strip()]
+    if not tokens:
+        return []
+    dur_total = max(0.4, float(duration_s or _get_wav_duration(wav_path) or 1.0))
+
+    # 1. Try local faster-whisper int8 for exact spoken word timing
+    try:
+        model = _get_whisper_align_model()
+        w_lang = "en" if str(lang).lower().startswith("en") else ("es" if str(lang).lower().startswith("es") else "pt")
+        segments, _ = model.transcribe(
+            str(wav_path),
+            language=w_lang,
+            word_timestamps=True,
+            vad_filter=False,
+            beam_size=1,
+        )
+        heard: List[Tuple[float, float, str]] = []
+        for seg in segments:
+            for wd in (seg.words or []):
+                st = max(0.0, float(wd.start))
+                en = min(dur_total, max(st + 0.06, float(wd.end)))
+                heard.append((st, en, str(wd.word or "").strip()))
+
+        if len(heard) >= max(2, int(len(tokens) * 0.55)):
+            # Map clean script tokens onto heard word timeline monotonically (keeps exact PT-BR spelling!)
+            aligned: List[Dict[str, Any]] = []
+            n_t = len(tokens)
+            n_h = len(heard)
+            for idx, tok in enumerate(tokens):
+                h_start_idx = min(n_h - 1, int(idx * n_h / n_t))
+                h_end_idx = min(n_h - 1, max(h_start_idx, int(((idx + 1) * n_h / n_t) - 0.001)))
+                st = heard[h_start_idx][0]
+                en = heard[h_end_idx][1]
+                if aligned and st < aligned[-1]["end"]:
+                    st = aligned[-1]["end"]
+                en = max(st + 0.07, min(dur_total, en))
+                aligned.append({"word": tok, "start": round(st, 3), "end": round(en, 3)})
+            return aligned
+    except Exception:
+        pass
+
+    # 2. Punctuation-weighted fallback (accounts for comma/period/ellipsis breathing pauses!)
+    weights: List[float] = []
+    for tok in tokens:
+        base_w = max(2.2, float(len(re.sub(r"[^\wÀ-ÿ]", "", tok))))
+        pause_extra = 0.0
+        if tok.endswith(("...", "…")):
+            pause_extra = 3.8
+        elif tok.endswith((".", "!", "?", ";", ":")):
+            pause_extra = 3.0
+        elif tok.endswith(","):
+            pause_extra = 1.6
+        weights.append(base_w + pause_extra)
+
+    sum_w = max(1.0, sum(weights))
+    usable = max(0.3, dur_total - 0.14)
+    cursor = 0.06
+    out: List[Dict[str, Any]] = []
+    for tok, w_val in zip(tokens, weights):
+        slot = usable * (w_val / sum_w)
+        # Keep displayed word end tight before the trailing punctuation pause
+        speech_frac = 0.72 if tok.endswith((".", "!", "?", "...", ",")) else 0.94
+        st = cursor
+        en = min(dur_total, st + max(0.08, slot * speech_frac))
+        out.append({"word": tok, "start": round(st, 3), "end": round(en, 3)})
+        cursor += slot
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,9 @@ Uses the user's Google AI Studio API key (AIza...) via official REST API:
 from __future__ import annotations
 
 import base64
+import re
 import subprocess
+import time
 import wave
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +23,100 @@ GEMINI_TTS_MODELS = ("gemini-2.5-flash-preview-tts", "gemini-3.1-flash-tts-previ
 GEMINI_TTS_MODEL = GEMINI_TTS_MODELS[0]
 GEMINI_TEXT_MODELS = ("gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash")
 
+_ROMAN_TO_PT: Dict[str, str] = {
+    "I": "um",
+    "II": "dois",
+    "III": "três",
+    "IV": "quatro",
+    "V": "cinco",
+    "VI": "seis",
+    "VII": "sete",
+    "VIII": "oito",
+    "IX": "nove",
+    "X": "dez",
+    "XI": "onze",
+    "XII": "doze",
+    "XIII": "treze",
+    "XIV": "quatorze",
+    "XV": "quinze",
+    "XVI": "dezesseis",
+    "XVII": "dezessete",
+    "XVIII": "dezoito",
+    "XIX": "dezenove",
+    "XX": "vinte",
+    "XXI": "vinte e um",
+}
+
+_ROMAN_TO_EN: Dict[str, str] = {
+    "I": "first",
+    "II": "second",
+    "III": "third",
+    "IV": "fourth",
+    "V": "fifth",
+    "VI": "sixth",
+    "VII": "seventh",
+    "VIII": "eighth",
+    "IX": "ninth",
+    "X": "tenth",
+    "XI": "eleventh",
+    "XII": "twelfth",
+    "XIII": "thirteenth",
+    "XIV": "fourteenth",
+    "XV": "fifteenth",
+    "XVI": "sixteenth",
+    "XVII": "seventeenth",
+    "XVIII": "eighteenth",
+    "XIX": "nineteenth",
+    "XX": "twentieth",
+    "XXI": "twenty-first",
+}
+
+
+def normalize_narration_for_speech(text: str, lang: str = "pt_br") -> str:
+    """Normalize abbreviations, Roman numerals, and raw symbols so TTS diction is natural & fluid."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    s = re.sub(r"[*_`#\[\]]+", "", s)
+    s = re.sub(r"\s*[|•—–]\s*", ", ", s)
+    s = re.sub(r"\s{2,}", " ", s)
+
+    is_en = str(lang or "pt_br").lower().startswith("en")
+    if is_en:
+        s = re.sub(r"\bB\.C\.E?\.?\b", "before Christ", s, flags=re.I)
+        s = re.sub(r"\bA\.D\.?\b", "A D", s, flags=re.I)
+        s = re.sub(
+            r"\b(?:cent\.?|century)\s+([IVX]{1,4})\b",
+            lambda m: f"the {_ROMAN_TO_EN.get(m.group(1).upper(), m.group(1))} century",
+            s,
+            flags=re.I,
+        )
+    else:
+        s = re.sub(
+            r"\bs[eé]c\.?\s*([IVX]{1,4})\b",
+            lambda m: f"século {_ROMAN_TO_PT.get(m.group(1).upper(), m.group(1))}",
+            s,
+            flags=re.I,
+        )
+        s = re.sub(
+            r"\bséculo\s+([IVX]{1,4})\b",
+            lambda m: f"século {_ROMAN_TO_PT.get(m.group(1).upper(), m.group(1))}",
+            s,
+            flags=re.I,
+        )
+        s = re.sub(
+            r"\bcapítulo\s+([IVX]{1,4})\b",
+            lambda m: f"capítulo {_ROMAN_TO_PT.get(m.group(1).upper(), m.group(1))}",
+            s,
+            flags=re.I,
+        )
+        s = re.sub(r"\ba\.C\.(?=\W|$)|\ba\.C\b", "antes de Cristo", s, flags=re.I)
+        s = re.sub(r"\bd\.C\.(?=\W|$)|\bd\.C\b", "depois de Cristo", s, flags=re.I)
+        s = re.sub(r"\bEUA\b", "Estados Unidos", s)
+        s = re.sub(r"\betc\.(?=\W|$)|\betc\b", "etcétera", s, flags=re.I)
+
+    return re.sub(r"\s{2,}", " ", s).strip()
+
 GEMINI_EXPRESSIVE_VOICES = [
     {"id": "Puck", "name": "Puck (Masculino • Energético / Comédia)", "gender": "M"},
     {"id": "Charon", "name": "Charon (Masculino • Grave / Épico / Chefe)", "gender": "M"},
@@ -33,7 +129,7 @@ GEMINI_EXPRESSIVE_VOICES = [
 ]
 
 
-def _pcm24k_to_wav48k(pcm_bytes: bytes, out_wav: Path) -> float:
+def _pcm24k_to_wav48k(pcm_bytes: bytes, out_wav: Path, thermal_limit_c: float = 85.0) -> float:
     """Convert raw 24kHz 16-bit mono PCM returned by Gemini TTS into broadcast 48kHz stereo WAV."""
     raw_24k = out_wav.with_name(out_wav.stem + "_24k.wav")
     with wave.open(str(raw_24k), "wb") as wf:
@@ -43,7 +139,8 @@ def _pcm24k_to_wav48k(pcm_bytes: bytes, out_wav: Path) -> float:
         wf.writeframes(pcm_bytes)
 
     run_ffmpeg_safe(
-        ["ffmpeg", "-y", "-v", "error", "-i", str(raw_24k), "-ac", "2", "-ar", "48000", str(out_wav)]
+        ["ffmpeg", "-y", "-v", "error", "-i", str(raw_24k), "-ac", "2", "-ar", "48000", str(out_wav)],
+        thermal_limit_c=thermal_limit_c,
     )
     raw_24k.unlink(missing_ok=True)
     with wave.open(str(out_wav), "rb") as wf:
@@ -62,16 +159,23 @@ def synthesize_gemini_tts_line(
     text: str,
     out_wav: Path,
     voice_name: str = "Puck",
-    acting_direction: str = "Read aloud in Brazilian Portuguese with expressive, natural cartoon voice acting.",
+    acting_direction: str = "Read aloud in Brazilian Portuguese with expressive, natural voice acting.",
     api_key: Optional[str] = None,
+    lang: str = "pt_br",
+    thermal_limit_c: float = 85.0,
 ) -> Tuple[Path, float]:
     """Synthesize a single expressive speech line using Google Gemini Native TTS (x-goog-api-key)."""
     key = (api_key or get_settings().get("gemini_api_key") or "").strip()
     if not key:
         raise RuntimeError("Chave Gemini API não configurada.")
 
-    clean_text = text.strip()
-    prompt = f"Read aloud ONLY the following Brazilian Portuguese transcript as audio ({acting_direction}):\n{clean_text}"
+    clean_text = normalize_narration_for_speech(text, lang=lang)
+    lang_low = str(lang or "pt_br").lower()
+    lang_label = (
+        "American English" if lang_low.startswith("en")
+        else ("Latin American Spanish" if lang_low.startswith("es") else "Brazilian Portuguese")
+    )
+    prompt = f"Read aloud ONLY the following {lang_label} transcript as natural spoken audio ({acting_direction}):\n{clean_text}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -90,35 +194,42 @@ def synthesize_gemini_tts_line(
 
     for model_id in GEMINI_TTS_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
-        try:
-            r = httpx.post(url, json=payload, headers=headers, timeout=35.0)
-            if r.status_code != 200:
-                last_err = f"Gemini TTS ({model_id}) HTTP {r.status_code}: {r.text[:160]}"
-                continue
-
-            j = r.json()
-            parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            audio_b64 = ""
-            for p in parts:
-                idata = p.get("inlineData") or p.get("inline_data")
-                if idata and idata.get("data"):
-                    audio_b64 = idata["data"]
+        for attempt in range(2):
+            try:
+                r = httpx.post(url, json=payload, headers=headers, timeout=45.0)
+                if r.status_code in (500, 502, 503) and attempt == 0:
+                    time.sleep(1.2)
+                    continue
+                if r.status_code != 200:
+                    last_err = f"Gemini TTS ({model_id}) HTTP {r.status_code}: {r.text[:160]}"
                     break
-            if not audio_b64:
-                last_err = f"Gemini TTS ({model_id}) retornou resposta sem áudio."
-                continue
 
-            pcm = base64.b64decode(audio_b64)
-            dur_s = _pcm24k_to_wav48k(pcm, out_wav)
+                j = r.json()
+                parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                audio_b64 = ""
+                for p in parts:
+                    idata = p.get("inlineData") or p.get("inline_data")
+                    if idata and idata.get("data"):
+                        audio_b64 = idata["data"]
+                        break
+                if not audio_b64:
+                    last_err = f"Gemini TTS ({model_id}) retornou resposta sem áudio."
+                    break
 
-            meta = j.get("usageMetadata", {})
-            pt = int(meta.get("promptTokenCount", 40))
-            ct = int(meta.get("candidatesTokenCount", 120))
-            record_token_usage("gemini-tts", model_id, pt, ct, 0, round((pt * 0.5 + ct * 10.0) / 1_000_000.0, 5))
-            return out_wav, dur_s
-        except Exception as exc:
-            last_err = str(exc)
-            continue
+                pcm = base64.b64decode(audio_b64)
+                dur_s = _pcm24k_to_wav48k(pcm, out_wav, thermal_limit_c=thermal_limit_c)
+
+                meta = j.get("usageMetadata", {})
+                pt = int(meta.get("promptTokenCount", 40))
+                ct = int(meta.get("candidatesTokenCount", 120))
+                record_token_usage("gemini-tts", model_id, pt, ct, 0, round((pt * 0.5 + ct * 10.0) / 1_000_000.0, 5))
+                return out_wav, dur_s
+            except Exception as exc:
+                last_err = str(exc)
+                if attempt == 0:
+                    time.sleep(0.8)
+                    continue
+                break
 
     raise RuntimeError(last_err)
 

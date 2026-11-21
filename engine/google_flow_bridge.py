@@ -959,6 +959,214 @@ def generate_flow_scene_image_sync(
     return Path(res["image_path"])
 
 
+def _validate_real_photo_image(img_path: Path, min_w: int = 384, min_h: int = 320) -> bool:
+    """Ensure a generated image is a genuine non-blank photograph/artwork (never an error page)."""
+    try:
+        if not img_path.exists() or img_path.stat().st_size < 18_000:
+            return False
+        import cv2
+        import numpy as np
+
+        bgr = cv2.imread(str(img_path))
+        if bgr is None or bgr.size == 0:
+            return False
+        h, w = bgr.shape[:2]
+        if w < min_w or h < min_h:
+            return False
+        if float(np.std(bgr)) < 14.0:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _try_google_flow_camoufox_image_sync(
+    prompt: str,
+    out_path: Path,
+    timeout_s: float = 35.0,
+) -> bool:
+    """Attempt real image generation on Google Flow (`flow.google` / `labs.google/fx/tools/flow`)
+    using the user's logged-in persistent Camoufox profile (`data/profiles/google_flow_pro/`).
+    Strictly guarded by a short timeout so any UI change or re-login need falls back cleanly.
+    """
+    if not _has_profile_cookies():
+        return False
+
+    async def _run() -> bool:
+        try:
+            from camoufox.async_api import AsyncCamoufox
+        except Exception:
+            return False
+
+        async with FLOW_LOCK:
+            try:
+                async with AsyncCamoufox(
+                    headless=True,
+                    persistent_context=True,
+                    user_data_dir=str(FLOW_PROFILE_DIR),
+                ) as browser:
+                    page = browser.pages[0] if browser.pages else await browser.new_page()
+                    await page.goto(FLOW_LABS_URL, wait_until="domcontentloaded", timeout=20_000)
+                    await asyncio.sleep(2.5)
+                    url_now = (page.url or "").lower()
+                    if "accounts.google.com" in url_now or "signin" in url_now:
+                        return False
+
+                    # Locate prompt textarea / contenteditable input
+                    prompt_box = page.locator("textarea, [contenteditable='true']").first
+                    if await prompt_box.count() == 0:
+                        return False
+                    await prompt_box.click(timeout=4_000)
+                    await prompt_box.fill(prompt[:420], timeout=4_000)
+                    await prompt_box.press("Enter")
+
+                    # Poll briefly for newly rendered generated <img> blob/https URL
+                    deadline = asyncio.get_running_loop().time() + max(10.0, timeout_s - 8.0)
+                    seen_srcs = set(
+                        await page.eval_on_selector_all(
+                            "img",
+                            "els => els.map(e => e.currentSrc || e.src || '').filter(Boolean)",
+                        )
+                    )
+                    while asyncio.get_running_loop().time() < deadline:
+                        await asyncio.sleep(2.0)
+                        candidates = await page.eval_on_selector_all(
+                            "img",
+                            """els => els
+                                .filter(e => e.complete && e.naturalWidth >= 512 && e.naturalHeight >= 384)
+                                .map(e => ({src: e.currentSrc || e.src || '', w: e.naturalWidth, h: e.naturalHeight}))""",
+                        )
+                        for cand in candidates:
+                            src = str(cand.get("src") or "")
+                            if not src or src in seen_srcs:
+                                continue
+                            if src.startswith("https://") and ("googleusercontent" in src or "storage.googleapis" in src):
+                                resp = await page.request.get(src, timeout=15_000)
+                                if resp.ok:
+                                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                                    out_path.write_bytes(await resp.body())
+                                    if _validate_real_photo_image(out_path):
+                                        return True
+                                    out_path.unlink(missing_ok=True)
+                    return False
+            except Exception:
+                return False
+
+    try:
+        asyncio.get_running_loop()
+        # Running inside an active loop (should be called from worker thread via asyncio.to_thread)
+        return False
+    except RuntimeError:
+        try:
+            return asyncio.run(asyncio.wait_for(_run(), timeout=timeout_s + 5.0))
+        except Exception:
+            return False
+
+
+def generate_flow_bespoke_photo_sync(
+    prompt_en: str,
+    out_path: Path,
+    aspect_ratio: str = "9:16",
+    mood: str = "dark_horror",
+    try_browser: bool = True,
+) -> Optional[Path]:
+    """Generate a genuine photorealistic/cinematic documentary image via:
+      1. FlowVault cache (0 credits, instant)
+      2. Authenticated Google Flow (`flow.google` Nano Banana 2) via persistent Camoufox profile
+      3. Pollinations Flux photorealistic dark-cinema endpoint (0 credits)
+    NEVER returns geometric Skia placeholder cards (returns None if all photo generators fail).
+    """
+    clean_p = re.sub(r"\s+", " ", (prompt_en or "").strip())
+    if not clean_p:
+        return None
+
+    mood_style = {
+        "dark_horror": "dark gothic 35mm cinema still, eerie chiaroscuro candlelight, mist, deep shadows, film grain, photorealistic, no text, no watermark",
+        "investigative_crime": "gritty neo-noir documentary photograph, tungsten night lighting, 35mm film grain, photorealistic, no text, no watermark",
+        "epic_history": "cinematic museum-grade historical film still, dramatic Rembrandt lighting, 35mm photography, no text, no watermark",
+        "corporate_thriller": "sleek moody prestige cinema photograph, dark glass reflections, 35mm anamorphic lens, no text, no watermark",
+    }.get(mood, "cinematic 35mm documentary photograph, dramatic lighting, no text, no watermark")
+    styled_prompt = f"{clean_p}, {mood_style}"
+
+    vault = get_flow_vault()
+    hit = vault.lookup_asset(
+        kind="image",
+        prompt_or_mood=styled_prompt,
+        aspect_ratio=aspect_ratio,
+        record_reuse=True,
+    )
+    if hit and Path(hit["abs_path"]).exists():
+        # Ignore legacy geometric Skia cards stored in vault
+        if str(hit.get("provider_source") or "") != "nano_banana_2_skia_studio":
+            src = Path(hit["abs_path"])
+            if _validate_real_photo_image(src):
+                out_path = Path(out_path)
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                if src.resolve() != out_path.resolve():
+                    shutil.copy2(src, out_path)
+                return out_path
+
+    img_hash = compute_vault_hash(styled_prompt, kind="images", aspect_ratio=aspect_ratio)
+    vault_jpg = vault.images_dir / f"flow_bespoke_{img_hash}.jpg"
+    w, h = (768, 1280) if aspect_ratio == "9:16" else (1280, 720)
+    used_source = ""
+
+    # 1. Try authenticated Google Flow browser session (if cookies present & enabled)
+    if try_browser and _has_profile_cookies():
+        if _try_google_flow_camoufox_image_sync(styled_prompt, vault_jpg, timeout_s=32.0):
+            used_source = "google_flow_pro_nano_banana_2"
+
+    # 2. Fallback to Pollinations Flux photorealistic cinema generator
+    if not used_source:
+        seed = int(img_hash[:6], 16)
+        encoded = quote(styled_prompt[:380])
+        poll_urls = [
+            f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&seed={seed}&nologo=true&model=flux",
+            f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&seed={seed}&nologo=true",
+        ]
+        try:
+            with httpx.Client(follow_redirects=True, timeout=28.0) as client:
+                for purl in poll_urls:
+                    try:
+                        r = client.get(purl)
+                        if r.status_code == 200 and len(r.content) > 20_000:
+                            ct = (r.headers.get("content-type") or "").lower()
+                            if "image" in ct or r.content[:2] == b"\xff\xd8" or r.content[:4] == b"\x89PNG":
+                                vault_jpg.parent.mkdir(parents=True, exist_ok=True)
+                                vault_jpg.write_bytes(r.content)
+                                if _validate_real_photo_image(vault_jpg):
+                                    used_source = "flow_pollinations_flux"
+                                    break
+                                vault_jpg.unlink(missing_ok=True)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    if not used_source or not vault_jpg.exists():
+        return None
+
+    vault.store_asset(
+        kind="image",
+        prompt_or_mood=styled_prompt,
+        file_path=vault_jpg,
+        aspect_ratio=aspect_ratio,
+        credits_cost=0,
+        copy_into_vault=False,
+        metadata={
+            "model": "nano_banana_2",
+            "provider_source": used_source,
+            "mood": mood,
+        },
+    )
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if vault_jpg.resolve() != out_path.resolve():
+        shutil.copy2(vault_jpg, out_path)
+    print(f"[GoogleFlow] Bespoke cinema art ready ({used_source}): {out_path.name}", flush=True)
+    return out_path
+
+
 async def fetch_or_generate_flow_image(
     prompt: str,
     out_path: Optional[Path] = None,

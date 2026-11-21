@@ -983,6 +983,7 @@ async function refreshAll() {
     renderClientChips();
     renderSettingsForm();
     renderRemoteAccessCard();
+    renderGdriveCard();
     renderJobs();
     renderSchedules();
     renderFeedback();
@@ -1832,6 +1833,64 @@ function initRemoteAccessControls() {
         if (submitBtn) submitBtn.disabled = false;
       }
     });
+  }
+
+  const gdForm = document.getElementById('gdrive-settings-form');
+  const gdBtn = document.getElementById('btn-save-gdrive');
+  if (gdForm) {
+    gdForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (gdBtn) gdBtn.disabled = true;
+      try {
+        await api('/api/settings', {
+          method: 'POST',
+          body: JSON.stringify({
+            gdrive_root_folder: (document.getElementById('gdrive-root-folder')?.value || 'FrimeRise').trim() || 'FrimeRise',
+            gdrive_local_dir: (document.getElementById('gdrive-local-dir')?.value || '').trim(),
+            gdrive_auto_upload: document.getElementById('gdrive-auto-upload')?.checked ? '1' : '0',
+            gdrive_prune_local: document.getElementById('gdrive-prune-local')?.checked ? '1' : '0',
+          }),
+        });
+        showToast('☁️ Preferências do Google Drive salvas!');
+        await refreshAll();
+      } catch (err) {
+        showToast(`Erro ao salvar Google Drive: ${err.message}`, true);
+      } finally {
+        if (gdBtn) gdBtn.disabled = false;
+      }
+    });
+  }
+}
+
+function renderGdriveCard() {
+  const gd = STATE.gdrive || {};
+  const s = STATE.settings || {};
+  const pill = document.getElementById('gdrive-status-pill');
+  const detail = document.getElementById('gdrive-status-detail');
+  const rootIn = document.getElementById('gdrive-root-folder');
+  const dirIn = document.getElementById('gdrive-local-dir');
+  const autoCb = document.getElementById('gdrive-auto-upload');
+  const pruneCb = document.getElementById('gdrive-prune-local');
+
+  if (rootIn && document.activeElement !== rootIn) {
+    rootIn.value = s.gdrive_root_folder || gd.root_folder || 'FrimeRise';
+  }
+  if (dirIn && document.activeElement !== dirIn) {
+    dirIn.value = s.gdrive_local_dir || gd.local_sync_dir || '';
+  }
+  if (autoCb) autoCb.checked = (s.gdrive_auto_upload ?? '1') === '1';
+  if (pruneCb) pruneCb.checked = (s.gdrive_prune_local ?? '0') === '1';
+
+  if (pill && detail) {
+    if (gd.connected) {
+      pill.textContent = `🟢 Drive Conectado (${gd.backend})`;
+      pill.className = 'text-[11px] font-extrabold px-3 py-1 rounded-full bg-frimelime/15 text-frimelime border border-frimelime/50';
+      detail.textContent = gd.detail || 'Pronto para salvar cada projeto em pasta separada no Google Drive.';
+    } else {
+      pill.textContent = '⚪ Aguardando Conexão Drive';
+      pill.className = 'text-[11px] font-extrabold px-3 py-1 rounded-full bg-frimegold/15 text-frimegold border border-frimegold/40';
+      detail.textContent = gd.detail || 'Execute ./setup_gdrive.sh no terminal para conectar seu Google Drive.';
+    }
   }
 }
 

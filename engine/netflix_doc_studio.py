@@ -47,8 +47,15 @@ from engine.audio_dsp import (
     _estimate_word_timestamps,
     _get_wav_duration,
     _synthesize_espeak_fallback,
+    align_script_words_to_audio,
     master_broadcast_audio,
     trim_silence_vad,
+)
+from engine.gemini_tts import (
+    GEMINI_EXPRESSIVE_VOICES,
+    has_valid_gemini_key,
+    normalize_narration_for_speech,
+    synthesize_gemini_tts_line,
 )
 from engine.doc_media_engine import (
     VideoLayerReader,
@@ -94,6 +101,7 @@ DOC_BG_CACHE = BASE_DIR / "data" / "doc_bgs"
 DOC_BG_CACHE.mkdir(parents=True, exist_ok=True)
 
 VisualModeType = Literal[
+    "cinema_multishot",
     "broll_video_pip",
     "newspaper_highlighter",
     "dark_map_route",
@@ -103,17 +111,23 @@ VisualModeType = Literal[
     "video_pip_evidence",
 ]
 
+# Cinema v3 visual rhythm: ~60% clean full-screen fast-cut multi-shot & full-bleed 2.5D art,
+# ~40% varied investigative set-pieces (newspaper, dark map, red-string board, timeline).
 VISUAL_MODES: Tuple[VisualModeType, ...] = (
-    "broll_video_pip",
+    "cinema_multishot",
     "newspaper_highlighter",
-    "dark_map_route",
+    "cinema_multishot",
     "parallax_25d_photo",
+    "cinema_multishot",
+    "dark_map_route",
+    "cinema_multishot",
     "red_string_board",
+    "cinema_multishot",
     "sliding_timeline",
-    "video_pip_evidence",
 )
 
 PIP_ENABLED_MODES: Tuple[VisualModeType, ...] = (
+    "cinema_multishot",
     "broll_video_pip",
     "dark_map_route",
     "video_pip_evidence",
@@ -1291,11 +1305,12 @@ def _ensure_topic_open_loops(
         if OPEN_LOOP_MARKERS_RE.search(txt):
             since_loop_s = 0.0
             continue
-        # Inject an authentic mood-matched question on scene 0 or whenever >= 12s elapsed without a hook
-        if idx == 0 or (idx < len(scenes) - 1 and since_loop_s >= 12.0):
-            q = pool[b_idx % len(pool)]
+        # Inject an authentic mood-matched question on scene 0 or whenever >= 18s elapsed without a hook
+        # (never repeat the same bridge question twice in one video!)
+        if (idx == 0 or (idx < len(scenes) - 1 and since_loop_s >= 18.0)) and b_idx < len(pool):
+            q = pool[b_idx]
             b_idx += 1
-            sc.narration = f"{txt.rstrip('.!?')} — {q}"
+            sc.narration = f"{txt.rstrip('.!?')}... {q}"
             since_loop_s = 0.0
 
 
@@ -1323,20 +1338,21 @@ def _call_open_topic_director_llm(
     skill_excerpt = skill_path.read_text(encoding="utf-8")[:900] if skill_path.exists() else ""
 
     sys_prompt = (
-        f"You are an Emmy-winning Netflix / A24 / MagnatesMedia Documentary Showrunner & Historian writing in {lang_label}. "
-        "Create a 100% ORIGINAL, deeply researched, gripping documentary blueprint strictly about the user's EXACT TOPIC.\n"
-        "ABSOLUTE RULES:\n"
-        "1. Research real historical facts, real dates/centuries, real places, real folklore/entities, and concrete details about the topic.\n"
-        "2. NEVER use unrelated financial/corporate/Barings/London-Singapore/Wall-Street boilerplate unless the user's topic is genuinely about finance!\n"
-        "3. ZERO robotic AI clichés (NEVER write 'Em um mundo onde', 'Vamos mergulhar', 'Em conclusão', 'In a world where', 'Let's dive in').\n"
-        "4. Every narration line must be 18-26 crisp, cinematic spoken words. Scene 0 MUST open with a shocking cold-open hook and end with an intriguing question (?). Include a natural investigative question (?) at least every 2nd scene.\n"
-        "5. Visual queries (`broll_query_en`, `pip_broll_query_en`, `photo_query_en`, `extra_photo_queries_en`) MUST BE IN ENGLISH, concrete, photographic, and topic-authentic:\n"
-        "   - `broll_query_en` and `pip_broll_query_en`: 3-4 concrete stock-video keywords that exist on Pixabay (e.g. 'snow forest night', 'candle flame dark', 'medieval castle fog', 'gothic cathedral dark', 'fireplace burning dark', 'ancient roman ruins', 'winter snow village'). `pip_broll_query_en` MUST differ from `broll_query_en`.\n"
-        "   - `photo_query_en` and `extra_photo_queries_en` (4 distinct items): 2-4 concrete photo/Wikimedia keywords (e.g. 'Krampus Austria mask', 'Saturnalia Roman painting', 'gothic cathedral candles', 'old parchment leather book candle').\n"
-        "   - `bespoke_image_prompt_en`: rich 15-24 word English dark-cinema photographic scene description with ZERO text/letters.\n"
-        "   - `prefer_gemini_photo`: true for folklore/macabre/ancient ritual scenes where bespoke cinema art shines, false for real-world places.\n"
-        "6. Classify `mood` strictly as ONE of: \"dark_horror\", \"investigative_crime\", \"epic_history\", \"corporate_thriller\".\n"
-        "7. Keep UI text crisp and punchy so it fits cleanly on screen: `thumbnail_hook` = 2-3 UPPERCASE words, `board_nodes` = exactly 4 real entities from the topic (title <= 18 chars, role <= 26 chars, badge <= 16 chars), `timeline_points` = exactly 4 real chronological dates/facts.\n"
+        f"You are an Emmy-winning Netflix / A24 / Nostalgia / MagnatesMedia Documentary Showrunner & Historian writing in {lang_label}.\n"
+        "Create a 100% ORIGINAL, deeply researched, spine-tingling, cinematic documentary script strictly about the user's EXACT TOPIC.\n"
+        "ABSOLUTE STORYTELLING & VOICE RULES:\n"
+        "1. CONTINUOUS HUMAN NARRATIVE: Write like a master human storyteller telling ONE gripping, continuous story from Cold Open to unforgettable ending — NEVER disjointed bullet points, NEVER repeating ideas across scenes, and NEVER pasting the user's raw prompt text inside narration or headlines!\n"
+        "2. REAL HISTORICAL DEPTH: Cite real eras, real years (e.g., 1647, 4th century, 1890s), real places (Rome, Austrian Alps, Myra, London, Iceland), real historical figures/folklore/edicts, and genuine plot twists!\n"
+        "3. NATURAL SPOKEN RHYTHM FOR VOICE ACTING: Each scene narration MUST be 16-24 crisp, visceral spoken words. Write spoken Portuguese/English naturally with commas and occasional ellipses (...) so the voice actor breathes and pauses dramatically. Spell out centuries naturally (write 'século quatro' instead of 'SÉC. IV', 'antes de Cristo' instead of 'a.C.').\n"
+        "4. ZERO ROBOTIC AI CLICHÉS: NEVER write 'Em um mundo onde', 'Vamos mergulhar', 'Em conclusão', 'Por trás da imagem familiar', 'As crônicas históricas conectaram', 'In a world where', or 'Let's dive in'.\n"
+        "5. RETENTION HOOKS: Scene 0 MUST be an explosive, chilling Cold Open that grabs attention in 2 seconds and ends with a sharp open-loop question (?). Keep building curiosity with natural unanswered tension every 2-3 scenes.\n"
+        "6. VISUAL PRECISION (ZERO OFF-TOPIC STOCK!): Every scene needs concrete, atmospheric English visual queries:\n"
+        "   - `broll_query_en` and `pip_broll_query_en` (MUST differ from each other): concrete, real atmospheric stock video phrases that exist on Pixabay (e.g., 'snow pine forest night', 'burning candle dark shadow', 'medieval stone castle fog', 'gothic cathedral interior', 'crackling fireplace dark', 'winter snow village night', 'old leather book candle', 'ancient roman stone ruins'). NEVER use abstract words like 'floor', 'butterfly', 'background', 'texture', or 'darkness' alone.\n"
+        "   - `photo_query_en` and `extra_photo_queries_en` (3-4 distinct concrete English museum/historical/photographic subjects matching THAT exact scene — e.g., 'Krampus Austrian folklore mask', 'Roman Saturnalia festival painting', 'Saint Nicholas Byzantine icon', 'Puritan Oliver Cromwell 17th century engraving', 'Victorian gothic winter postcard').\n"
+        "   - `bespoke_image_prompt_en`: vivid 16-26 word English dark-cinema photographic still prompt depicting THAT scene's exact historical moment, dramatic candlelight/chiaroscuro, 35mm film grain, ZERO text/words/letters.\n"
+        "   - `prefer_gemini_photo`: true for vivid historical/macabre/folklore scenes where custom AI cinema art beats generic stock.\n"
+        "7. UNIQUE PER-SCENE UI METADATA: Give every scene its OWN specific `evidence_headline` (<= 48 chars, punchy newspaper headline), `evidence_quote` (1 gripping historical fact for THAT scene), and `lower_third_title` (`LOCATION • ERA`).\n"
+        "8. Classify `mood` strictly as ONE of: \"dark_horror\", \"investigative_crime\", \"epic_history\", \"corporate_thriller\".\n"
         "Return ONLY valid JSON matching this exact schema:\n"
         "{\n"
         '  "title": "Editorial documentary title",\n'
@@ -1378,100 +1394,141 @@ def _call_open_topic_director_llm(
         "}"
     )
 
-    dir_block = f"\nUSER CREATIVE DIRECTIVES: {custom_directives.strip()}" if custom_directives.strip() else ""
-    user_prompt = (
-        f"EXACT DOCUMENTARY TOPIC: {topic}\n"
-        f"LANGUAGE: {lang_label}\n"
-        f"SUGGESTED MOOD: {mood_hint}\n"
-        f"EXACT NUMBER OF SCENES REQUIRED: {n_scenes}\n"
-        f"{dir_block}\n"
-        f"STYLE REFERENCE:\n{skill_excerpt}"
-    )
-
-    max_out_tokens = min(4096, 1100 + n_scenes * 280)
-    provider_order = ["deepseek", "gemini"] if "deepseek" in default_llm else ["gemini", "deepseek"]
-
-    for prov in provider_order:
-        if prov == "deepseek" and dkey:
-            try:
-                from openai import OpenAI
-
-                cli = OpenAI(api_key=dkey, base_url="https://api.deepseek.com", timeout=45.0)
-                resp = cli.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=[
-                        {"role": "system", "content": sys_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    temperature=0.65,
-                    max_tokens=max_out_tokens,
-                    response_format={"type": "json_object"},
-                )
-                raw_txt = resp.choices[0].message.content or "{}"
-                data = _extract_clean_json(raw_txt)
-                if isinstance(data.get("scenes"), list) and len(data["scenes"]) >= min(4, n_scenes):
-                    u = resp.usage
-                    pt = int(getattr(u, "prompt_tokens", 850))
-                    ct = int(getattr(u, "completion_tokens", 950))
-                    cost = round((pt * 0.14 + ct * 0.28) / 1_000_000.0, 6)
-                    try:
-                        record_token_usage("deepseek", "deepseek-chat", pt, ct, 0, cost)
-                    except Exception:
-                        pass
-                    print(
-                        f"[NetflixDoc] Open-topic AI Director succeeded via DeepSeek (deepseek-chat) | "
-                        f"scenes={len(data['scenes'])} | mood={data.get('mood')}",
-                        flush=True,
-                    )
-                    return data, "llm_deepseek", pt + ct, cost
-            except Exception as exc:
-                print(f"[NetflixDoc] DeepSeek open-topic director failed, failing over: {exc}", flush=True)
-
-        if prov == "gemini" and gkey:
-            gemini_models = ("gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite")
-            headers = {"Content-Type": "application/json", "x-goog-api-key": gkey}
-            for gm in gemini_models:
+    def _invoke_single_call(usr_p: str, target_count: int) -> Optional[Tuple[Dict[str, Any], str, int, float]]:
+        max_out_tokens = min(16384, 2400 + target_count * 480)
+        provider_order = ["deepseek", "gemini"] if "deepseek" in default_llm else ["gemini", "deepseek"]
+        for prov in provider_order:
+            if prov == "deepseek" and dkey:
                 try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent"
-                    payload = {
-                        "system_instruction": {"parts": [{"text": sys_prompt}]},
-                        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-                        "generationConfig": {
-                            "temperature": 0.65,
-                            "maxOutputTokens": max_out_tokens,
-                            "responseMimeType": "application/json",
-                        },
-                    }
-                    r = httpx.post(url, json=payload, headers=headers, timeout=45.0)
-                    if r.status_code != 200:
-                        print(f"[NetflixDoc] Gemini ({gm}) HTTP {r.status_code}, trying next model...", flush=True)
-                        continue
-                    j = r.json()
-                    parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                    txt = "".join(str(p.get("text") or "") for p in parts if not p.get("thought"))
-                    if not txt:
-                        txt = str(parts[0].get("text") or "") if parts else ""
-                    data = _extract_clean_json(txt)
-                    if isinstance(data.get("scenes"), list) and len(data["scenes"]) >= min(4, n_scenes):
-                        meta = j.get("usageMetadata", {})
-                        pt = int(meta.get("promptTokenCount", 850))
-                        ct = int(meta.get("candidatesTokenCount", 950))
-                        cost = round((pt * 0.05 + ct * 0.20) / 1_000_000.0, 6)
+                    from openai import OpenAI
+
+                    cli = OpenAI(api_key=dkey, base_url="https://api.deepseek.com", timeout=90.0)
+                    resp = cli.chat.completions.create(
+                        model="deepseek-chat",
+                        messages=[
+                            {"role": "system", "content": sys_prompt},
+                            {"role": "user", "content": usr_p},
+                        ],
+                        temperature=0.72,
+                        max_tokens=min(8192, max_out_tokens),
+                        response_format={"type": "json_object"},
+                    )
+                    raw_txt = resp.choices[0].message.content or "{}"
+                    data = _extract_clean_json(raw_txt)
+                    if isinstance(data.get("scenes"), list) and len(data["scenes"]) >= max(3, int(target_count * 0.6)):
+                        u = resp.usage
+                        pt = int(getattr(u, "prompt_tokens", 900))
+                        ct = int(getattr(u, "completion_tokens", 1600))
+                        cost = round((pt * 0.14 + ct * 0.28) / 1_000_000.0, 6)
                         try:
-                            record_token_usage("gemini", gm, pt, ct, 0, cost)
+                            record_token_usage("deepseek", "deepseek-chat", pt, ct, 0, cost)
                         except Exception:
                             pass
                         print(
-                            f"[NetflixDoc] Open-topic AI Director succeeded via Gemini ({gm}) | "
-                            f"scenes={len(data['scenes'])} | mood={data.get('mood')}",
+                            f"[NetflixDoc] Open-topic AI Director succeeded via DeepSeek (deepseek-chat) | "
+                            f"scenes={len(data['scenes'])}/{target_count} | mood={data.get('mood')}",
                             flush=True,
                         )
-                        return data, f"llm_gemini:{gm}", pt + ct, cost
+                        return data, "llm_deepseek", pt + ct, cost
                 except Exception as exc:
-                    print(f"[NetflixDoc] Gemini ({gm}) open-topic director failed: {exc}", flush=True)
-                    continue
+                    print(f"[NetflixDoc] DeepSeek open-topic director failed, failing over: {exc}", flush=True)
 
-    return None
+            if prov == "gemini" and gkey:
+                gemini_models = ("gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash")
+                headers = {"Content-Type": "application/json", "x-goog-api-key": gkey}
+                for gm in gemini_models:
+                    try:
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent"
+                        payload = {
+                            "system_instruction": {"parts": [{"text": sys_prompt}]},
+                            "contents": [{"role": "user", "parts": [{"text": usr_p}]}],
+                            "generationConfig": {
+                                "temperature": 0.72,
+                                "maxOutputTokens": max_out_tokens,
+                                "responseMimeType": "application/json",
+                            },
+                        }
+                        r = httpx.post(url, json=payload, headers=headers, timeout=95.0)
+                        if r.status_code != 200:
+                            print(f"[NetflixDoc] Gemini ({gm}) HTTP {r.status_code}, trying next model...", flush=True)
+                            continue
+                        j = r.json()
+                        parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                        txt = "".join(str(p.get("text") or "") for p in parts if not p.get("thought"))
+                        if not txt:
+                            txt = str(parts[0].get("text") or "") if parts else ""
+                        data = _extract_clean_json(txt)
+                        if isinstance(data.get("scenes"), list) and len(data["scenes"]) >= max(3, int(target_count * 0.6)):
+                            meta = j.get("usageMetadata", {})
+                            pt = int(meta.get("promptTokenCount", 900))
+                            ct = int(meta.get("candidatesTokenCount", 1800))
+                            cost = round((pt * 0.05 + ct * 0.20) / 1_000_000.0, 6)
+                            try:
+                                record_token_usage("gemini", gm, pt, ct, 0, cost)
+                            except Exception:
+                                pass
+                            print(
+                                f"[NetflixDoc] Open-topic AI Director succeeded via Gemini ({gm}) | "
+                                f"scenes={len(data['scenes'])}/{target_count} | mood={data.get('mood')}",
+                                flush=True,
+                            )
+                            return data, f"llm_gemini:{gm}", pt + ct, cost
+                        else:
+                            got_n = len(data.get("scenes", [])) if isinstance(data, dict) else 0
+                            print(f"[NetflixDoc] Gemini ({gm}) incomplete JSON ({got_n}/{target_count} scenes), trying next...", flush=True)
+                    except Exception as exc:
+                        print(f"[NetflixDoc] Gemini ({gm}) open-topic director failed: {exc}", flush=True)
+                        continue
+        return None
+
+    dir_block = f"\nUSER CREATIVE DIRECTIVES: {custom_directives.strip()}" if custom_directives.strip() else ""
+    if n_scenes <= 14:
+        user_prompt = (
+            f"EXACT DOCUMENTARY TOPIC: {topic}\n"
+            f"LANGUAGE: {lang_label}\n"
+            f"SUGGESTED MOOD: {mood_hint}\n"
+            f"EXACT NUMBER OF SCENES REQUIRED: {n_scenes}\n"
+            f"{dir_block}\n"
+            f"STYLE REFERENCE:\n{skill_excerpt}"
+        )
+        return _invoke_single_call(user_prompt, n_scenes)
+
+    part1_n = (n_scenes + 1) // 2
+    part2_n = n_scenes - part1_n
+    prompt_p1 = (
+        f"EXACT DOCUMENTARY TOPIC: {topic}\n"
+        f"LANGUAGE: {lang_label}\n"
+        f"SUGGESTED MOOD: {mood_hint}\n"
+        f"PART 1 OF 2 (Cold Open + Acts I & II — end on a gripping mid-story cliffhanger!)\n"
+        f"EXACT NUMBER OF SCENES IN PART 1: {part1_n}\n"
+        f"{dir_block}\n"
+        f"STYLE REFERENCE:\n{skill_excerpt}"
+    )
+    res1 = _invoke_single_call(prompt_p1, part1_n)
+    if res1 is None:
+        return None
+    data1, src1, tok1, cost1 = res1
+    p1_scenes = [s for s in (data1.get("scenes") or []) if isinstance(s, dict)][:part1_n]
+    prev_tail = " ".join(str(s.get("narration") or "") for s in p1_scenes[-2:])
+    used_facts = "; ".join(str(s.get("evidence_headline") or "") for s in p1_scenes if s.get("evidence_headline"))
+
+    prompt_p2 = (
+        f"EXACT DOCUMENTARY TOPIC: {topic}\n"
+        f"LANGUAGE: {lang_label}\n"
+        f"SUGGESTED MOOD: {data1.get('mood') or mood_hint}\n"
+        f"PART 2 OF 2 (Acts III & IV + Dark Twist + Chilling Finale — continue SEAMLESSLY after Part 1!)\n"
+        f"PART 1 ENDED WITH: \"{prev_tail}\"\n"
+        f"ALREADY COVERED HEADLINES (DO NOT REPEAT): {used_facts}\n"
+        f"EXACT NUMBER OF NEW SCENES IN PART 2: {part2_n}\n"
+        f"{dir_block}"
+    )
+    res2 = _invoke_single_call(prompt_p2, part2_n)
+    if res2 is not None:
+        data2, _, tok2, cost2 = res2
+        p2_scenes = [s for s in (data2.get("scenes") or []) if isinstance(s, dict)][:part2_n]
+        data1["scenes"] = p1_scenes + p2_scenes
+        return data1, src1, tok1 + tok2, round(cost1 + cost2, 6)
+    return data1, src1, tok1, cost1
 
 
 def _build_open_topic_offline_dossier(topic: str, clean_lang: str, mood: str) -> Dict[str, Any]:
@@ -1641,7 +1698,8 @@ def generate_netflix_doc_plan(
     is_en = clean_lang == "en_us"
     t_min = max(0.35, min(15.0, float(target_minutes or 0.5)))
     target_seconds = max(25.0, t_min * 60.0)
-    n_scenes = max(5, min(90, int(round(target_seconds / 6.0))))
+    # Each narrated cinema beat (~16-24 words with natural breathing) lasts ~7.8s and cuts visually every 2.5-3.2s
+    n_scenes = max(5, min(60, int(round(target_seconds / 7.8))))
     voice_id = "en-US-AndrewMultilingualNeural" if is_en else "pt-BR-AntonioNeural"
     resolved_cap_style = (
         resolve_caption_style(caption_style)
@@ -2207,6 +2265,28 @@ def _is_valid_cached_scene_mp4(
         return False
 
 
+_GEMINI_VOICE_NAMES = {str(v.get("id") or "") for v in GEMINI_EXPRESSIVE_VOICES}
+
+_DOC_ACTING_DIRECTIONS: Dict[str, Dict[str, str]] = {
+    "dark_horror": {
+        "pt": "Narre como um locutor humano de documentário sombrio da Netflix: voz grave, envolvente e cinematográfica, ritmo calmo e tenso, pausas naturais nas vírgulas e reticências, respiração sutil e dicção brasileira impecável, sem pressa e sem soar robótico.",
+        "en": "Narrate like a human Netflix dark-history documentary voice actor: deep, haunting, cinematic gravity, calm suspenseful pacing, natural breaths and short pauses at commas and ellipses, crisp diction, never robotic.",
+    },
+    "investigative_crime": {
+        "pt": "Narre como um jornalista investigativo de documentário true-crime: voz firme, séria e humana, ritmo natural com pausas dramáticas nas revelações e perguntas, dicção clara em português do Brasil, sem pressa.",
+        "en": "Narrate like a Prestige true-crime documentary host: grounded, tense, human voice with natural pauses on revelations and questions, crisp diction, never rushed.",
+    },
+    "epic_history": {
+        "pt": "Narre como um documentarista histórico de cinema: voz profunda, emotiva e cativante, ritmo cadenciado com respiração natural e pausas elegantes nas vírgulas, português do Brasil natural.",
+        "en": "Narrate like an epic cinema documentary historian: rich, evocative, deeply human voice with measured pacing and natural breathing pauses.",
+    },
+    "corporate_thriller": {
+        "pt": "Narre no estilo MagnatesMedia em português do Brasil: voz firme, inteligente e cinematográfica, ritmo envolvente com pausas estratégicas antes dos números e reviravoltas, 100% natural e humano.",
+        "en": "Narrate in MagnatesMedia documentary thriller style: crisp, authoritative, human storytelling voice with dramatic pauses before twists and numbers.",
+    },
+}
+
+
 async def _synthesize_doc_scene_narration(
     text: str,
     voice_id: str,
@@ -2214,12 +2294,16 @@ async def _synthesize_doc_scene_narration(
     work_dir: Path,
     tag: str,
     thermal_limit_c: float = 85.0,
-    rate: str = "+5%",
-    pitch: str = "-6Hz",
+    rate: str = "+0%",
+    pitch: str = "-4Hz",
     resume: bool = False,
     reuse_existing_wav_if_no_words: bool = False,
+    voice_engine: str = "auto",
+    mood: str = "dark_horror",
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
-    """Synthesize authoritative deep documentary narration for a single scene (checkpoint/resume aware)."""
+    """Synthesize natural human-acting cinema documentary narration (Gemini Expressive TTS primary,
+    natural pause-preserving edge-tts fallback, checkpoint/resume aware).
+    """
     raw_mp3 = work_dir / f"{tag}_raw.mp3"
     raw_wav = work_dir / f"{tag}_raw.wav"
     vad_wav = work_dir / f"{tag}_vad.wav"
@@ -2239,16 +2323,76 @@ async def _synthesize_doc_scene_narration(
                 est_words = _estimate_word_timestamps(text, cached_dur)
                 return vad_wav, est_words, cached_dur
 
-    default_v = "en-US-AndrewMultilingualNeural" if str(lang).lower().startswith("en") else "pt-BR-AntonioNeural"
-    candidates = [voice_id or default_v, default_v, "pt-BR-AntonioNeural", "en-US-AndrewMultilingualNeural"]
+    spoken_text = normalize_narration_for_speech(text, lang=lang)
+    is_en = str(lang).lower().startswith("en")
+    eff_engine = str(voice_engine or "auto").strip().lower()
+    if voice_id in _GEMINI_VOICE_NAMES and eff_engine in ("auto", "gemini_tts", "gemini"):
+        eff_engine = "gemini_tts"
+
+    # 1. PRIORITY 1: Google Gemini Native Expressive TTS (Real human breathing, emotion, pauses & diction!)
+    gem_ok, gem_key = has_valid_gemini_key()
+    if gem_ok and eff_engine in ("auto", "gemini_tts", "gemini"):
+        default_gem_voice = {
+            "dark_horror": "Charon",
+            "epic_history": "Charon",
+            "investigative_crime": "Orus",
+            "corporate_thriller": "Fenrir",
+        }.get(str(mood or "dark_horror"), "Charon")
+        gem_voice = voice_id if voice_id in _GEMINI_VOICE_NAMES else default_gem_voice
+        mood_dir = _DOC_ACTING_DIRECTIONS.get(str(mood or "dark_horror"), _DOC_ACTING_DIRECTIONS["dark_horror"])
+        acting_dir = mood_dir["en" if is_en else "pt"]
+        try:
+            await asyncio.to_thread(
+                synthesize_gemini_tts_line,
+                spoken_text,
+                raw_wav,
+                gem_voice,
+                acting_dir,
+                gem_key,
+                lang,
+                thermal_limit_c,
+            )
+            # Trim ONLY dead outer silence — preserve 100% of human internal breaths & dramatic pauses!
+            out_wav, _, out_dur = await asyncio.to_thread(
+                trim_silence_vad,
+                raw_wav,
+                vad_wav,
+                [],
+                0.45,
+                0.11,
+                thermal_limit_c,
+                True,
+            )
+            aligned_words = await asyncio.to_thread(
+                align_script_words_to_audio,
+                out_wav,
+                text,
+                out_dur,
+                lang,
+            )
+            try:
+                words_json.write_text(json.dumps(aligned_words, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+            return out_wav, aligned_words, out_dur
+        except Exception as exc:
+            print(f"[NetflixDoc] Gemini Expressive TTS fallback -> edge-tts ({str(exc)[:110]})", flush=True)
+
+    # 2. PRIORITY 2: Natural pause-preserving Edge-TTS (never rushed +8% unless explicitly desired)
+    default_v = "en-US-AndrewMultilingualNeural" if is_en else "pt-BR-AntonioNeural"
+    edge_voice_id = voice_id if (voice_id and "Neural" in voice_id) else default_v
+    candidates = [edge_voice_id, default_v, "pt-BR-AntonioNeural", "en-US-AndrewMultilingualNeural"]
+    # Keep documentary speech natural (avoid robotic fast-forward when default "+8%" came from viral shorts UI)
+    eff_rate = "+0%" if str(rate or "").strip() in ("", "+8%", "+5%") else str(rate).strip()
+    eff_pitch = "-4Hz" if str(pitch or "").strip() in ("", "+0Hz") else str(pitch).strip()
 
     for v_try in candidates:
         try:
             comm = edge_tts.Communicate(
-                text=text,
+                text=spoken_text,
                 voice=v_try,
-                rate=rate or "+5%",
-                pitch=pitch or "-6Hz",
+                rate=eff_rate,
+                pitch=eff_pitch,
                 boundary="WordBoundary",
             )
             words: List[Dict[str, Any]] = []
@@ -2262,7 +2406,15 @@ async def _synthesize_doc_scene_narration(
                     words.append({"word": str(ch["text"]).strip(), "start": round(st, 3), "end": round(st + max(0.06, dur), 3)})
             if chunks:
                 raw_mp3.write_bytes(bytes(chunks))
-                out_wav, trimmed_words, out_dur = trim_silence_vad(raw_mp3, vad_wav, words, thermal_limit_c=thermal_limit_c)
+                out_wav, trimmed_words, out_dur = trim_silence_vad(
+                    raw_mp3,
+                    vad_wav,
+                    words,
+                    max_pause_s=0.45,
+                    consonant_pad_s=0.11,
+                    thermal_limit_c=thermal_limit_c,
+                    trim_edges_only=True,
+                )
                 try:
                     words_json.write_text(json.dumps(trimmed_words, ensure_ascii=False), encoding="utf-8")
                 except Exception:
@@ -2273,8 +2425,8 @@ async def _synthesize_doc_scene_narration(
 
     # Offline fallback via espeak-ng or pure-Python harmonic narration envelope
     try:
-        _, words = _synthesize_espeak_fallback(text, raw_wav)
-        out_wav, trimmed_words, out_dur = trim_silence_vad(raw_wav, vad_wav, words, thermal_limit_c=thermal_limit_c)
+        _, words = _synthesize_espeak_fallback(spoken_text, raw_wav)
+        out_wav, trimmed_words, out_dur = trim_silence_vad(raw_wav, vad_wav, words, thermal_limit_c=thermal_limit_c, trim_edges_only=True)
         try:
             words_json.write_text(json.dumps(trimmed_words, ensure_ascii=False), encoding="utf-8")
         except Exception:
@@ -2997,6 +3149,178 @@ def _draw_mode_video_pip_evidence(
             qy += qf.getSize() * 1.32
 
 
+def _draw_fullbleed_parallax_shot(
+    canvas: skia.Canvas,
+    w: int,
+    h: int,
+    bg_img: Optional[skia.Image],
+    fg_img: Optional[skia.Image],
+    shot_prog: float,
+    t: float,
+    pan_dir: float = 1.0,
+) -> None:
+    """Render an unobstructed full-bleed edge-to-edge 2.5D parallax cinema shot with subtle embers & vignette."""
+    full_r = skia.Rect.MakeXYWH(0, 0, w, h)
+    canvas.clear(skia.ColorSetARGB(255, 9, 7, 16))
+    if bg_img is not None:
+        bg_zoom = 1.05 + 0.08 * shot_prog
+        bg_pan_x = (shot_prog - 0.5) * (-26.0 * pan_dir)
+        bg_pan_y = (shot_prog - 0.5) * -10.0
+        canvas.save()
+        canvas.translate(w * 0.5 + bg_pan_x, h * 0.42 + bg_pan_y)
+        canvas.scale(bg_zoom, bg_zoom)
+        canvas.translate(-w * 0.5, -h * 0.42)
+        canvas.drawImageRect(bg_img, full_r, _LINEAR_SAMPLING)
+        canvas.restore()
+
+        # Atmospheric floating dust / warm candlelight embers
+        mote_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(72, 255, 209, 102))
+        for mi in range(16):
+            mx_m = ((mi * 197 + t * (26 + (mi % 4) * 9)) % w)
+            my_m = ((mi * 131 - t * (18 + (mi % 3) * 7)) % h)
+            canvas.drawCircle(mx_m, my_m, 2.0 + (mi % 3) * 1.2, mote_p)
+
+        if fg_img is not None:
+            fg_zoom = 1.07 + 0.145 * shot_prog
+            fg_pan_x = (shot_prog - 0.5) * (44.0 * pan_dir)
+            fg_pan_y = (shot_prog - 0.5) * -14.0
+            canvas.save()
+            canvas.translate(w * 0.5 + fg_pan_x, h * 0.42 + fg_pan_y)
+            canvas.scale(fg_zoom, fg_zoom)
+            canvas.translate(-w * 0.5, -h * 0.42)
+            fg_paint = skia.Paint(AntiAlias=True)
+            fg_paint.setImageFilter(skia.ImageFilters.DropShadow(0, 14, 28, 28, skia.ColorSetARGB(145, 0, 0, 0)))
+            canvas.drawImageRect(fg_img, full_r, _LINEAR_SAMPLING, fg_paint)
+            canvas.restore()
+
+    # Subtle cinematic edge vignette (keeps center bright and dramatic)
+    vig = skia.Paint()
+    vig.setShader(
+        skia.GradientShader.MakeRadial(
+            (w * 0.5, h * 0.46),
+            max(w, h) * 0.68,
+            [skia.ColorSetARGB(0, 8, 6, 16), skia.ColorSetARGB(158, 8, 6, 16)],
+        )
+    )
+    canvas.drawRect(full_r, vig)
+
+
+def _draw_mode_cinema_multishot(
+    canvas: skia.Canvas,
+    w: int,
+    h: int,
+    scene: NetflixDocScene,
+    prog: float,
+    body_t: float,
+    body_dur: float,
+    t: float,
+    primary_frame: Optional[skia.Image],
+    pip_frame: Optional[skia.Image],
+    media: LoadedSceneSkiaMedia,
+    cut_cadence_s: float = 2.6,
+    s_idx: int = 0,
+) -> None:
+    """Cinema v3 Primary Visual Mode: clean, unobstructed FULL-SCREEN multi-shot storytelling!
+    Automatically cuts visually every ~`cut_cadence_s` (2.0-3.5s) across distinct visual beats:
+      Shot 0: Full-screen HD Atmospheric B-Roll #1 with smooth dynamic push-in
+      Shot 1: Full-bleed Archival / Google Flow Art in 2.5D u2netp Parallax with drifting embers
+      Shot 2: Full-screen Secondary HD B-Roll #2 (or Archival Photo #2) with dramatic camera punch-in
+      Shot 3: Archival / Google Flow Art #2 (on longer beats)
+    Includes a crisp 0.13s dark-cinema flash/cut transition right on every internal visual cut!
+    """
+    eff_cadence = max(1.8, min(4.2, float(cut_cadence_s or 2.6)))
+    n_shots = max(2, min(4, int(round(body_dur / eff_cadence))))
+    shot_dur = max(1.2, body_dur / float(n_shots))
+    shot_idx = min(n_shots - 1, int(body_t / shot_dur))
+    shot_local_t = max(0.0, body_t - shot_idx * shot_dur)
+    shot_prog = min(1.0, shot_local_t / shot_dur)
+
+    # Build ordered sequence of distinct full-screen visual layers for this scene
+    shot_slots: List[str] = []
+    if s_idx % 2 == 0:
+        if primary_frame is not None:
+            shot_slots.append("video_primary")
+        if (media.parallax_bg or media.primary_photo) is not None:
+            shot_slots.append("photo_25d_primary")
+        if pip_frame is not None:
+            shot_slots.append("video_secondary")
+        if media.extra_photos:
+            shot_slots.append("photo_extra_0")
+    else:
+        if (media.parallax_bg or media.primary_photo) is not None:
+            shot_slots.append("photo_25d_primary")
+        if primary_frame is not None:
+            shot_slots.append("video_primary")
+        if media.extra_photos:
+            shot_slots.append("photo_extra_0")
+        if pip_frame is not None:
+            shot_slots.append("video_secondary")
+    if not shot_slots:
+        shot_slots = ["video_primary"]
+
+    kind = shot_slots[shot_idx % len(shot_slots)]
+    pan_dir = 1.0 if (shot_idx + s_idx) % 2 == 0 else -1.0
+
+    if kind == "video_primary":
+        _draw_video_backdrop_layer(
+            canvas,
+            w,
+            h,
+            primary_frame,
+            t,
+            shot_prog,
+            scrim_alpha=36,
+            ken_burns_zoom=0.09,
+            show_grid=False,
+            show_dust=True,
+        )
+    elif kind == "video_secondary":
+        _draw_video_backdrop_layer(
+            canvas,
+            w,
+            h,
+            pip_frame or primary_frame,
+            t,
+            shot_prog,
+            scrim_alpha=34,
+            ken_burns_zoom=0.11,
+            show_grid=False,
+            show_dust=True,
+        )
+    elif kind == "photo_25d_primary":
+        _draw_fullbleed_parallax_shot(
+            canvas,
+            w,
+            h,
+            media.parallax_bg or media.primary_photo,
+            media.parallax_fg,
+            shot_prog,
+            t,
+            pan_dir=pan_dir,
+        )
+    else:
+        extra_img = media.extra_photos[0] if media.extra_photos else (media.parallax_bg or media.primary_photo)
+        _draw_fullbleed_parallax_shot(
+            canvas,
+            w,
+            h,
+            extra_img,
+            None,
+            shot_prog,
+            t,
+            pan_dir=-pan_dir,
+        )
+
+    # Crisp 0.13s cinema cut flash / micro-dip right on each internal shot switch
+    if shot_idx > 0 and shot_local_t < 0.13:
+        cut_k = 1.0 - (shot_local_t / 0.13)
+        flash_alpha = int(115 * (cut_k ** 1.6))
+        canvas.drawRect(
+            skia.Rect.MakeXYWH(0, 0, w, h),
+            skia.Paint(Color=skia.ColorSetARGB(flash_alpha, 255, 224, 175)),
+        )
+
+
 def _draw_mode_parallax_25d_photo(
     canvas: skia.Canvas,
     w: int,
@@ -3011,8 +3335,24 @@ def _draw_mode_parallax_25d_photo(
     media: LoadedSceneSkiaMedia,
     is_en: bool = False,
 ) -> None:
-    """Mode 4: Real high-res photo separated via `separate_photo_25d_u2netp` (foreground moves 2.2x faster than background!) inside dramatic cinema matte over moving dark B-roll video."""
-    # Real moving dark HD B-roll video behind the 2.5D cinema matte!
+    """Mode 4: Real high-res photo separated via `separate_photo_25d_u2netp` (foreground moves 2.2x faster than background!).
+    In 9:16 vertical mobile cinema, renders FULL-BLEED edge-to-edge without heavy dashboard boxes!
+    """
+    is_wide = w >= h
+    if not is_wide:
+        _draw_fullbleed_parallax_shot(
+            canvas,
+            w,
+            h,
+            media.parallax_bg or media.primary_photo or primary_frame,
+            media.parallax_fg,
+            prog,
+            t,
+            pan_dir=1.0,
+        )
+        return
+
+    # 16:9 widescreen cinema matte presentation over moving dark HD B-roll
     _draw_video_backdrop_layer(
         canvas,
         w,
@@ -4038,11 +4378,17 @@ def _draw_sleek_lower_third(
     scene_dur: float,
     title_tf: skia.Typeface,
     ui_tf: skia.Typeface,
+    max_display_s: float = 3.2,
 ) -> None:
-    """Draw sleek investigative documentary Lower Third (top-left in 9:16 or bottom-left above subtitles in 16:9)."""
+    """Draw sleek investigative documentary Lower Third that enters cleanly and fades out after `max_display_s`
+    so the cinema footage remains unobstructed.
+    """
+    vis_dur = min(scene_dur, max_display_s)
+    if local_t >= vis_dur:
+        return
     enter = _ease_out_cubic(local_t / 0.35)
-    exit_a = _ease_out_cubic((scene_dur - local_t) / 0.30) if (scene_dur - local_t) < 0.30 else 1.0
-    alpha = int(242 * min(enter, exit_a))
+    exit_a = _ease_out_cubic((vis_dur - local_t) / 0.35) if (vis_dur - local_t) < 0.35 else 1.0
+    alpha = int(235 * min(enter, exit_a))
     if alpha <= 10:
         return
 
@@ -4190,9 +4536,12 @@ def _load_scene_skia_photos(
     loaded = LoadedSceneSkiaMedia()
     is_wide = w >= h
 
-    if scene.visual_mode == "parallax_25d_photo" and assets.primary_photo_path is not None:
-        matte_w = int(round(w * (0.76 if is_wide else 0.88)))
-        matte_h = int(round(h * (0.61 if is_wide else 0.45)))
+    if scene.visual_mode in ("parallax_25d_photo", "cinema_multishot") and assets.primary_photo_path is not None:
+        if scene.visual_mode == "cinema_multishot" or not is_wide:
+            matte_w, matte_h = w, h
+        else:
+            matte_w = int(round(w * 0.76))
+            matte_h = int(round(h * 0.61))
         bg_img, fg_img = separate_photo_25d_u2netp(assets.primary_photo_path, matte_w, matte_h)
         if bg_img is not None:
             loaded.parallax_bg = bg_img
@@ -4213,7 +4562,9 @@ def _load_scene_skia_photos(
         loaded.primary_photo = load_skia_image_cover(assets.primary_photo_path, pw, ph)
 
     if assets.extra_photo_paths:
-        if scene.visual_mode == "red_string_board":
+        if scene.visual_mode == "cinema_multishot":
+            ew, eh = w, h
+        elif scene.visual_mode == "red_string_board":
             ew, eh = (260, 260)
         elif scene.visual_mode == "sliding_timeline":
             ew, eh = (460, 180) if is_wide else (260, 220)
@@ -4228,6 +4579,8 @@ def _load_scene_skia_photos(
 
 
 def _compute_pip_dimensions(visual_mode: VisualModeType, is_wide: bool) -> Tuple[int, int]:
+    if visual_mode == "cinema_multishot":
+        return (1920, 1080) if is_wide else (1080, 1920)
     if visual_mode == "broll_video_pip":
         return (780, 440) if is_wide else (908, 512)
     if visual_mode == "dark_map_route":
@@ -4257,6 +4610,7 @@ def _render_single_doc_scene_to_disk(
     media_assets: Optional[SceneMediaAssets] = None,
     lang: str = "pt_br",
     caption_style: str = "cinema_minimal",
+    cut_cadence_s: float = 2.6,
 ) -> Tuple[Path, bool]:
     """Render one documentary scene at 30fps in C++ Skia directly to disk with REAL moving B-roll video,
     Video-over-Video PiP monitor, REAL photographs, kinetic captions, LUT 02_dark_wealth.cube & 35mm film grain.
@@ -4376,7 +4730,12 @@ def _render_single_doc_scene_to_disk(
                 prog = min(1.0, body_t / body_dur)
                 pip_frame = pip_reader.read_skia_frame(darken_alpha=0.0) if pip_reader is not None else None
 
-                if scene.visual_mode == "broll_video_pip":
+                if scene.visual_mode == "cinema_multishot":
+                    _draw_mode_cinema_multishot(
+                        c, w, h, scene, prog, body_t, body_dur, global_t, primary_frame, pip_frame, loaded_media,
+                        cut_cadence_s=cut_cadence_s, s_idx=s_idx,
+                    )
+                elif scene.visual_mode == "broll_video_pip":
                     _draw_mode_broll_video_pip(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, pip_frame, loaded_media, is_en=is_en)
                 elif scene.visual_mode == "video_pip_evidence":
                     _draw_mode_video_pip_evidence(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, pip_frame, loaded_media, is_en=is_en)
@@ -4391,7 +4750,9 @@ def _render_single_doc_scene_to_disk(
                 else:
                     _draw_mode_parallax_25d_photo(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, loaded_media, is_en=is_en)
 
-                _draw_sleek_lower_third(c, w, h, scene, body_t, body_dur, title_tf, ui_tf)
+                # Show sleek Lower-Third ONLY on Act/Location shifts (prevents repetitive dashboard clutter!)
+                if s_idx == 0 or scene.chapter_card is not None or (s_idx % 4 == 0):
+                    _draw_sleek_lower_third(c, w, h, scene, body_t, body_dur, title_tf, ui_tf, max_display_s=3.2)
                 _draw_doc_subtitles(c, w, h, chunks, local_t, caption_tf, caption_style=caption_style)
 
             # Top slim cinema progress bar
@@ -4554,6 +4915,50 @@ def _prefetch_scene_media_sync(
                         fallback_photo_pool.append(ppath)
             if item.extra_photo_paths:
                 item.primary_photo_path = item.extra_photo_paths[0]
+        elif sc.visual_mode == "cinema_multishot":
+            # Fetch primary high-res archival / Google Flow bespoke plate + 1 extra distinct photo for multi-shot cuts!
+            ppath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_photo") if resume else None
+            if ppath is None:
+                pq = sc.photo_query_en or sc.image_prompt_en or mood_defaults["photos"][s_idx % len(mood_defaults["photos"])]
+                ppath = fetch_doc_hero_or_archival_photo(
+                    pq,
+                    work_dir,
+                    f"sc{s_idx:02d}_photo",
+                    min_width=760,
+                    used_urls=used_photo_urls,
+                    mood=sc_mood,
+                    prefer_gemini=bool(sc.prefer_gemini_photo),
+                    aspect_ratio=aspect_ratio,
+                    bespoke_prompt_en=sc.bespoke_image_prompt_en or "",
+                )
+            if ppath is None and fallback_photo_pool:
+                ppath = fallback_photo_pool[s_idx % len(fallback_photo_pool)]
+            if ppath is not None:
+                item.primary_photo_path = ppath
+                photos_used.append(str(ppath))
+                if ppath not in fallback_photo_pool:
+                    fallback_photo_pool.append(ppath)
+
+            # Secondary distinct archival/Flow photo for Shot 3
+            extra_q_list = list(sc.extra_photo_queries_en or [])
+            extra_q = next((q for q in extra_q_list if q.lower() != (sc.photo_query_en or "").lower()), "") or mood_defaults["photos"][(s_idx + 2) % len(mood_defaults["photos"])]
+            epath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_ms2") if resume else None
+            if epath is None:
+                epath = fetch_doc_hero_or_archival_photo(
+                    extra_q,
+                    work_dir,
+                    f"sc{s_idx:02d}_ms2",
+                    min_width=720,
+                    used_urls=used_photo_urls,
+                    mood=sc_mood,
+                    prefer_gemini=False,
+                    aspect_ratio=aspect_ratio,
+                )
+            if epath is not None:
+                item.extra_photo_paths.append(epath)
+                photos_used.append(str(epath))
+                if epath not in fallback_photo_pool:
+                    fallback_photo_pool.append(epath)
         elif sc.visual_mode in ("parallax_25d_photo", "newspaper_highlighter", "broll_video_pip", "video_pip_evidence"):
             min_w = 800 if sc.visual_mode == "parallax_25d_photo" else 640
             ppath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_photo") if resume else None
@@ -4793,9 +5198,11 @@ async def render_netflix_documentary(
     progress_cb=None,
     caption_style: Optional[str] = None,
     music_volume: float = 0.17,
-    voice_rate: str = "+5%",
-    voice_pitch: str = "-6Hz",
+    voice_rate: str = "+0%",
+    voice_pitch: str = "-4Hz",
     resume: bool = False,
+    voice_engine: str = "auto",
+    cut_cadence_s: float = 2.6,
 ) -> Dict[str, Any]:
     """Render a complete Netflix / MagnatesMedia / Dark History cinema documentary scene-by-scene to disk
     with REAL moving HD B-roll video in every scene, Video-over-Video (PiP), REAL/Bespoke Gemini photographs
@@ -4940,6 +5347,8 @@ async def render_netflix_documentary(
             pitch=voice_pitch,
             resume=resume,
             reuse_existing_wav_if_no_words=scene_already_rendered,
+            voice_engine=voice_engine,
+            mood=doc_mood,
         )
 
         # Shift scene words by chapter_intro_s (local scene time) and cursor_t (master time)
@@ -4966,7 +5375,18 @@ async def render_netflix_documentary(
                 _add_sfx(0.04, 0.56, "horror_braam.wav", "sub_boom.wav")
             else:
                 _add_sfx(0.04, 0.50, "cinematic_hit.wav", "sub_boom.wav")
-        if sc.visual_mode == "broll_video_pip":
+        if sc.visual_mode == "cinema_multishot":
+            eff_cad = max(1.8, min(4.2, float(cut_cadence_s or 2.6)))
+            body_est = max(1.0, speech_dur + pause_gap_s)
+            n_sub = max(2, min(4, int(round(body_est / eff_cad))))
+            sub_dur = body_est / float(n_sub)
+            for si_cut in range(1, n_sub):
+                cut_t = body_start_t + si_cut * sub_dur
+                if si_cut % 2 == 1:
+                    _add_sfx(cut_t - 0.04, 0.24, "whoosh_fast.wav", "camera_shutter.wav")
+                else:
+                    _add_sfx(cut_t - 0.03, 0.22, "flash_impact.wav", "whoosh_fast.wav")
+        elif sc.visual_mode == "broll_video_pip":
             _add_sfx(body_start_t + 0.14, 0.34, "whoosh_fast.wav", "whoosh_deep.wav")
         elif sc.visual_mode == "video_pip_evidence":
             _add_sfx(body_start_t + 0.12, 0.36, "flash_impact.wav", "ui_click.wav")
@@ -5077,6 +5497,7 @@ async def render_netflix_documentary(
             rec["media_assets"],
             plan_obj.lang,
             eff_caption_style,
+            cut_cadence_s,
         )
         if did_u2netp:
             u2netp_25d_used = True

@@ -76,6 +76,7 @@ from engine.audio_dsp import (
     PT_BR_EDGE_VOICES,
     generate_narration,
 )
+from engine.gdrive_sync import probe_gdrive_status, upload_job_to_gdrive
 from engine.intel_vaapi import probe_quicksync, read_cpu_temperature_c, safe_thread_count
 from engine.pipeline import enqueue_new_job, run_video_job
 from publisher.stealth_uploader import (
@@ -367,6 +368,10 @@ class SettingsPayload(BaseModel):
     ollama_url: Optional[str] = None
     default_llm: Optional[str] = None
     thermal_limit_c: Optional[str] = None
+    gdrive_root_folder: Optional[str] = None
+    gdrive_auto_upload: Optional[str] = None
+    gdrive_prune_local: Optional[str] = None
+    gdrive_local_dir: Optional[str] = None
 
 
 class ClientPayload(BaseModel):
@@ -874,6 +879,7 @@ async def api_bootstrap_data(request: Request):
             "username": auth_user or (raw_settings.get("auth_username") or "frimerise"),
         },
         "tailscale": tailscale,
+        "gdrive": probe_gdrive_status(),
         "presets": list_presets(),
         "clients": list_clients(),
         "skills": list_skills(),
@@ -1395,6 +1401,34 @@ async def api_resume_job(job_id: str):
         }
     )
     return {"status": "queued_for_resume", "job_id": job_id}
+
+
+@app.get("/api/gdrive/status")
+async def api_gdrive_status():
+    return probe_gdrive_status()
+
+
+@app.post("/api/jobs/{job_id}/gdrive-upload")
+async def api_job_gdrive_upload(job_id: str, prune_local: Optional[bool] = None):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    job_dir = OUTPUTS_DIR / job_id
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="Pasta de saída do job não encontrada")
+    res = await asyncio.to_thread(
+        upload_job_to_gdrive,
+        job_dir,
+        str(job.get("topic") or job_id),
+        job_id,
+        prune_after_upload=prune_local,
+    )
+    if res.get("status") == "uploaded":
+        append_job_log(
+            job_id,
+            f"☁️ Enviado manualmente ao Google Drive: {res.get('remote_path')} ({res.get('files_uploaded')} arquivos, {res.get('total_mb')} MB)",
+        )
+    return res
 
 
 @app.post("/api/jobs/{job_id}/extract-shorts")
