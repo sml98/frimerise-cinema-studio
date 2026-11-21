@@ -317,6 +317,12 @@ def trim_silence_vad(
     n_frames = len(pcm) // frame_len
     speech_probs = np.zeros(n_frames, dtype=np.float32)
 
+    # Adaptive energy + zero-crossing speech detector (immune to long Gemini TTS trailing room-tone hiss!)
+    frames = pcm[: n_frames * frame_len].reshape(n_frames, frame_len) if n_frames > 0 else np.zeros((0, frame_len), dtype=np.float32)
+    rms_energy = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-10) if n_frames > 0 else np.zeros(0, dtype=np.float32)
+    peak_speech_ref = float(np.percentile(rms_energy, 92)) if n_frames > 10 else 0.05
+    energy_floor = max(0.014, peak_speech_ref * 0.11)
+
     if silero_path.exists():
         try:
             sess = ort.InferenceSession(str(silero_path), providers=["CPUExecutionProvider"])
@@ -325,22 +331,24 @@ def trim_silence_vad(
             for i in range(n_frames):
                 chunk = pcm[i * frame_len : (i + 1) * frame_len][None, :]
                 out, state = sess.run(None, {"input": chunk, "state": state, "sr": sr_arr})
-                speech_probs[i] = float(out[0][0])
+                # Require minimum acoustic energy so pure room-tone hiss never triggers false speech
+                speech_probs[i] = float(out[0][0]) if rms_energy[i] >= energy_floor * 0.55 else 0.0
         except Exception:
             silero_path = Path("__fallback__")
 
-    if not silero_path.exists():
-        # Adaptive energy + zero-crossing consonant detector
-        frames = pcm[: n_frames * frame_len].reshape(n_frames, frame_len)
-        rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-10)
+    if not silero_path.exists() and n_frames > 0:
         zcr = np.mean(np.abs(np.diff(np.sign(frames), axis=1)) > 0, axis=1)
-        thresh = max(0.012, float(np.percentile(rms, 25)) * 2.2)
-        speech_probs = ((rms > thresh) | ((rms > thresh * 0.45) & (zcr > 0.12))).astype(np.float32)
+        speech_probs = ((rms_energy > energy_floor) | ((rms_energy > energy_floor * 0.55) & (zcr > 0.12))).astype(np.float32)
 
     # Convert to speech intervals with generous consonant tail pad
     frame_s = frame_len / float(sr)
     pad_frames = int(math.ceil(consonant_pad_s / frame_s))
     active = speech_probs > 0.35
+    # Suppress isolated 1-frame hiss spikes (require >= 2 consecutive active frames = 64ms)
+    if n_frames >= 3:
+        sustained = active & (np.roll(active, 1) | np.roll(active, -1))
+        if np.any(sustained):
+            active = sustained
     # Dilate active mask so final consonants ("s", "r", "t", "k") are NEVER clipped
     if n_frames > 0 and np.any(active):
         kernel = np.ones(pad_frames * 2 + 1, dtype=np.int32)
@@ -348,15 +356,25 @@ def trim_silence_vad(
     else:
         dilated = np.ones(n_frames, dtype=bool)
 
-    # Keep natural micro-pauses up to max_pause_s; ALWAYS preserve final 250ms tail after last word
+    # Keep natural micro-pauses up to max_pause_s; ALWAYS preserve clean lead-in & tail after last real speech
     active_idx = np.where(dilated)[0]
     keep_mask = np.zeros(n_frames, dtype=bool)
     if trim_edges_only and len(active_idx) > 0:
-        lead_frames = int(math.ceil(0.08 / frame_s))
-        tail_frames = int(math.ceil(0.28 / frame_s))
+        lead_frames = int(math.ceil(0.06 / frame_s))
+        tail_frames = int(math.ceil(0.24 / frame_s))
         start_f = max(0, int(active_idx[0]) - lead_frames)
         end_f = min(n_frames, int(active_idx[-1]) + tail_frames)
-        keep_mask[start_f:end_f] = True
+        # Preserve all natural human breaths (<= 0.50s), while capping any glitched long internal silence (> 0.50s)
+        max_internal_sil = int(max(0.45, max_pause_s) / frame_s)
+        sil_run = 0
+        for i in range(start_f, end_f):
+            if dilated[i] or i < int(active_idx[0]) or i > int(active_idx[-1]):
+                keep_mask[i] = True
+                sil_run = 0
+            else:
+                sil_run += 1
+                if sil_run <= max_internal_sil:
+                    keep_mask[i] = True
     else:
         max_sil_frames = int(max_pause_s / frame_s)
         sil_run = 0
@@ -444,6 +462,19 @@ def _get_whisper_align_model():
     return _WHISPER_ALIGN_MODEL
 
 
+def _load_wav_16k_float32(wav_path: Path) -> np.ndarray:
+    """Decode PCM WAV directly to 16kHz mono float32 ndarray (bypasses PyAV version mismatches!)."""
+    with wave.open(str(wav_path), "rb") as wf:
+        sr = wf.getframerate()
+        ch = wf.getnchannels()
+        pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+    if ch > 1:
+        pcm = pcm.reshape(-1, ch).mean(axis=1)
+    if sr != 16000 and len(pcm) > 0:
+        pcm = signal.resample_poly(pcm, 16000, sr).astype(np.float32)
+    return pcm.astype(np.float32, copy=False)
+
+
 def align_script_words_to_audio(
     wav_path: Path,
     script_text: str,
@@ -451,19 +482,28 @@ def align_script_words_to_audio(
     lang: str = "pt_br",
 ) -> List[Dict[str, Any]]:
     """Align script words to human TTS audio (Gemini TTS) using local faster-whisper int8
-    with punctuation-aware proportional fallback so captions sync tightly to breaths & pauses.
+    (passing 16kHz float32 ndarray directly to bypass PyAV) + SequenceMatcher token alignment
+    so captions stay laser-synced to real human breaths and dramatic pauses.
     """
+    import difflib
+    import unicodedata
+
     tokens = [w.strip() for w in (script_text or "").split() if w.strip()]
     if not tokens:
         return []
     dur_total = max(0.4, float(duration_s or _get_wav_duration(wav_path) or 1.0))
 
-    # 1. Try local faster-whisper int8 for exact spoken word timing
+    def _norm_tok(s: str) -> str:
+        nfd = unicodedata.normalize("NFKD", s.lower())
+        return re.sub(r"[^a-z0-9]", "", "".join(c for c in nfd if not unicodedata.combining(c)))
+
+    # 1. Local faster-whisper int8 via direct 16kHz float32 numpy array (zero PyAV errors!)
     try:
         model = _get_whisper_align_model()
+        audio_16k = _load_wav_16k_float32(wav_path)
         w_lang = "en" if str(lang).lower().startswith("en") else ("es" if str(lang).lower().startswith("es") else "pt")
         segments, _ = model.transcribe(
-            str(wav_path),
+            audio_16k,
             language=w_lang,
             word_timestamps=True,
             vad_filter=False,
@@ -476,23 +516,50 @@ def align_script_words_to_audio(
                 en = min(dur_total, max(st + 0.06, float(wd.end)))
                 heard.append((st, en, str(wd.word or "").strip()))
 
-        if len(heard) >= max(2, int(len(tokens) * 0.55)):
-            # Map clean script tokens onto heard word timeline monotonically (keeps exact PT-BR spelling!)
+        if len(heard) >= max(2, int(len(tokens) * 0.45)):
+            script_norms = [_norm_tok(t) for t in tokens]
+            heard_norms = [_norm_tok(h[2]) for h in heard]
+            sm = difflib.SequenceMatcher(None, script_norms, heard_norms, autojunk=False)
+            anchors: Dict[int, Tuple[float, float]] = {}
+            for blk in sm.get_matching_blocks():
+                for k in range(blk.size):
+                    anchors[blk.a + k] = (heard[blk.b + k][0], heard[blk.b + k][1])
+
             aligned: List[Dict[str, Any]] = []
             n_t = len(tokens)
             n_h = len(heard)
-            for idx, tok in enumerate(tokens):
-                h_start_idx = min(n_h - 1, int(idx * n_h / n_t))
-                h_end_idx = min(n_h - 1, max(h_start_idx, int(((idx + 1) * n_h / n_t) - 0.001)))
-                st = heard[h_start_idx][0]
-                en = heard[h_end_idx][1]
-                if aligned and st < aligned[-1]["end"]:
-                    st = aligned[-1]["end"]
-                en = max(st + 0.07, min(dur_total, en))
-                aligned.append({"word": tok, "start": round(st, 3), "end": round(en, 3)})
+            speech_start = heard[0][0]
+            speech_end = heard[-1][1]
+
+            # Fill any unmatched tokens cleanly by interpolating between neighboring matched anchors
+            idx = 0
+            while idx < n_t:
+                if idx in anchors:
+                    st, en = anchors[idx]
+                    if aligned and st < aligned[-1]["end"]:
+                        st = aligned[-1]["end"]
+                    en = max(st + 0.06, min(dur_total, en))
+                    aligned.append({"word": tokens[idx], "start": round(st, 3), "end": round(en, 3)})
+                    idx += 1
+                else:
+                    run_end = idx
+                    while run_end < n_t and run_end not in anchors:
+                        run_end += 1
+                    t_left = aligned[-1]["end"] if aligned else speech_start
+                    t_right = anchors[run_end][0] if run_end < n_t else speech_end
+                    if t_right <= t_left + 0.05:
+                        h_i = min(n_h - 1, int(idx * n_h / n_t))
+                        t_right = max(t_left + 0.14 * (run_end - idx), heard[min(n_h - 1, h_i + (run_end - idx))][1])
+                    span = max(0.08 * (run_end - idx), t_right - t_left)
+                    step = span / float(run_end - idx)
+                    for k, j_tok in enumerate(range(idx, run_end)):
+                        st = t_left + k * step
+                        en = min(dur_total, st + max(0.06, step * 0.92))
+                        aligned.append({"word": tokens[j_tok], "start": round(st, 3), "end": round(en, 3)})
+                    idx = run_end
             return aligned
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[AudioDSP] Whisper alignment fallback: {exc}", flush=True)
 
     # 2. Punctuation-weighted fallback (accounts for comma/period/ellipsis breathing pauses!)
     weights: List[float] = []

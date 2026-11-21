@@ -174,6 +174,27 @@ OFFTOPIC_MEDIA_TAGS = (
     "emoji",
     "cartoon",
     "anime",
+    "cosplay",
+    "facepaint",
+    "face paint",
+    "costume",
+    "parade",
+    "krampuslauf",
+    "perchtenlauf",
+    "reenactment",
+    "tourist",
+    "gemstone",
+    "emerald",
+    "jade",
+    "mineral",
+    "crystal",
+    "quartz",
+    "specimen",
+    "artifact_fragment",
+    "shard",
+    "coin",
+    "postage",
+    "stamp",
 )
 
 DARK_HISTORY_EXTRA_BAD_TAGS = (
@@ -1125,8 +1146,12 @@ def fetch_doc_real_photo(
                 pass
             return None
 
-        # a/b) Pixabay & Wikimedia Commons real archival photography (with Google Flow bespoke for folklore/macabre)
-        if prefer_wiki_first:
+        # a/b) For vivid folklore/macabre subjects (Krampus, demons, pagan rituals), prefer dark-cinema bespoke art
+        # (Google Flow / Pollinations Flux) ahead of random street-parade/cosplay Wikimedia uploads!
+        is_folklore_bespoke = bool(_BESPOKE_HISTORY_FOLKLORE_RE.search(f"{norm_q} {bespoke_prompt_en}"))
+        if is_folklore_bespoke and (prefer_gemini or bespoke_prompt_en.strip()):
+            hit = _try_google_flow_bespoke() or _try_wikimedia() or _try_pixabay()
+        elif prefer_wiki_first:
             hit = _try_wikimedia() or _try_google_flow_bespoke() or _try_pixabay()
         else:
             hit = _try_pixabay() or _try_wikimedia()

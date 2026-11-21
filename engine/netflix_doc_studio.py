@@ -2269,20 +2269,20 @@ _GEMINI_VOICE_NAMES = {str(v.get("id") or "") for v in GEMINI_EXPRESSIVE_VOICES}
 
 _DOC_ACTING_DIRECTIONS: Dict[str, Dict[str, str]] = {
     "dark_horror": {
-        "pt": "Narre como um locutor humano de documentário sombrio da Netflix: voz grave, envolvente e cinematográfica, ritmo calmo e tenso, pausas naturais nas vírgulas e reticências, respiração sutil e dicção brasileira impecável, sem pressa e sem soar robótico.",
-        "en": "Narrate like a human Netflix dark-history documentary voice actor: deep, haunting, cinematic gravity, calm suspenseful pacing, natural breaths and short pauses at commas and ellipses, crisp diction, never robotic.",
+        "pt": "Narre como um locutor humano de documentário viral sombrio da Netflix: voz grave, firme e magnética em português do Brasil natural, ritmo envolvente e dinâmico (cerca de 2,6 palavras por segundo), pausas curtas e naturais de respiração nas vírgulas, dicção cristalina — nunca lento, arrastado ou robótico.",
+        "en": "Narrate like a human Netflix dark-history documentary host: deep, magnetic, cinematic voice, engaging brisk storytelling pace (~2.6 words per second), brief natural breaths at commas, crisp diction — never slow, sluggish, or robotic.",
     },
     "investigative_crime": {
-        "pt": "Narre como um jornalista investigativo de documentário true-crime: voz firme, séria e humana, ritmo natural com pausas dramáticas nas revelações e perguntas, dicção clara em português do Brasil, sem pressa.",
-        "en": "Narrate like a Prestige true-crime documentary host: grounded, tense, human voice with natural pauses on revelations and questions, crisp diction, never rushed.",
+        "pt": "Narre como um jornalista investigativo de documentário true-crime: voz firme, séria e humana em português do Brasil natural, ritmo envolvente e ágil (~2,6 palavras por segundo) com pausas curtas nas revelações, nunca lento ou arrastado.",
+        "en": "Narrate like a prestige true-crime documentary host: grounded, tense, engaging pace (~2.6 words per second) with brief natural pauses on twists, crisp diction, never sluggish.",
     },
     "epic_history": {
-        "pt": "Narre como um documentarista histórico de cinema: voz profunda, emotiva e cativante, ritmo cadenciado com respiração natural e pausas elegantes nas vírgulas, português do Brasil natural.",
-        "en": "Narrate like an epic cinema documentary historian: rich, evocative, deeply human voice with measured pacing and natural breathing pauses.",
+        "pt": "Narre como um documentarista histórico de cinema: voz profunda, emotiva e cativante em português do Brasil natural, ritmo envolvente (~2,5 palavras por segundo) com respiração curta natural, nunca arrastado.",
+        "en": "Narrate like an epic cinema documentary historian: rich, evocative, human voice with engaging brisk cadence (~2.5 words per second) and brief natural breaths.",
     },
     "corporate_thriller": {
-        "pt": "Narre no estilo MagnatesMedia em português do Brasil: voz firme, inteligente e cinematográfica, ritmo envolvente com pausas estratégicas antes dos números e reviravoltas, 100% natural e humano.",
-        "en": "Narrate in MagnatesMedia documentary thriller style: crisp, authoritative, human storytelling voice with dramatic pauses before twists and numbers.",
+        "pt": "Narre no estilo MagnatesMedia em português do Brasil: voz firme, inteligente e cinematográfica, ritmo dinâmico (~2,7 palavras por segundo) com micro-pausas estratégicas antes dos números e reviravoltas, 100% natural e humano.",
+        "en": "Narrate in MagnatesMedia documentary thriller style: crisp, authoritative, dynamic storytelling pace (~2.7 words per second) with crisp pauses before twists.",
     },
 }
 
@@ -2341,42 +2341,54 @@ async def _synthesize_doc_scene_narration(
         gem_voice = voice_id if voice_id in _GEMINI_VOICE_NAMES else default_gem_voice
         mood_dir = _DOC_ACTING_DIRECTIONS.get(str(mood or "dark_horror"), _DOC_ACTING_DIRECTIONS["dark_horror"])
         acting_dir = mood_dir["en" if is_en else "pt"]
-        try:
-            await asyncio.to_thread(
-                synthesize_gemini_tts_line,
-                spoken_text,
-                raw_wav,
-                gem_voice,
-                acting_dir,
-                gem_key,
-                lang,
-                thermal_limit_c,
-            )
-            # Trim ONLY dead outer silence — preserve 100% of human internal breaths & dramatic pauses!
-            out_wav, _, out_dur = await asyncio.to_thread(
-                trim_silence_vad,
-                raw_wav,
-                vad_wav,
-                [],
-                0.45,
-                0.11,
-                thermal_limit_c,
-                True,
-            )
-            aligned_words = await asyncio.to_thread(
-                align_script_words_to_audio,
-                out_wav,
-                text,
-                out_dur,
-                lang,
-            )
+        max_sane_dur = max(7.0, len(spoken_text.split()) * 0.62)
+        for gem_try in range(2):
             try:
-                words_json.write_text(json.dumps(aligned_words, ensure_ascii=False), encoding="utf-8")
-            except Exception:
-                pass
-            return out_wav, aligned_words, out_dur
-        except Exception as exc:
-            print(f"[NetflixDoc] Gemini Expressive TTS fallback -> edge-tts ({str(exc)[:110]})", flush=True)
+                await asyncio.to_thread(
+                    synthesize_gemini_tts_line,
+                    spoken_text,
+                    raw_wav,
+                    gem_voice,
+                    acting_dir if gem_try == 0 else (acting_dir + " Speak briskly with zero long pauses."),
+                    gem_key,
+                    lang,
+                    thermal_limit_c,
+                )
+                # Trim dead leading/trailing room-tone hiss AND cap any glitched >0.42s silence gaps
+                out_wav, _, out_dur = await asyncio.to_thread(
+                    trim_silence_vad,
+                    raw_wav,
+                    vad_wav,
+                    [],
+                    0.42,
+                    0.10,
+                    thermal_limit_c,
+                    True,
+                )
+                if out_dur > max_sane_dur and gem_try == 0:
+                    print(
+                        f"[NetflixDoc] Gemini TTS clip unusually long ({out_dur:.1f}s > {max_sane_dur:.1f}s) on {tag}, retrying briskly...",
+                        flush=True,
+                    )
+                    continue
+                if out_dur > max_sane_dur * 1.45:
+                    raise RuntimeError(f"Gemini TTS duration glitch ({out_dur:.1f}s for {len(spoken_text.split())} words)")
+                aligned_words = await asyncio.to_thread(
+                    align_script_words_to_audio,
+                    out_wav,
+                    text,
+                    out_dur,
+                    lang,
+                )
+                try:
+                    words_json.write_text(json.dumps(aligned_words, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+                return out_wav, aligned_words, out_dur
+            except Exception as exc:
+                if gem_try == 0:
+                    continue
+                print(f"[NetflixDoc] Gemini Expressive TTS fallback -> edge-tts ({str(exc)[:110]})", flush=True)
 
     # 2. PRIORITY 2: Natural pause-preserving Edge-TTS (never rushed +8% unless explicitly desired)
     default_v = "en-US-AndrewMultilingualNeural" if is_en else "pt-BR-AntonioNeural"
@@ -3228,8 +3240,8 @@ def _draw_mode_cinema_multishot(
       Shot 3: Archival / Google Flow Art #2 (on longer beats)
     Includes a crisp 0.13s dark-cinema flash/cut transition right on every internal visual cut!
     """
-    eff_cadence = max(1.8, min(4.2, float(cut_cadence_s or 2.6)))
-    n_shots = max(2, min(4, int(round(body_dur / eff_cadence))))
+    eff_cadence = max(1.8, min(4.0, float(cut_cadence_s or 2.5)))
+    n_shots = max(2, min(10, int(round(body_dur / eff_cadence))))
     shot_dur = max(1.2, body_dur / float(n_shots))
     shot_idx = min(n_shots - 1, int(body_t / shot_dur))
     shot_local_t = max(0.0, body_t - shot_idx * shot_dur)
@@ -5376,9 +5388,9 @@ async def render_netflix_documentary(
             else:
                 _add_sfx(0.04, 0.50, "cinematic_hit.wav", "sub_boom.wav")
         if sc.visual_mode == "cinema_multishot":
-            eff_cad = max(1.8, min(4.2, float(cut_cadence_s or 2.6)))
+            eff_cad = max(1.8, min(4.0, float(cut_cadence_s or 2.5)))
             body_est = max(1.0, speech_dur + pause_gap_s)
-            n_sub = max(2, min(4, int(round(body_est / eff_cad))))
+            n_sub = max(2, min(10, int(round(body_est / eff_cad))))
             sub_dur = body_est / float(n_sub)
             for si_cut in range(1, n_sub):
                 cut_t = body_start_t + si_cut * sub_dur
