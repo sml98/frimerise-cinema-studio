@@ -2146,6 +2146,67 @@ def generate_netflix_doc_plan(
 # ---------------------------------------------------------------------------
 # 3. Narrator Voice Synthesizer per Scene (PT-BR & EN-US + Exact WordBoundary)
 # ---------------------------------------------------------------------------
+def _probe_wav_duration_s(wav_path: Path) -> float:
+    try:
+        with wave.open(str(wav_path), "rb") as wf:
+            frames = wf.getnframes()
+            sr = wf.getframerate()
+            if sr > 0:
+                return round(float(frames) / float(sr), 3)
+    except Exception:
+        pass
+    try:
+        return round(float(_probe_video_duration(wav_path)), 3)
+    except Exception:
+        return 0.0
+
+
+def _is_valid_cached_scene_mp4(
+    path: Path,
+    expected_w: int,
+    expected_h: int,
+    expected_fps: int,
+    expected_dur_s: float,
+    tol_s: float = 0.22,
+) -> bool:
+    """Return True iff `path` is a complete, playable video matching target WxH, FPS, and duration."""
+    if not path.exists() or path.stat().st_size < 16_384:
+        return False
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration:stream=codec_type,width,height,r_frame_rate",
+                "-of",
+                "json",
+                str(path),
+            ],
+            text=True,
+            timeout=8,
+        )
+        info = json.loads(out)
+        dur = float((info.get("format") or {}).get("duration") or 0.0)
+        if dur <= 0.3 or abs(dur - float(expected_dur_s)) > tol_s:
+            return False
+        vstreams = [s for s in (info.get("streams") or []) if s.get("codec_type") == "video"]
+        if not vstreams:
+            return False
+        vs = vstreams[0]
+        if int(vs.get("width") or 0) != int(expected_w) or int(vs.get("height") or 0) != int(expected_h):
+            return False
+        rfr = str(vs.get("r_frame_rate") or "0/1")
+        num, den = (rfr.split("/", 1) + ["1"])[:2]
+        fps_actual = float(num) / max(1.0, float(den))
+        if abs(fps_actual - float(expected_fps)) > 1.5:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 async def _synthesize_doc_scene_narration(
     text: str,
     voice_id: str,
@@ -2155,11 +2216,28 @@ async def _synthesize_doc_scene_narration(
     thermal_limit_c: float = 85.0,
     rate: str = "+5%",
     pitch: str = "-6Hz",
+    resume: bool = False,
+    reuse_existing_wav_if_no_words: bool = False,
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
-    """Synthesize authoritative deep documentary narration for a single scene."""
+    """Synthesize authoritative deep documentary narration for a single scene (checkpoint/resume aware)."""
     raw_mp3 = work_dir / f"{tag}_raw.mp3"
     raw_wav = work_dir / f"{tag}_raw.wav"
     vad_wav = work_dir / f"{tag}_vad.wav"
+    words_json = work_dir / f"{tag}_words.json"
+
+    if resume and vad_wav.exists() and vad_wav.stat().st_size > 4096:
+        cached_dur = _probe_wav_duration_s(vad_wav)
+        if cached_dur > 0.3:
+            if words_json.exists():
+                try:
+                    cached_words = json.loads(words_json.read_text(encoding="utf-8"))
+                    if isinstance(cached_words, list):
+                        return vad_wav, cached_words, cached_dur
+                except Exception:
+                    pass
+            if reuse_existing_wav_if_no_words:
+                est_words = _estimate_word_timestamps(text, cached_dur)
+                return vad_wav, est_words, cached_dur
 
     default_v = "en-US-AndrewMultilingualNeural" if str(lang).lower().startswith("en") else "pt-BR-AntonioNeural"
     candidates = [voice_id or default_v, default_v, "pt-BR-AntonioNeural", "en-US-AndrewMultilingualNeural"]
@@ -2184,14 +2262,24 @@ async def _synthesize_doc_scene_narration(
                     words.append({"word": str(ch["text"]).strip(), "start": round(st, 3), "end": round(st + max(0.06, dur), 3)})
             if chunks:
                 raw_mp3.write_bytes(bytes(chunks))
-                return trim_silence_vad(raw_mp3, vad_wav, words, thermal_limit_c=thermal_limit_c)
+                out_wav, trimmed_words, out_dur = trim_silence_vad(raw_mp3, vad_wav, words, thermal_limit_c=thermal_limit_c)
+                try:
+                    words_json.write_text(json.dumps(trimmed_words, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+                return out_wav, trimmed_words, out_dur
         except Exception:
             continue
 
     # Offline fallback via espeak-ng or pure-Python harmonic narration envelope
     try:
         _, words = _synthesize_espeak_fallback(text, raw_wav)
-        return trim_silence_vad(raw_wav, vad_wav, words, thermal_limit_c=thermal_limit_c)
+        out_wav, trimmed_words, out_dur = trim_silence_vad(raw_wav, vad_wav, words, thermal_limit_c=thermal_limit_c)
+        try:
+            words_json.write_text(json.dumps(trimmed_words, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+        return out_wav, trimmed_words, out_dur
     except Exception:
         import numpy as np
 
@@ -2218,6 +2306,10 @@ async def _synthesize_doc_scene_narration(
             wf.setsampwidth(2)
             wf.setframerate(sr)
             wf.writeframes(stereo.tobytes())
+        try:
+            words_json.write_text(json.dumps(words, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
         return vad_wav, words, dur_est
 
 
@@ -4333,11 +4425,22 @@ def _render_single_doc_scene_to_disk(
     return out_scene_mp4, loaded_media.u2netp_separated
 
 
+def _find_cached_work_asset(work_dir: Path, prefix: str, min_bytes: int = 4096) -> Optional[Path]:
+    for cand in sorted(work_dir.glob(f"{prefix}_*")):
+        try:
+            if cand.exists() and cand.stat().st_size >= min_bytes:
+                return cand
+        except Exception:
+            continue
+    return None
+
+
 def _prefetch_scene_media_sync(
     scenes: List[NetflixDocScene],
     work_dir: Path,
     aspect_ratio: str,
     mood: str = "corporate_thriller",
+    resume: bool = False,
 ) -> Tuple[List[SceneMediaAssets], Dict[str, Any]]:
     """Fetch unique real HD B-roll videos, secondary PiP videos, and real/bespoke Gemini archival photographs."""
     used_video_hashes: Set[str] = set()
@@ -4356,15 +4459,17 @@ def _prefetch_scene_media_sync(
         mood_defaults = _OPEN_TOPIC_FALLBACK_MEDIA.get(sc_mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
 
         # 1. Primary HD B-Roll Video (EVERY SINGLE SCENE — mood-aware, never finance stocks for horror/history!)
-        broll_q = sc.broll_query_en or mood_defaults["broll"][s_idx % len(mood_defaults["broll"])]
-        main_mp4 = fetch_doc_broll_clip(
-            broll_q,
-            work_dir,
-            f"sc{s_idx:02d}_main",
-            used_video_hashes,
-            aspect_ratio=aspect_ratio,
-            mood=sc_mood,
-        )
+        main_mp4 = _find_cached_work_asset(work_dir, f"broll_sc{s_idx:02d}_main", min_bytes=32_768) if resume else None
+        if main_mp4 is None:
+            broll_q = sc.broll_query_en or mood_defaults["broll"][s_idx % len(mood_defaults["broll"])]
+            main_mp4 = fetch_doc_broll_clip(
+                broll_q,
+                work_dir,
+                f"sc{s_idx:02d}_main",
+                used_video_hashes,
+                aspect_ratio=aspect_ratio,
+                mood=sc_mood,
+            )
         if main_mp4 is None and fallback_video_pool:
             main_mp4 = fallback_video_pool[s_idx % len(fallback_video_pool)]
         if main_mp4 is not None:
@@ -4375,15 +4480,17 @@ def _prefetch_scene_media_sync(
 
         # 2. Secondary Video-over-Video (PiP) B-Roll Video
         if sc.visual_mode in PIP_ENABLED_MODES:
-            pip_q = sc.pip_broll_query_en or mood_defaults["pip"][s_idx % len(mood_defaults["pip"])]
-            pip_mp4 = fetch_doc_broll_clip(
-                pip_q,
-                work_dir,
-                f"sc{s_idx:02d}_pip",
-                used_video_hashes,
-                aspect_ratio="16:9",
-                mood=sc_mood,
-            )
+            pip_mp4 = _find_cached_work_asset(work_dir, f"broll_sc{s_idx:02d}_pip", min_bytes=32_768) if resume else None
+            if pip_mp4 is None:
+                pip_q = sc.pip_broll_query_en or mood_defaults["pip"][s_idx % len(mood_defaults["pip"])]
+                pip_mp4 = fetch_doc_broll_clip(
+                    pip_q,
+                    work_dir,
+                    f"sc{s_idx:02d}_pip",
+                    used_video_hashes,
+                    aspect_ratio="16:9",
+                    mood=sc_mood,
+                )
             if pip_mp4 is None and fallback_video_pool:
                 alt = next((p for p in fallback_video_pool if p != main_mp4), fallback_video_pool[0])
                 pip_mp4 = alt
@@ -4399,18 +4506,20 @@ def _prefetch_scene_media_sync(
             if not q_list:
                 q_list = [sc.photo_query_en or mood_defaults["photos"][0], *mood_defaults["photos"][:3]]
             for pi in range(4):
-                pq = q_list[pi % len(q_list)]
-                ppath = fetch_doc_hero_or_archival_photo(
-                    pq,
-                    work_dir,
-                    f"sc{s_idx:02d}_board_{pi + 1}",
-                    min_width=640,
-                    used_urls=used_photo_urls,
-                    mood=sc_mood,
-                    prefer_gemini=(bool(sc.prefer_gemini_photo) and pi == 0),
-                    aspect_ratio="16:9",
-                    bespoke_prompt_en=sc.bespoke_image_prompt_en if pi == 0 else "",
-                )
+                ppath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_board_{pi + 1}") if resume else None
+                if ppath is None:
+                    pq = q_list[pi % len(q_list)]
+                    ppath = fetch_doc_hero_or_archival_photo(
+                        pq,
+                        work_dir,
+                        f"sc{s_idx:02d}_board_{pi + 1}",
+                        min_width=640,
+                        used_urls=used_photo_urls,
+                        mood=sc_mood,
+                        prefer_gemini=(bool(sc.prefer_gemini_photo) and pi == 0),
+                        aspect_ratio="16:9",
+                        bespoke_prompt_en=sc.bespoke_image_prompt_en if pi == 0 else "",
+                    )
                 if ppath is None and fallback_photo_pool:
                     ppath = fallback_photo_pool[pi % len(fallback_photo_pool)]
                 if ppath is not None:
@@ -4423,17 +4532,19 @@ def _prefetch_scene_media_sync(
         elif sc.visual_mode == "sliding_timeline":
             q_list = list(sc.extra_photo_queries_en or [sc.photo_query_en or mood_defaults["photos"][0]])
             for pi in range(min(3, max(2, len(sc.timeline_points)))):
-                pq = q_list[pi % len(q_list)]
-                ppath = fetch_doc_hero_or_archival_photo(
-                    pq,
-                    work_dir,
-                    f"sc{s_idx:02d}_tl_{pi + 1}",
-                    min_width=640,
-                    used_urls=used_photo_urls,
-                    mood=sc_mood,
-                    prefer_gemini=(bool(sc.prefer_gemini_photo) and pi == 0),
-                    aspect_ratio="16:9",
-                )
+                ppath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_tl_{pi + 1}") if resume else None
+                if ppath is None:
+                    pq = q_list[pi % len(q_list)]
+                    ppath = fetch_doc_hero_or_archival_photo(
+                        pq,
+                        work_dir,
+                        f"sc{s_idx:02d}_tl_{pi + 1}",
+                        min_width=640,
+                        used_urls=used_photo_urls,
+                        mood=sc_mood,
+                        prefer_gemini=(bool(sc.prefer_gemini_photo) and pi == 0),
+                        aspect_ratio="16:9",
+                    )
                 if ppath is None and fallback_photo_pool:
                     ppath = fallback_photo_pool[pi % len(fallback_photo_pool)]
                 if ppath is not None:
@@ -4445,18 +4556,20 @@ def _prefetch_scene_media_sync(
                 item.primary_photo_path = item.extra_photo_paths[0]
         elif sc.visual_mode in ("parallax_25d_photo", "newspaper_highlighter", "broll_video_pip", "video_pip_evidence"):
             min_w = 800 if sc.visual_mode == "parallax_25d_photo" else 640
-            pq = sc.photo_query_en or sc.image_prompt_en or mood_defaults["photos"][s_idx % len(mood_defaults["photos"])]
-            ppath = fetch_doc_hero_or_archival_photo(
-                pq,
-                work_dir,
-                f"sc{s_idx:02d}_photo",
-                min_width=min_w,
-                used_urls=used_photo_urls,
-                mood=sc_mood,
-                prefer_gemini=bool(sc.prefer_gemini_photo),
-                aspect_ratio=aspect_ratio,
-                bespoke_prompt_en=sc.bespoke_image_prompt_en or "",
-            )
+            ppath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_photo") if resume else None
+            if ppath is None:
+                pq = sc.photo_query_en or sc.image_prompt_en or mood_defaults["photos"][s_idx % len(mood_defaults["photos"])]
+                ppath = fetch_doc_hero_or_archival_photo(
+                    pq,
+                    work_dir,
+                    f"sc{s_idx:02d}_photo",
+                    min_width=min_w,
+                    used_urls=used_photo_urls,
+                    mood=sc_mood,
+                    prefer_gemini=bool(sc.prefer_gemini_photo),
+                    aspect_ratio=aspect_ratio,
+                    bespoke_prompt_en=sc.bespoke_image_prompt_en or "",
+                )
             if ppath is None and fallback_photo_pool:
                 ppath = fallback_photo_pool[s_idx % len(fallback_photo_pool)]
             if ppath is not None:
@@ -4682,6 +4795,7 @@ async def render_netflix_documentary(
     music_volume: float = 0.17,
     voice_rate: str = "+5%",
     voice_pitch: str = "-6Hz",
+    resume: bool = False,
 ) -> Dict[str, Any]:
     """Render a complete Netflix / MagnatesMedia / Dark History cinema documentary scene-by-scene to disk
     with REAL moving HD B-roll video in every scene, Video-over-Video (PiP), REAL/Bespoke Gemini photographs
@@ -4727,13 +4841,19 @@ async def render_netflix_documentary(
 
     # 1. Pre-fetch real HD B-roll videos, secondary PiP videos, and real/bespoke archival photographs for all scenes
     if progress_cb:
-        progress_cb(10, "Capturando vídeos B-roll HD, feeds PiP e fotografias/artes cinematográficas de arquivo...")
+        progress_cb(
+            10,
+            "♻️ Reaproveitando mídias B-roll HD e fotos em cache do ponto de parada..."
+            if resume
+            else "Capturando vídeos B-roll HD, feeds PiP e fotografias/artes cinematográficas de arquivo...",
+        )
     scene_media_list, media_telemetry = await asyncio.to_thread(
         _prefetch_scene_media_sync,
         plan_obj.scenes,
         work_dir,
         plan_obj.aspect_ratio,
         doc_mood,
+        resume,
     )
 
     # 2. Synthesize narration per scene & compute exact timeline with Chapter Cards + Hollywood SFX
@@ -4800,6 +4920,15 @@ async def render_netflix_documentary(
             else:
                 _add_sfx(cursor_t + 0.04, 0.54, "sub_boom.wav", "cinematic_hit.wav")
 
+        existing_sc_mp4 = work_dir / f"doc_scene_{s_idx:03d}.mp4"
+        existing_vad_wav = work_dir / f"doc_narr_{s_idx:03d}_vad.wav"
+        scene_already_rendered = False
+        if resume and existing_sc_mp4.exists() and existing_vad_wav.exists():
+            est_wav_d = _probe_wav_duration_s(existing_vad_wav)
+            if est_wav_d > 0.3:
+                exp_sc_d = round(chapter_intro_s + est_wav_d + pause_gap_s + (xfade_dur if s_idx < n_scenes - 1 else 0.0), 3)
+                scene_already_rendered = _is_valid_cached_scene_mp4(existing_sc_mp4, w, h, fps, exp_sc_d, tol_s=0.35)
+
         wav_p, words, speech_dur = await _synthesize_doc_scene_narration(
             sc.narration,
             plan_obj.voice_id,
@@ -4809,6 +4938,8 @@ async def render_netflix_documentary(
             thermal_limit_c=thermal_limit_c,
             rate=voice_rate,
             pitch=voice_pitch,
+            resume=resume,
+            reuse_existing_wav_if_no_words=scene_already_rendered,
         )
 
         # Shift scene words by chapter_intro_s (local scene time) and cursor_t (master time)
@@ -4906,13 +5037,25 @@ async def render_netflix_documentary(
     for rec in scene_records:
         s_idx = rec["s_idx"]
         sc: NetflixDocScene = rec["scene"]
+        out_sc_mp4 = work_dir / f"doc_scene_{s_idx:03d}.mp4"
+        if resume and _is_valid_cached_scene_mp4(out_sc_mp4, w, h, fps, rec["render_dur"]):
+            if progress_cb:
+                pct = 45 + int(40 * ((s_idx + 1) / float(max(1, n_scenes))))
+                progress_cb(
+                    pct,
+                    f"♻️ Reaproveitando cena já renderizada {s_idx + 1}/{n_scenes} [{sc.visual_mode}] ({w}x{h} @ {fps}fps)...",
+                )
+            if sc.visual_mode == "parallax_25d_photo":
+                u2netp_25d_used = True
+            scene_mp4_paths.append(out_sc_mp4)
+            continue
+
         if progress_cb:
             pct = 45 + int(40 * ((s_idx + 1) / float(max(1, n_scenes))))
             progress_cb(
                 pct,
                 f"Renderizando cena Skia C++ {s_idx + 1}/{n_scenes} [{sc.visual_mode}] ({w}x{h} @ {fps}fps | Vídeo Real + PiP + Fotos)...",
             )
-        out_sc_mp4 = work_dir / f"doc_scene_{s_idx:03d}.mp4"
         rendered_p, did_u2netp = await asyncio.to_thread(
             _render_single_doc_scene_to_disk,
             sc,

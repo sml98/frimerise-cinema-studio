@@ -28,6 +28,7 @@ from database import (
     append_job_log,
     create_job,
     get_client,
+    get_job,
     get_preset,
     get_settings,
     update_job,
@@ -1207,69 +1208,89 @@ async def run_video_job(
             def _doc_cb(pct: int, msg: str) -> None:
                 append_job_log(job_id, msg, progress=pct, stage=msg[:60])
 
-            append_job_log(
-                job_id,
-                f"Gerando roteiro documental investigativo ({aspect_ratio} | Alvo: {doc_target_minutes:.2f}min | Idioma: {doc_lang} | LUT: {lut_file})...",
-                progress=14,
-                stage="Estruturando Cold Open & Capítulos Netflix Doc",
-            )
-            eff_doc_topic = f"{topic} — {custom_directives[:140]}" if custom_directives else topic
-            maybe_plan = generate_netflix_doc_plan(
-                topic=eff_doc_topic,
-                aspect_ratio=studio_ar,
-                target_minutes=doc_target_minutes,
-                lang=doc_lang,
-            )
-            if inspect.isawaitable(maybe_plan):
-                doc_plan = await maybe_plan
-            else:
-                doc_plan = maybe_plan
-
-            if not isinstance(doc_plan, dict):
-                doc_plan = doc_plan.model_dump() if hasattr(doc_plan, "model_dump") else dict(doc_plan)
-
-            # Enforce user LUT, voice, caption style, directives & visual library mix on documentary plan
-            doc_plan["lut_file"] = lut_file
-            if eff_voice_engine == "edge" and eff_voice_id:
-                doc_plan["voice_id"] = eff_voice_id
-            elif opts.get("voice_id") and "Neural" in eff_voice_id:
-                doc_plan["voice_id"] = eff_voice_id
-            doc_plan["caption_style"] = caption_style
-            if custom_directives:
-                doc_plan["custom_directives"] = custom_directives
-
-            if explicit_libs and isinstance(doc_plan.get("scenes"), list):
-                allow_pip = "video_over_video" in explicit_libs
-                allow_25d = "photos_25d" in explicit_libs
-                allow_skia = "skia_graphics" in explicit_libs
-                for sc_d in doc_plan["scenes"]:
-                    vm = str(sc_d.get("visual_mode") or "")
-                    if not allow_pip and vm in ("broll_video_pip", "video_pip_evidence"):
-                        sc_d["visual_mode"] = "parallax_25d_photo" if allow_25d else "newspaper_highlighter"
-                    elif not allow_25d and vm == "parallax_25d_photo":
-                        sc_d["visual_mode"] = "broll_video_pip" if allow_pip else "sliding_timeline"
-                    elif not allow_skia and vm in ("newspaper_highlighter", "dark_map_route", "red_string_board", "sliding_timeline"):
-                        sc_d["visual_mode"] = "broll_video_pip" if allow_pip else "parallax_25d_photo"
-
-            if audit_netflix_doc_plan is not None:
+            is_resume = bool(opts.get("_resume", False))
+            doc_plan: Optional[Dict[str, Any]] = None
+            if is_resume:
                 try:
-                    doc_plan = audit_netflix_doc_plan(doc_plan)
+                    existing_job = get_job(job_id) or {}
+                    saved_raw = existing_job.get("script_json") or ""
+                    if saved_raw:
+                        parsed_plan = json.loads(saved_raw)
+                        if isinstance(parsed_plan, dict) and isinstance(parsed_plan.get("scenes"), list) and parsed_plan["scenes"]:
+                            doc_plan = parsed_plan
+                            append_job_log(
+                                job_id,
+                                f"♻️ Retomando Documentário Cinema '{doc_plan.get('title', topic)}' com o mesmo roteiro ({len(doc_plan['scenes'])} cenas) e reaproveitando cenas já renderizadas...",
+                                progress=22,
+                                stage="Retomando Cenas Investigativas Skia C++",
+                            )
                 except Exception:
-                    pass
+                    doc_plan = None
 
-            update_job(
-                job_id,
-                script_json=json.dumps(doc_plan, ensure_ascii=False),
-                tokens_used=int(doc_plan.get("tokens_used", 0)),
-                cost_usd=float(doc_plan.get("cost_usd", 0.0)),
-            )
+            if doc_plan is None:
+                append_job_log(
+                    job_id,
+                    f"Gerando roteiro documental investigativo ({aspect_ratio} | Alvo: {doc_target_minutes:.2f}min | Idioma: {doc_lang} | LUT: {lut_file})...",
+                    progress=14,
+                    stage="Estruturando Cold Open & Capítulos Netflix Doc",
+                )
+                eff_doc_topic = f"{topic} — {custom_directives[:140]}" if custom_directives else topic
+                maybe_plan = generate_netflix_doc_plan(
+                    topic=eff_doc_topic,
+                    aspect_ratio=studio_ar,
+                    target_minutes=doc_target_minutes,
+                    lang=doc_lang,
+                )
+                if inspect.isawaitable(maybe_plan):
+                    doc_plan = await maybe_plan
+                else:
+                    doc_plan = maybe_plan
 
-            append_job_log(
-                job_id,
-                f"Renderizando Documentário Cinema '{doc_plan.get('title', topic)}' em Skia C++ ({resolved_fps}fps | Legenda: {caption_style})...",
-                progress=22,
-                stage="Renderizando Cenas Investigativas Skia C++",
-            )
+                if not isinstance(doc_plan, dict):
+                    doc_plan = doc_plan.model_dump() if hasattr(doc_plan, "model_dump") else dict(doc_plan)
+
+                # Enforce user LUT, voice, caption style, directives & visual library mix on documentary plan
+                doc_plan["lut_file"] = lut_file
+                if eff_voice_engine == "edge" and eff_voice_id:
+                    doc_plan["voice_id"] = eff_voice_id
+                elif opts.get("voice_id") and "Neural" in eff_voice_id:
+                    doc_plan["voice_id"] = eff_voice_id
+                doc_plan["caption_style"] = caption_style
+                if custom_directives:
+                    doc_plan["custom_directives"] = custom_directives
+
+                if explicit_libs and isinstance(doc_plan.get("scenes"), list):
+                    allow_pip = "video_over_video" in explicit_libs
+                    allow_25d = "photos_25d" in explicit_libs
+                    allow_skia = "skia_graphics" in explicit_libs
+                    for sc_d in doc_plan["scenes"]:
+                        vm = str(sc_d.get("visual_mode") or "")
+                        if not allow_pip and vm in ("broll_video_pip", "video_pip_evidence"):
+                            sc_d["visual_mode"] = "parallax_25d_photo" if allow_25d else "newspaper_highlighter"
+                        elif not allow_25d and vm == "parallax_25d_photo":
+                            sc_d["visual_mode"] = "broll_video_pip" if allow_pip else "sliding_timeline"
+                        elif not allow_skia and vm in ("newspaper_highlighter", "dark_map_route", "red_string_board", "sliding_timeline"):
+                            sc_d["visual_mode"] = "broll_video_pip" if allow_pip else "parallax_25d_photo"
+
+                if audit_netflix_doc_plan is not None:
+                    try:
+                        doc_plan = audit_netflix_doc_plan(doc_plan)
+                    except Exception:
+                        pass
+
+                update_job(
+                    job_id,
+                    script_json=json.dumps(doc_plan, ensure_ascii=False),
+                    tokens_used=int(doc_plan.get("tokens_used", 0)),
+                    cost_usd=float(doc_plan.get("cost_usd", 0.0)),
+                )
+
+                append_job_log(
+                    job_id,
+                    f"Renderizando Documentário Cinema '{doc_plan.get('title', topic)}' em Skia C++ ({resolved_fps}fps | Legenda: {caption_style})...",
+                    progress=22,
+                    stage="Renderizando Cenas Investigativas Skia C++",
+                )
             doc_render_kwargs: Dict[str, Any] = {
                 "plan": doc_plan,
                 "work_dir": work_dir,
@@ -1288,6 +1309,8 @@ async def run_video_job(
                 doc_render_kwargs["voice_rate"] = voice_rate
             if "voice_pitch" in doc_sig.parameters:
                 doc_render_kwargs["voice_pitch"] = voice_pitch
+            if "resume" in doc_sig.parameters:
+                doc_render_kwargs["resume"] = is_resume
 
             render_info = await render_netflix_documentary(**doc_render_kwargs)
 

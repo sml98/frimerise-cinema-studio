@@ -552,6 +552,15 @@ def list_jobs(limit: int = 50) -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+def list_incomplete_jobs() -> List[Dict[str, Any]]:
+    """Return jobs left in 'running' or 'queued' state (e.g. after a server restart)."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM jobs WHERE status IN ('running', 'queued') ORDER BY created_at ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def record_token_usage(
     provider: str,
     model: str,

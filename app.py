@@ -51,6 +51,7 @@ from security import (
     verify_password,
 )
 from database import (
+    append_job_log,
     create_schedule,
     get_client,
     get_conn,
@@ -60,10 +61,12 @@ from database import (
     get_total_cost_stats,
     init_db,
     list_clients,
+    list_incomplete_jobs,
     list_jobs,
     list_presets,
     list_schedules,
     save_settings,
+    update_job,
     update_schedule,
     upsert_client,
 )
@@ -284,6 +287,54 @@ async def _check_due_schedules() -> None:
                 update_schedule(s["id"], "error", str(exc)[:200])
 
 
+async def _recover_interrupted_jobs() -> None:
+    """Auto-resume jobs left in 'running'/'queued' when uvicorn restarts (max 2 auto-resumes)."""
+    for job in list_incomplete_jobs():
+        job_id = str(job["id"])
+        try:
+            opts = json.loads(job.get("options_json") or "{}")
+            if not isinstance(opts, dict):
+                opts = {}
+        except Exception:
+            opts = {}
+
+        attempts = int(opts.get("_resume_attempts", 0) or 0)
+        if attempts >= 2:
+            update_job(
+                job_id,
+                status="error",
+                stage="Interrompido após reinícios do servidor",
+            )
+            append_job_log(
+                job_id,
+                "⚠️ Job marcado como interrompido após 2 tentativas automáticas de retomada. Use /api/jobs/{id}/resume se quiser tentar novamente.",
+            )
+            continue
+
+        opts["_resume"] = True
+        opts["_resume_attempts"] = attempts + 1
+        update_job(
+            job_id,
+            status="queued",
+            stage=f"Retomando render ({attempts + 1}/2)...",
+            options_json=json.dumps(opts, ensure_ascii=False),
+        )
+        append_job_log(
+            job_id,
+            f"♻️ Servidor reiniciado durante o render — retomando automaticamente do ponto de parada (tentativa {attempts + 1}/2)...",
+        )
+        await JOB_QUEUE.put(
+            {
+                "job_id": job_id,
+                "client_id": int(job.get("client_id") or 1),
+                "topic": str(job.get("topic") or "FrimeRise"),
+                "skill_id": str(job.get("skill_id") or "01_negative_hook"),
+                "mode": str(job.get("mode") or "single"),
+                "options": opts,
+            }
+        )
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db()
@@ -291,6 +342,7 @@ async def on_startup() -> None:
     seed_twin_channels_and_queue()
     probe_quicksync()
     asyncio.create_task(_job_worker())
+    await _recover_interrupted_jobs()
     SCHEDULER.add_job(_check_due_schedules, "interval", seconds=45, id="autopilot_tick", replace_existing=True)
     SCHEDULER.start()
 
@@ -1307,6 +1359,42 @@ async def api_get_job(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
     return _enrich_job(job)
+
+
+@app.post("/api/jobs/{job_id}/resume")
+async def api_resume_job(job_id: str):
+    """Resume an interrupted or failed job reusing cached script, audio, media, and completed scenes."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job não encontrado")
+    if job.get("status") == "completed":
+        return {"status": "already_completed", "job_id": job_id}
+    try:
+        opts = json.loads(job.get("options_json") or "{}")
+        if not isinstance(opts, dict):
+            opts = {}
+    except Exception:
+        opts = {}
+    opts["_resume"] = True
+    opts["_resume_attempts"] = 0
+    update_job(
+        job_id,
+        status="queued",
+        stage="Retomando render do ponto de parada...",
+        options_json=json.dumps(opts, ensure_ascii=False),
+    )
+    append_job_log(job_id, "♻️ Retomada manual acionada — reaproveitando cenas já renderizadas...")
+    await JOB_QUEUE.put(
+        {
+            "job_id": job_id,
+            "client_id": int(job.get("client_id") or 1),
+            "topic": str(job.get("topic") or "FrimeRise"),
+            "skill_id": str(job.get("skill_id") or "01_negative_hook"),
+            "mode": str(job.get("mode") or "single"),
+            "options": opts,
+        }
+    )
+    return {"status": "queued_for_resume", "job_id": job_id}
 
 
 @app.post("/api/jobs/{job_id}/extract-shorts")
