@@ -1,0 +1,7 @@
+{
+  "version": "pro_cinema_sfx_v3",
+  "sample_rate": 48000,
+  "channels": 2,
+  "sfx_count": 15,
+  "dark_music": "/home/s-m-l/Documentos/FrimeRise/assets/music/dark_mystery_horror.mp3"
+}

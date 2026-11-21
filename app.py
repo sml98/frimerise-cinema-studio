@@ -45,7 +45,12 @@ from database import (
     update_schedule,
     upsert_client,
 )
-from engine.audio_dsp import PT_BR_EDGE_VOICES, generate_narration
+from engine.audio_dsp import (
+    ALL_EDGE_VOICES,
+    KOKORO_VOICES,
+    PT_BR_EDGE_VOICES,
+    generate_narration,
+)
 from engine.intel_vaapi import probe_quicksync, read_cpu_temperature_c, safe_thread_count
 from engine.pipeline import enqueue_new_job, run_video_job
 from publisher.stealth_uploader import (
@@ -225,10 +230,79 @@ class ClientPayload(BaseModel):
     watermark_text: str = "PRÉVIA • FRIMERISE"
 
 
+# ---------------------------------------------------------------------------
+# Creative Studio Catalogs (Duration Presets, Visual Libraries Mixer, Captions)
+# ---------------------------------------------------------------------------
+DURATION_PRESETS: List[Dict[str, Any]] = [
+    {"seconds": 15, "label": "15s", "tag": "Hook Relâmpago • Reels/Shorts"},
+    {"seconds": 30, "label": "30s", "tag": "Viral Curto • Alta Retenção"},
+    {"seconds": 60, "label": "60s", "tag": "Shorts Completo / TikTok Pro"},
+    {"seconds": 180, "label": "3 min", "tag": "Mini-Doc / Storytelling"},
+    {"seconds": 480, "label": "8 min", "tag": "YouTube Mid-Roll High-RPM"},
+    {"seconds": 900, "label": "15 min", "tag": "Documentário Cinema Completo"},
+]
+
+VISUAL_LIBRARIES_CATALOG: List[Dict[str, Any]] = [
+    {
+        "id": "real_broll",
+        "label": "📹 Filmagens Reais HD",
+        "desc": "Filmagens Reais HD: Pixabay + Wikimedia + Archive + yt-dlp",
+        "default_engines": ["cinematic_broll", "netflix_doc"],
+    },
+    {
+        "id": "photos_25d",
+        "label": "🖼️ Fotos Reais + Parallax 2.5D",
+        "desc": "Fotos Reais + Parallax 2.5D u2netp + cv2.inpaint",
+        "default_engines": ["netflix_doc"],
+    },
+    {
+        "id": "video_over_video",
+        "label": "📺 Vídeo sobre Vídeo (PiP)",
+        "desc": "Vídeo sobre Vídeo: Monitor PiP Forense + Split-Screen",
+        "default_engines": ["netflix_doc"],
+    },
+    {
+        "id": "skia_graphics",
+        "label": "📊 Gráficos Skia C++",
+        "desc": "Gráficos Skia C++: Cards, Jornal, Mapa, Timeline, Red-String",
+        "default_engines": ["cinematic_broll", "netflix_doc"],
+    },
+    {
+        "id": "cartoon_2d_layer",
+        "label": "🎭 Personagens 2D Cartoon",
+        "desc": "Personagens 2D Cartoon + Rhubarb 9-Visemas",
+        "default_engines": ["cartoon_2d"],
+    },
+    {
+        "id": "bespoke_ai",
+        "label": "✨ Arte IA Inédita",
+        "desc": "Arte IA Inédita: Pollinations Flux / Google Flow Pro",
+        "default_engines": [],
+    },
+    {
+        "id": "cinema_35mm_sfx",
+        "label": "🎞️ Cinema FX 35mm + SFX",
+        "desc": "Efeitos Cinema: Granulação 35mm + Partículas + SFX",
+        "default_engines": ["cinematic_broll", "cartoon_2d", "netflix_doc"],
+    },
+]
+
+CAPTION_STYLES_CATALOG: List[Dict[str, str]] = [
+    {"id": "hormozi_neon", "label": "⚡ Hormozi Pílula Neon (CapCut Spring Bounce + Tilt)"},
+    {"id": "karaoke_glow", "label": "🌈 Karaokê Glow (Wipe Gradiente Neon Palavra-a-Palavra)"},
+    {"id": "word_slam", "label": "💥 Word Slam 3D (Impacto Metálico + Shake Viral)"},
+    {"id": "cinema_minimal", "label": "🎬 Cinema Minimalista (Netflix Blur-Reveal Dourado)"},
+    {"id": "typewriter_highlight", "label": "📰 Dossiê Highlighter (Typewriter + Marca-Texto Neon)"},
+    {"id": "none", "label": "🚫 Sem Legendas"},
+]
+
+
 class VoicePreviewPayload(BaseModel):
     voice_engine: str = "edge"
     voice_id: str = "pt-BR-AntonioNeural"
-    voice_blend: Dict[str, float] = {"pf_dora": 0.35, "pm_alex": 0.65, "pm_santa": 0.0}
+    voice_blend: Optional[Dict[str, float]] = None
+    voice_rate: str = "+8%"
+    voice_pitch: str = "+0Hz"
     sample_text: str = "Bem-vindo ao FrimeRise! Este é o seu estúdio proprietário de vídeos virais com qualidade broadcast."
 
 
@@ -236,7 +310,7 @@ class ManufacturePayload(BaseModel):
     client_id: int = 1
     mode: str = "single"  # single | batch | clone_url
     engine_style: str = "cinematic_broll"  # cinematic_broll | cartoon_2d | netflix_doc
-    aspect_ratio: str = "9:16"  # 9:16 | 16:9
+    aspect_ratio: str = "9:16"  # 9:16 | 16:9 | 4:5 | 1:1
     cartoon_tone: str = "Comédia Nordestina/BR"
     cartoon_fps: int = 60  # 30 | 60
     cartoon_voice_engine: str = "gemini_tts"  # gemini_tts | edge
@@ -244,7 +318,7 @@ class ManufacturePayload(BaseModel):
     flow_mode: str = "economico_pro"  # economico_pro | gancho_de_ouro | cinema_full_veo
     max_credits_cap: int = 45
     use_flow_music: bool = False
-    doc_lang: str = "pt_br"  # pt_br | en_us
+    doc_lang: str = "pt_br"  # pt_br | en_us | es
     target_minutes: float = 0.5
     thumb_3words: Optional[str] = None
     auto_shorts_cascade: bool = True
@@ -258,6 +332,20 @@ class ManufacturePayload(BaseModel):
     motion_cards: bool = True
     seamless_loop: bool = True
     dual_hook_ab: bool = True
+    # --- Full Creative Studio Overrides (100% backward compatible) ---
+    voice_engine: Optional[str] = None  # "auto" | "gemini_tts" | "edge" | "kokoro"
+    voice_id: Optional[str] = None
+    voice_rate: str = "+8%"
+    voice_pitch: str = "+0Hz"
+    target_duration_s: Optional[int] = None  # e.g. 15..900 seconds
+    cut_cadence_s: float = 3.5  # seconds per scene cut
+    fps: Optional[int] = None  # 30 or 60
+    music_file: Optional[str] = None  # "auto" | "none" | filename in assets/music/ | "flow_vault"
+    music_volume: float = 0.18
+    caption_style: str = "hormozi_neon"  # "hormozi_neon" | "karaoke_glow" | "word_slam" | "cinema_minimal" | "typewriter_highlight" | "none"
+    language: str = "pt_br"  # "pt_br" | "en_us" | "es"
+    visual_libraries: List[str] = []
+    custom_directives: str = ""
 
 
 class DocQueueManufacturePayload(BaseModel):
@@ -401,6 +489,13 @@ async def api_bootstrap_data():
     from engine.gemini_tts import GEMINI_EXPRESSIVE_VOICES
     from engine.rhubarb_lipsync import find_rhubarb_binary
 
+    try:
+        from engine.kinetic_captions import list_caption_styles
+
+        caption_styles_payload = list_caption_styles()
+    except Exception:
+        caption_styles_payload = CAPTION_STYLES_CATALOG
+
     luts = sorted([p.name for p in (ASSETS_DIR / "luts").glob("*.cube")])
     sfx = sorted([p.name for p in (ASSETS_DIR / "sfx").glob("*.wav")])
     music = sorted([p.name for p in (ASSETS_DIR / "music").glob("*.mp3")])
@@ -415,7 +510,12 @@ async def api_bootstrap_data():
         "sfx": sfx,
         "music": music,
         "edge_voices": PT_BR_EDGE_VOICES,
+        "edge_voices_all": ALL_EDGE_VOICES,
         "gemini_voices": GEMINI_EXPRESSIVE_VOICES,
+        "kokoro_voices": list(KOKORO_VOICES),
+        "duration_presets": DURATION_PRESETS,
+        "visual_libraries_catalog": VISUAL_LIBRARIES_CATALOG,
+        "caption_styles": caption_styles_payload,
         "rhubarb_ready": find_rhubarb_binary() is not None,
         "flow_pro": flow_status,
         "doc_queue": doc_queue,
@@ -600,18 +700,38 @@ async def api_voice_preview(payload: VoicePreviewPayload):
     preview_dir = OUTPUTS_DIR / "_voice_previews"
     preview_dir.mkdir(parents=True, exist_ok=True)
     tag = uuid.uuid4().hex[:8]
+    settings = get_settings()
+    limit_c = float(settings.get("thermal_limit_c") or 85.0)
+
+    vid_low = str(payload.voice_id or "").lower()
+    inferred_lang = "en_us" if (vid_low.startswith("en-") or vid_low.startswith(("af_", "am_"))) else ("es" if vid_low.startswith("es-") else "pt_br")
+
+    # If previewing a specific Kokoro voice without explicit blend weights, synthesize that exact voice
+    blend_to_use = payload.voice_blend
+    if payload.voice_engine == "kokoro" and blend_to_use is None and payload.voice_id in KOKORO_VOICES:
+        blend_to_use = {payload.voice_id: 1.0}
+
     wav_path, _, dur = await generate_narration(
         text=payload.sample_text[:240],
         work_dir=preview_dir,
         voice_engine=payload.voice_engine,
         voice_id=payload.voice_id,
-        voice_blend=payload.voice_blend,
+        voice_blend=blend_to_use,
         prefix=f"prev_{tag}",
+        rate=payload.voice_rate,
+        pitch=payload.voice_pitch,
+        thermal_limit_c=limit_c,
+        language=inferred_lang,
     )
     return {
         "status": "ok",
         "audio_url": f"/outputs/_voice_previews/{wav_path.name}",
+        "file_path": str(wav_path),
         "duration_s": dur,
+        "voice_engine": payload.voice_engine,
+        "voice_id": payload.voice_id,
+        "voice_rate": payload.voice_rate,
+        "voice_pitch": payload.voice_pitch,
     }
 
 
@@ -795,6 +915,20 @@ async def api_manufacture(payload: ManufacturePayload):
         "dual_hook_ab": payload.dual_hook_ab,
         "source_url": payload.source_url,
         "reference_mp4_path": payload.reference_mp4_path,
+        # Full Creative Studio overrides
+        "voice_engine": payload.voice_engine,
+        "voice_id": payload.voice_id,
+        "voice_rate": payload.voice_rate,
+        "voice_pitch": payload.voice_pitch,
+        "target_duration_s": payload.target_duration_s,
+        "cut_cadence_s": payload.cut_cadence_s,
+        "fps": payload.fps,
+        "music_file": payload.music_file,
+        "music_volume": payload.music_volume,
+        "caption_style": payload.caption_style,
+        "language": payload.language,
+        "visual_libraries": list(payload.visual_libraries or []),
+        "custom_directives": payload.custom_directives,
     }
 
     if payload.mode == "batch":

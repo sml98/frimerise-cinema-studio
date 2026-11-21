@@ -23,7 +23,7 @@
       }
     }
   </script>
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=6" />
 </head>
 <body class="antialiased selection:bg-frimepink selection:text-white">
 
@@ -94,15 +94,15 @@
 
   <main class="max-w-[1440px] mx-auto px-4 sm:px-6 py-6 space-y-6">
 
-    <!-- ==================== TAB 1: FÁBRICA MULTI-MODO + 3 MOTORES + FILA 10 DOCUMENTÁRIOS ==================== -->
+    <!-- ==================== TAB 1: FÁBRICA MULTI-MODO + ESTÚDIO DE CRIAÇÃO PERSONALIZADA + FILA 10 DOCUMENTÁRIOS ==================== -->
     <section id="tab-factory" class="tab-panel space-y-6">
-      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <!-- Left: Manufacture Form -->
+      <div class="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+        <!-- Left: Manufacture Form + Estúdio de Criação Personalizada -->
         <div class="lg:col-span-7 glass-card p-6 space-y-5">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h2 class="text-xl font-black text-white">Fábrica Multi-Modo <span class="text-frimepink">FrimeRise</span></h2>
-              <p class="text-xs text-[#B6A9D4]">Escolha um dos 3 Motores Master, clone um viral com Raio-X 3×3 ou dispare a Fila de 10 Documentários.</p>
+              <p class="text-xs text-[#B6A9D4]">Crie qualquer assunto totalmente novo com controle total de voz, estilo, tempo, legendas cinéticas e mistura de bibliotecas.</p>
             </div>
             <!-- Mode Switcher -->
             <div class="flex bg-[#0B0713] p-1 rounded-xl border border-[rgba(179,136,255,0.2)] text-xs font-bold">
@@ -114,7 +114,7 @@
 
           <!-- Seletor dos 3 Motores Master -->
           <div class="space-y-2">
-            <span class="block text-xs font-bold text-frimegold uppercase">Seletor dos 3 Motores Master</span>
+            <span class="block text-xs font-bold text-frimegold uppercase">1. Seletor dos 3 Motores Master</span>
             <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <button type="button" class="style-btn text-left p-3.5 rounded-xl border border-frimelime bg-[#0B0713]/90 transition" data-style="cinematic_broll">
                 <div class="text-xs font-black text-white">🎬 Vídeo Dinâmico Viral / Bespoke 2.5D</div>
@@ -125,118 +125,17 @@
                 <div class="text-[11px] text-[#B6A9D4] mt-1">60 FPS • Line Boil 8fps • Rhubarb 9-Visemas • Vozes Atuadas</div>
               </button>
               <button type="button" class="style-btn text-left p-3.5 rounded-xl border border-[rgba(179,136,255,0.22)] bg-[#0B0713]/70 transition" data-style="netflix_doc">
-                <div class="text-xs font-black text-white">🎞️ Documentário Cinema Netflix / MagnatesMedia 16:9 &amp; 9:16</div>
-                <div class="text-[11px] text-[#B6A9D4] mt-1">Cold Open • Capítulos • 5 Modos Skia • 3 Thumbs + 5 Shorts</div>
+                <div class="text-xs font-black text-white">🎞️ Documentário Cinema Netflix / MagnatesMedia</div>
+                <div class="text-[11px] text-[#B6A9D4] mt-1">Qualquer Tema • Capítulos • 5 Modos Skia • 3 Thumbs + 5 Shorts</div>
               </button>
             </div>
           </div>
 
-          <!-- Google Flow & Flow Music Pro Controls -->
-          <div class="p-4 rounded-xl bg-[#0B0713]/90 border border-frimelilac/35 space-y-3">
-            <div class="flex flex-wrap items-center justify-between gap-2">
-              <div class="flex items-center gap-2">
-                <span class="text-xs font-black uppercase text-frimegold">🌊 Google Flow &amp; Flow Music Pro</span>
-                <span id="flow-mode-pill" class="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-frimelime/15 text-frimelime border border-frimelime/40">Cofre FlowVault 0-Crédito Ativo</span>
-              </div>
-              <div class="flex items-center gap-1.5">
-                <button type="button" onclick="loginGoogleFlow('flow')" class="btn-ghost px-2.5 py-1 text-[11px] font-bold">🔐 Login Flow.google</button>
-                <button type="button" onclick="loginGoogleFlow('flowmusic')" class="btn-ghost px-2.5 py-1 text-[11px] font-bold">🎵 Login FlowMusic</button>
-              </div>
-            </div>
-            <div class="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
-              <div class="sm:col-span-7">
-                <label for="fac-flow-mode" class="block text-[11px] font-bold text-[#B6A9D4] mb-1">Modo de Geração Visual &amp; Guardião de Créditos</label>
-                <select id="fac-flow-mode" class="fr-input text-xs" onchange="toggleFlowCreditsCap()">
-                  <option value="economico_pro" selected>🟢 Econômico Pro (Nano Banana 2 + 2.5D Parallax CPU • 0 cr Veo)</option>
-                  <option value="gancho_de_ouro">🟡 Gancho de Ouro (~15 cr • Cena 1 Veo 3.1 Light + Cenas 2..N 2.5D CPU)</option>
-                  <option value="cinema_full_veo">🔴 Cinema Full Veo (Veo 3.1 com Teto Máximo de Créditos)</option>
-                </select>
-              </div>
-              <div class="sm:col-span-2">
-                <label for="fac-flow-cap" class="block text-[11px] font-bold text-frimegold mb-1">Teto Máx (cr)</label>
-                <input id="fac-flow-cap" type="number" min="0" max="1000" step="5" value="45" class="fr-input text-xs text-center" title="Teto máximo de créditos Google Flow por vídeo (max_credits_cap)" />
-              </div>
-              <div class="sm:col-span-3">
-                <label class="flex items-center gap-2 p-2.5 rounded-xl bg-[#140E24] border border-frimepink/35 cursor-pointer">
-                  <input id="opt-flow-music" type="checkbox" class="fr-check w-4 h-4" checked />
-                  <span class="text-[11px] font-extrabold text-white">🎵 Flow Music Vault</span>
-                </label>
-              </div>
-            </div>
-          </div>
-
-          <!-- Opções Exclusivas de Animação 2D Cartoon Studio v2 -->
-          <div id="cartoon-2d-options" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl bg-[#0B0713]/85 border border-frimepink/40">
-            <div>
-              <label for="fac-aspect" class="block text-xs font-bold text-frimepink uppercase mb-1.5">Formato do Vídeo</label>
-              <select id="fac-aspect" class="fr-input">
-                <option value="9:16">📱 Vertical 9:16 — Shorts / TikTok / Reels (1080×1920)</option>
-                <option value="16:9">📺 Horizontal 16:9 — YouTube Longo Cinema (1920×1080)</option>
-              </select>
-            </div>
-            <div>
-              <label for="fac-tone" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Tom de Humor / Narração</label>
-              <select id="fac-tone" class="fr-input">
-                <option value="Comédia Nordestina/BR">😂 Comédia Nordestina / BR (Gírias e Quebras)</option>
-                <option value="Explicativo Ácido">🧠 Explicativo Ácido (OverSimplified / Paint)</option>
-                <option value="Sério Épico">⚔️ Sério Épico (Dramático com Virada)</option>
-              </select>
-            </div>
-            <div>
-              <label for="fac-fps" class="block text-xs font-bold text-frimelime uppercase mb-1.5">Fluidez da Animação (CPU Skia C++)</label>
-              <select id="fac-fps" class="fr-input">
-                <option value="60" selected>⚡ 60 FPS Ultra-Fluido (Line Boil 8fps + Paralaxe 2.5D)</option>
-                <option value="30">🎞️ 30 FPS Padrão (Render 2× Mais Rápido)</option>
-              </select>
-            </div>
-            <div>
-              <label for="fac-cartoon-voice" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Motor de Voz dos Personagens</label>
-              <select id="fac-cartoon-voice" class="fr-input">
-                <option value="gemini_tts" selected>🎭 Google Gemini TTS Expressivo + Kokoro/Edge</option>
-                <option value="edge">⚡ Edge-TTS Multi-Pitch Instantâneo (Zero Custo)</option>
-              </select>
-            </div>
-          </div>
-
-          <!-- Opções Exclusivas de Documentário Cinema Netflix / MagnatesMedia -->
-          <div id="netflix-doc-options" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl bg-[#0B0713]/90 border border-frimegold/45">
-            <div>
-              <label for="doc-aspect" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Formato Documental</label>
-              <select id="doc-aspect" class="fr-input">
-                <option value="16:9" selected>📺 16:9 Widescreen Cinema (1920×1080 + 5 Shorts 9:16)</option>
-                <option value="9:16">📱 9:16 Doc Vertical Investigativo (1080×1920)</option>
-              </select>
-            </div>
-            <div>
-              <label for="doc-lang" class="block text-xs font-bold text-frimelime uppercase mb-1.5">Canal Gêmeo / Idioma Nativo</label>
-              <select id="doc-lang" class="fr-input" onchange="syncDocChannelSelection()">
-                <option value="pt_br" selected>🇧🇷 Dossiê Capital (PT-BR • pt-BR-AntonioNeural)</option>
-                <option value="en_us">🇺🇸 Vault Files (EN-US Dólar • en-US-AndrewMultilingualNeural)</option>
-              </select>
-            </div>
-            <div>
-              <label for="doc-thumb-hook" class="block text-xs font-bold text-frimepink uppercase mb-1.5">Texto 3 Palavras da Thumbnail (1280×720)</label>
-              <input id="doc-thumb-hook" type="text" class="fr-input" placeholder="Ex: ESCONDEU $1.4 BILHÃO ou HID $1.4 BILLION" />
-            </div>
-            <div>
-              <label for="doc-minutes" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Escala de Duração (Cena a Cena • Guardião Térmico)</label>
-              <select id="doc-minutes" class="fr-input">
-                <option value="0.5" selected>⚡ Demo Rápido (~30s • Cold Open + Capítulos Skia)</option>
-                <option value="3.0">🎬 Mini-Documentário (3 min • Pacing MagnatesMedia)</option>
-                <option value="8.0">🍿 Documentário Mid-Roll Alto RPM (8+ min)</option>
-              </select>
-            </div>
-            <div class="sm:col-span-2 flex flex-wrap items-center gap-2 text-[11px] text-[#B6A9D4]">
-              <span class="px-2 py-0.5 rounded bg-frimegold/15 text-frimegold font-bold border border-frimegold/30">Cold Open + C A P Í T U L O   I</span>
-              <span class="px-2 py-0.5 rounded bg-frimepink/15 text-frimepink font-bold border border-frimepink/30">Quadro Fios Vermelhos + Marca-Texto</span>
-              <span class="px-2 py-0.5 rounded bg-frimelime/15 text-frimelime font-bold border border-frimelime/30">LUT 02_dark_wealth.cube + 3 Thumbs + 5 Shorts</span>
-            </div>
-          </div>
-
+          <!-- Cliente / Canal & Skill Viral -->
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
-              <label for="fac-client" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Cliente / Canal</label>
-              <select id="fac-client" class="fr-input"></select>
+              <label for="fac-client" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Cliente / Canal Base</label>
+              <select id="fac-client" class="fr-input" onchange="onFactoryClientChange()"></select>
             </div>
             <div>
               <label for="fac-skill" class="block text-xs font-bold text-frimepink uppercase mb-1.5">Skill Viral (Cofre de Skills)</label>
@@ -246,14 +145,14 @@
 
           <!-- Mode Single -->
           <div id="mode-single-wrap">
-            <label for="fac-topic" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Tema, Investigação ou História do Vídeo</label>
-            <input id="fac-topic" type="text" class="fr-input" placeholder="Ex: Como um Único Operador Quebrou o Banco Mais Antigo da Rainha (Nick Leeson / Barings Bank)" />
+            <label for="fac-topic" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Assunto, Investigação ou História Totalmente Nova</label>
+            <input id="fac-topic" type="text" class="fr-input" placeholder="Ex: A real história macabra por trás do Natal — ou qualquer assunto inédito que você quiser criar..." />
           </div>
 
           <!-- Mode Batch 50 -->
           <div id="mode-batch-wrap" class="hidden">
             <label for="fac-batch" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Lista de Temas (1 por linha — até 50 vídeos na fila)</label>
-            <textarea id="fac-batch" rows="5" class="fr-input" placeholder="Tema 1: Como um único operador escondeu $1.4 bilhão no Barings Bank&#10;Tema 2: O monopólio invisível da Luxottica nos óculos de luxo&#10;Tema 3: Os boletos falsos de US$ 122 milhões pagos por Google e Facebook"></textarea>
+            <textarea id="fac-batch" rows="5" class="fr-input" placeholder="Tema 1: A real história macabra por trás do Natal&#10;Tema 2: O monopólio invisível da Luxottica nos óculos de luxo&#10;Tema 3: Os boletos falsos de US$ 122 milhões pagos por Google e Facebook"></textarea>
           </div>
 
           <!-- Mode Clone URL / Upload MP4 + Visual DNA X-Ray -->
@@ -300,10 +199,387 @@
             </div>
           </div>
 
+          <!-- Opções Exclusivas de Animação 2D Cartoon Studio v2 (sincronizadas com controles universais) -->
+          <div id="cartoon-2d-options" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl bg-[#0B0713]/85 border border-frimepink/40">
+            <div>
+              <label for="fac-aspect" class="block text-xs font-bold text-frimepink uppercase mb-1.5">Formato Cartoon 2D</label>
+              <select id="fac-aspect" class="fr-input" onchange="syncUniversalAspectFrom(this.value)">
+                <option value="9:16">📱 Vertical 9:16 — Shorts / TikTok / Reels (1080×1920)</option>
+                <option value="16:9">📺 Horizontal 16:9 — YouTube Longo Cinema (1920×1080)</option>
+                <option value="4:5">🖼️ Feed 4:5 — Instagram / LinkedIn (1080×1350)</option>
+                <option value="1:1">⬜ Quadrado 1:1 — Universal (1080×1080)</option>
+              </select>
+            </div>
+            <div>
+              <label for="fac-tone" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Tom de Humor / Narração</label>
+              <select id="fac-tone" class="fr-input">
+                <option value="Comédia Nordestina/BR">😂 Comédia Nordestina / BR (Gírias e Quebras)</option>
+                <option value="Explicativo Ácido">🧠 Explicativo Ácido (OverSimplified / Paint)</option>
+                <option value="Sério Épico">⚔️ Sério Épico (Dramático com Virada)</option>
+              </select>
+            </div>
+            <div>
+              <label for="fac-fps" class="block text-xs font-bold text-frimelime uppercase mb-1.5">Fluidez da Animação (CPU Skia C++)</label>
+              <select id="fac-fps" class="fr-input" onchange="syncFpsControl('fac-fps')">
+                <option value="60" selected>⚡ 60 FPS Ultra-Fluido (Line Boil 8fps + Paralaxe 2.5D)</option>
+                <option value="30">🎞️ 30 FPS Padrão (Render 2× Mais Rápido)</option>
+              </select>
+            </div>
+            <div>
+              <label for="fac-cartoon-voice" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Motor de Voz dos Personagens</label>
+              <select id="fac-cartoon-voice" class="fr-input" onchange="syncCartoonVoiceEngine()">
+                <option value="gemini_tts" selected>🎭 Google Gemini TTS Expressivo + Kokoro/Edge</option>
+                <option value="edge">⚡ Edge-TTS Multi-Pitch Instantâneo (Zero Custo)</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Opções Exclusivas de Documentário Cinema Netflix / MagnatesMedia (sincronizadas com controles universais) -->
+          <div id="netflix-doc-options" class="hidden grid grid-cols-1 sm:grid-cols-2 gap-4 p-4 rounded-xl bg-[#0B0713]/90 border border-frimegold/45">
+            <div>
+              <label for="doc-aspect" class="block text-xs font-bold text-frimegold uppercase mb-1.5">Formato Documental</label>
+              <select id="doc-aspect" class="fr-input" onchange="syncUniversalAspectFrom(this.value)">
+                <option value="16:9" selected>📺 16:9 Widescreen Cinema (1920×1080 + 5 Shorts 9:16)</option>
+                <option value="9:16">📱 9:16 Doc Vertical Investigativo (1080×1920)</option>
+                <option value="4:5">🖼️ 4:5 Feed Investigativo (1080×1350)</option>
+                <option value="1:1">⬜ 1:1 Quadrado (1080×1080)</option>
+              </select>
+            </div>
+            <div>
+              <label for="doc-lang" class="block text-xs font-bold text-frimelime uppercase mb-1.5">Canal Gêmeo / Idioma Nativo</label>
+              <select id="doc-lang" class="fr-input" onchange="syncDocChannelSelection(true)">
+                <option value="pt_br" selected>🇧🇷 Dossiê Capital (PT-BR • pt-BR-AntonioNeural)</option>
+                <option value="en_us">🇺🇸 Vault Files (EN-US Dólar • en-US-AndrewMultilingualNeural)</option>
+              </select>
+            </div>
+            <div>
+              <label for="doc-thumb-hook" class="block text-xs font-bold text-frimepink uppercase mb-1.5">Texto 3 Palavras da Thumbnail (1280×720)</label>
+              <input id="doc-thumb-hook" type="text" class="fr-input" placeholder="Ex: NATAL MACABRO ou ESCONDEU $1.4 BILHÃO" />
+            </div>
+            <div>
+              <label for="doc-minutes" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Escala Documental Rápida</label>
+              <select id="doc-minutes" class="fr-input" onchange="syncDurationFromDocMinutes()">
+                <option value="0.5" selected>⚡ Demo Rápido (~30s • Cold Open + Capítulos Skia)</option>
+                <option value="1.0">🎯 Curto Investigativo (1 min)</option>
+                <option value="3.0">🎬 Mini-Documentário (3 min • Pacing MagnatesMedia)</option>
+                <option value="8.0">🍿 Documentário Mid-Roll Alto RPM (8 min)</option>
+                <option value="15.0">🏆 Especial Cinema Longo (15 min)</option>
+              </select>
+            </div>
+            <div class="sm:col-span-2 flex flex-wrap items-center gap-2 text-[11px] text-[#B6A9D4]">
+              <span class="px-2 py-0.5 rounded bg-frimegold/15 text-frimegold font-bold border border-frimegold/30">Cold Open + C A P Í T U L O   I</span>
+              <span class="px-2 py-0.5 rounded bg-frimepink/15 text-frimepink font-bold border border-frimepink/30">Quadro Fios Vermelhos + xfade + Hollywood SFX</span>
+              <span class="px-2 py-0.5 rounded bg-frimelime/15 text-frimelime font-bold border border-frimelime/30">3 Thumbs Cinema 1280×720 + 5 Shorts</span>
+            </div>
+          </div>
+
+          <!-- ==================== ESTÚDIO DE CRIAÇÃO PERSONALIZADA ==================== -->
+          <!-- BLOCO 1: SELETOR COMPLETO DE VOZ & LOCUÇÃO -->
+          <div class="creator-studio-block space-y-3.5 border-frimepink/30">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <span class="text-xs font-black uppercase text-frimepink">🎙️ 2. Voz &amp; Locução Personalizada</span>
+                <p class="text-[11px] text-[#B6A9D4]">Escolha o motor, a voz exata, velocidade e tom — ouça a prévia na hora antes de gerar.</p>
+              </div>
+              <button type="button" id="btn-fac-voice-preview" onclick="previewFactoryVoice()" class="btn-pink-lilac px-3.5 py-1.5 text-xs whitespace-nowrap">
+                ▶ Ouvir Voz
+              </button>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label for="fac-voice-engine" class="block text-[11px] font-bold text-frimelilac uppercase mb-1">Motor de Voz</label>
+                <select id="fac-voice-engine" class="fr-input text-xs" onchange="syncFactoryVoiceList()">
+                  <option value="auto" selected>🤖 Padrão do Cliente (Automático)</option>
+                  <option value="gemini_tts">🎭 Google Gemini TTS Expressivo</option>
+                  <option value="edge">⚡ Edge-TTS Neural (PT-BR / EN-US / ES)</option>
+                  <option value="kokoro">🎙️ Kokoro-ONNX Voice Blender Local</option>
+                </select>
+              </div>
+              <div>
+                <label for="fac-voice-id" class="block text-[11px] font-bold text-frimelime uppercase mb-1">Voz Específica</label>
+                <select id="fac-voice-id" class="fr-input text-xs" onchange="updateRecipeSummary()"></select>
+              </div>
+              <div>
+                <label for="fac-voice-rate" class="block text-[11px] font-bold text-[#B6A9D4] uppercase mb-1">Velocidade da Fala</label>
+                <select id="fac-voice-rate" class="fr-input text-xs" onchange="updateRecipeSummary()">
+                  <option value="-6%">🐢 -6% Cinema Pausado (Suspense / Doc)</option>
+                  <option value="+0%">🎙️ +0% Natural Equilibrado</option>
+                  <option value="+8%" selected>⚡ +8% Viral Dinâmico (Padrão)</option>
+                  <option value="+15%">🚀 +15% Turbo Shorts / TikTok</option>
+                </select>
+              </div>
+              <div>
+                <label for="fac-voice-pitch" class="block text-[11px] font-bold text-[#B6A9D4] uppercase mb-1">Tom / Pitch da Voz</label>
+                <select id="fac-voice-pitch" class="fr-input text-xs" onchange="updateRecipeSummary()">
+                  <option value="-8Hz">🎬 -8Hz Grave Documentário / Sombrio</option>
+                  <option value="-4Hz">🎙️ -4Hz Médio-Grave Autoridade</option>
+                  <option value="+0Hz" selected>⚖️ +0Hz Normal</option>
+                  <option value="+4Hz">✨ +4Hz Vibrante / Narrativo</option>
+                  <option value="+8Hz">🔥 +8Hz Energético / Comédia</option>
+                </select>
+              </div>
+            </div>
+            <audio id="fac-voice-audio" controls class="w-full fr-audio-mini hidden"></audio>
+          </div>
+
+          <!-- BLOCO 2: ESTILO VISUAL, FORMATO UNIVERSAL & TEMPO (DURAÇÃO ALVO) -->
+          <div class="creator-studio-block space-y-4 border-frimegold/30">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <span class="text-xs font-black uppercase text-frimegold">🎨 3. Estilo Visual, Formato Universal &amp; Tempo</span>
+                <p class="text-[11px] text-[#B6A9D4]">Controle proporção, duração exata em segundos, preset, 3D LUT, estilo de legendas cinéticas e idioma.</p>
+              </div>
+              <span id="fac-duration-label" class="text-[11px] font-black px-2.5 py-0.5 rounded-full bg-frimelime/15 text-frimelime border border-frimelime/40">30s • Viral Curto</span>
+            </div>
+
+            <!-- Tempo / Duração Alvo: Pílulas 1-Clique + Slider + Input Numérico -->
+            <div class="p-3.5 rounded-xl bg-[#0B0713]/85 border border-[rgba(179,136,255,0.2)] space-y-2.5">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <label for="fac-duration-s" class="text-[11px] font-bold text-frimegold uppercase">⏱️ Tempo / Duração Alvo do Vídeo</label>
+                <div class="flex flex-wrap gap-1.5" role="group" aria-label="Durações rápidas">
+                  <button type="button" class="dur-pill-btn" data-seconds="15" onclick="setFactoryDuration(15)">15s</button>
+                  <button type="button" class="dur-pill-btn active" data-seconds="30" onclick="setFactoryDuration(30)">30s</button>
+                  <button type="button" class="dur-pill-btn" data-seconds="60" onclick="setFactoryDuration(60)">60s</button>
+                  <button type="button" class="dur-pill-btn" data-seconds="180" onclick="setFactoryDuration(180)">3 min</button>
+                  <button type="button" class="dur-pill-btn" data-seconds="480" onclick="setFactoryDuration(480)">8 min</button>
+                  <button type="button" class="dur-pill-btn" data-seconds="900" onclick="setFactoryDuration(900)">15 min</button>
+                </div>
+              </div>
+              <div class="flex items-center gap-3">
+                <input id="fac-duration-range" type="range" min="15" max="900" step="5" value="30" class="w-full fr-range" aria-label="Duração alvo em segundos (slider)" oninput="setFactoryDuration(this.value, 'range')" />
+                <div class="flex items-center gap-1 shrink-0">
+                  <input id="fac-duration-s" type="number" min="10" max="900" step="5" value="30" class="fr-input !w-24 !py-1.5 text-xs text-center font-extrabold text-frimelime" oninput="setFactoryDuration(this.value, 'number')" />
+                  <span class="text-xs font-bold text-[#B6A9D4]">seg</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Grid de Estilo Visual, Formato Universal, LUT, Legendas Cinéticas & Idioma -->
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label for="fac-aspect-universal" class="block text-[11px] font-bold text-frimelime uppercase mb-1">📐 Formato / Proporção (Todos os Motores)</label>
+                <select id="fac-aspect-universal" class="fr-input text-xs" onchange="onUniversalAspectChange()">
+                  <option value="9:16" selected>📱 9:16 Vertical — 1080×1920 (Shorts / TikTok / Reels)</option>
+                  <option value="16:9">📺 16:9 Horizontal — 1920×1080 (YouTube / Documentário)</option>
+                  <option value="4:5">🖼️ 4:5 Feed — 1080×1350 (Instagram / LinkedIn)</option>
+                  <option value="1:1">⬜ 1:1 Quadrado — 1080×1080 (Feed Universal)</option>
+                </select>
+              </div>
+              <div>
+                <label for="fac-language" class="block text-[11px] font-bold text-frimelilac uppercase mb-1">🌎 Idioma Principal do Vídeo</label>
+                <select id="fac-language" class="fr-input text-xs" onchange="onFactoryLanguageChange()">
+                  <option value="pt_br" selected>🇧🇷 Português-BR</option>
+                  <option value="en_us">🇺🇸 Inglês US</option>
+                  <option value="es">🇪🇸 Espanhol</option>
+                </select>
+              </div>
+              <div>
+                <label for="fac-preset" class="block text-[11px] font-bold text-frimegold uppercase mb-1">🎨 Estilo / Preset Visual</label>
+                <select id="fac-preset" class="fr-input text-xs" onchange="onFactoryPresetChange()">
+                  <option value="">✨ Padrão do Cliente (Automático)</option>
+                </select>
+              </div>
+              <div>
+                <label for="fac-lut" class="block text-[11px] font-bold text-frimepink uppercase mb-1">🎞️ 3D LUT de Cinema (.cube)</label>
+                <select id="fac-lut" class="fr-input text-xs" onchange="updateRecipeSummary()">
+                  <option value="">🎞️ Automática do Preset / Cliente</option>
+                </select>
+              </div>
+              <div>
+                <label for="fac-caption-style" class="block text-[11px] font-bold text-frimelime uppercase mb-1">💬 Estilo &amp; Animação das Legendas</label>
+                <select id="fac-caption-style" class="fr-input text-xs" onchange="updateRecipeSummary()">
+                  <option value="hormozi_neon" selected>🔥 Hormozi Pílula Neon (CapCut Spring Bounce + Tilt)</option>
+                  <option value="karaoke_glow">✨ Karaokê Neon Glow (Varredura Gradiente)</option>
+                  <option value="word_slam">💥 Word Slam 3D (Impacto Metálico + Shake)</option>
+                  <option value="cinema_minimal">🎬 Cinema Minimalista (Netflix Blur-Reveal)</option>
+                  <option value="typewriter_highlight">🕵️ Dossiê Typewriter (Marca-Texto Investigativo)</option>
+                  <option value="none">🚫 Sem Legendas (Clean Feed)</option>
+                </select>
+              </div>
+              <div class="flex flex-col justify-end">
+                <span class="block text-[11px] font-bold text-[#B6A9D4] uppercase mb-1">Paleta do Preset Ativo</span>
+                <div id="fac-preset-swatches" class="flex items-center gap-2 px-3 py-2 rounded-xl bg-[#0B0713]/85 border border-[rgba(179,136,255,0.2)] text-[11px] text-[#B6A9D4] min-h-[38px]">
+                  <span class="w-3.5 h-3.5 rounded-full inline-block bg-frimepink"></span>
+                  <span class="w-3.5 h-3.5 rounded-full inline-block bg-frimelilac"></span>
+                  <span class="w-3.5 h-3.5 rounded-full inline-block bg-frimelime"></span>
+                  <span class="w-3.5 h-3.5 rounded-full inline-block bg-frimegold"></span>
+                  <span class="truncate">FrimeRise Cyber-Luxury</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- BLOCO 3: MISTURADOR DE BIBLIOTECAS & CAMADAS VISUAIS ("MISTURAR BIBLIOTECAS") -->
+          <div class="creator-studio-block space-y-3.5 border-frimelime/35">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <span class="text-xs font-black uppercase text-frimelime">🧩 4. Misturador de Bibliotecas &amp; Camadas Visuais</span>
+                <p class="text-[11px] text-[#B6A9D4]">Combine quantas bibliotecas quiser no mesmo vídeo (ex: filmagens reais + arte IA + 2.5D + PiP + gráficos Skia).</p>
+              </div>
+              <span id="lib-mix-count" class="text-[11px] font-extrabold px-2.5 py-0.5 rounded-full bg-frimelime/15 text-frimelime border border-frimelime/45">4 bibliotecas ativas no mix</span>
+            </div>
+
+            <!-- Presets Rápidos de 1 Clique -->
+            <div class="flex flex-wrap items-center gap-1.5" role="group" aria-label="Receitas rápidas de mistura de bibliotecas">
+              <button type="button" class="mix-preset-btn" data-mix="cinema_real" onclick="applyLibraryMixPreset('cinema_real', this)">🔥 Híbrido Cinema + Real</button>
+              <button type="button" class="mix-preset-btn" data-mix="antistock_ai" onclick="applyLibraryMixPreset('antistock_ai', this)">✨ 100% Anti-Stock IA + 2.5D</button>
+              <button type="button" class="mix-preset-btn" data-mix="cartoon_real" onclick="applyLibraryMixPreset('cartoon_real', this)">🎭 Misto Cartoon + Filmagens</button>
+              <button type="button" class="mix-preset-btn" data-mix="all_layers" onclick="applyLibraryMixPreset('all_layers', this)">⚡ Super Mix (7 Camadas)</button>
+            </div>
+
+            <!-- 7 Cards-Checkbox Clicáveis (.lib-mix-check) -->
+            <div id="lib-mix-grid" class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <label for="lib-real_broll" class="lib-mix-card active">
+                <input id="lib-real_broll" type="checkbox" class="fr-check lib-mix-check w-4 h-4 mt-0.5 shrink-0" value="real_broll" checked onchange="onLibraryMixToggle(this)" />
+                <span class="block leading-tight">
+                  <strong class="block text-xs text-white">📹 Filmagens Reais HD</strong>
+                  <span class="text-[10px] text-[#B6A9D4]">Pixabay + Wikimedia + Archive + yt-dlp</span>
+                </span>
+              </label>
+
+              <label for="lib-photos_25d" class="lib-mix-card active">
+                <input id="lib-photos_25d" type="checkbox" class="fr-check lib-mix-check w-4 h-4 mt-0.5 shrink-0" value="photos_25d" checked onchange="onLibraryMixToggle(this)" />
+                <span class="block leading-tight">
+                  <strong class="block text-xs text-white">🖼️ Fotos Reais + Parallax 2.5D</strong>
+                  <span class="text-[10px] text-[#B6A9D4]">Recorte u2netp + cv2.inpaint em CPU</span>
+                </span>
+              </label>
+
+              <label for="lib-video_over_video" class="lib-mix-card">
+                <input id="lib-video_over_video" type="checkbox" class="fr-check lib-mix-check w-4 h-4 mt-0.5 shrink-0" value="video_over_video" onchange="onLibraryMixToggle(this)" />
+                <span class="block leading-tight">
+                  <strong class="block text-xs text-white">📺 Vídeo sobre Vídeo (PiP)</strong>
+                  <span class="text-[10px] text-[#B6A9D4]">Monitor Forense PiP / Split-Screen</span>
+                </span>
+              </label>
+
+              <label for="lib-skia_graphics" class="lib-mix-card active">
+                <input id="lib-skia_graphics" type="checkbox" class="fr-check lib-mix-check w-4 h-4 mt-0.5 shrink-0" value="skia_graphics" checked onchange="onLibraryMixToggle(this)" />
+                <span class="block leading-tight">
+                  <strong class="block text-xs text-white">📊 Gráficos Skia C++</strong>
+                  <span class="text-[10px] text-[#B6A9D4]">Cards, Jornal, Mapa, Timeline, Red-String</span>
+                </span>
+              </label>
+
+              <label for="lib-cartoon_2d_layer" class="lib-mix-card">
+                <input id="lib-cartoon_2d_layer" type="checkbox" class="fr-check lib-mix-check w-4 h-4 mt-0.5 shrink-0" value="cartoon_2d_layer" onchange="onLibraryMixToggle(this)" />
+                <span class="block leading-tight">
+                  <strong class="block text-xs text-white">🎭 Personagens 2D Cartoon</strong>
+                  <span class="text-[10px] text-[#B6A9D4]">Animação 2D + Lip-Sync Rhubarb 9-Visemas</span>
+                </span>
+              </label>
+
+              <label for="lib-bespoke_ai" class="lib-mix-card">
+                <input id="lib-bespoke_ai" type="checkbox" class="fr-check lib-mix-check w-4 h-4 mt-0.5 shrink-0" value="bespoke_ai" onchange="onLibraryMixToggle(this)" />
+                <span class="block leading-tight">
+                  <strong class="block text-xs text-white">✨ Arte IA Inédita (Anti-Stock)</strong>
+                  <span class="text-[10px] text-[#B6A9D4]">Gemini Image / Pollinations / Google Flow</span>
+                </span>
+              </label>
+
+              <label for="lib-cinema_35mm_sfx" class="lib-mix-card active sm:col-span-2">
+                <input id="lib-cinema_35mm_sfx" type="checkbox" class="fr-check lib-mix-check w-4 h-4 mt-0.5 shrink-0" value="cinema_35mm_sfx" checked onchange="onLibraryMixToggle(this)" />
+                <span class="block leading-tight">
+                  <strong class="block text-xs text-white">🎞️ Cinema FX (Grão 35mm + Partículas + Hollywood SFX)</strong>
+                  <span class="text-[10px] text-[#B6A9D4]">Transições suaves xfade, sub-boom, whoosh, riser e atmosfera cinematográfica</span>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <!-- BLOCO 4: PAINEL EXPANSÍVEL <details> DE CONFIGURAÇÕES AVANÇADAS -->
+          <details id="fac-advanced-details" class="fr-details">
+            <summary class="fr-summary">
+              <span>⚙️ 5. Configurações Avançadas (FPS, Cadência de Corte, Trilha &amp; Diretrizes)</span>
+              <span id="fac-adv-summary-pill" class="ml-auto text-[10px] font-bold text-frimelilac px-2.5 py-0.5 rounded-full bg-frimelilac/15 border border-frimelilac/30 whitespace-nowrap">30 FPS • 3.5s • Trilha Auto</span>
+            </summary>
+            <div class="px-4 pb-4 pt-3 space-y-4 border-t border-[rgba(179,136,255,0.16)]">
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label for="fac-fps-universal" class="block text-[11px] font-bold text-frimelime uppercase mb-1">Taxa de Quadros (FPS)</label>
+                  <select id="fac-fps-universal" class="fr-input text-xs" onchange="syncFpsControl('fac-fps-universal')">
+                    <option value="30" selected>🎞️ 30 FPS Cinema (Render 2× Mais Rápido)</option>
+                    <option value="60">⚡ 60 FPS Ultra-Fluido (Skia C++ / QuickSync)</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="fac-cut-cadence" class="block text-[11px] font-bold text-frimegold uppercase mb-1">Cadência de Corte (Ritmo Visual)</label>
+                  <select id="fac-cut-cadence" class="fr-input text-xs" onchange="updateAdvancedSummaryPill()">
+                    <option value="2.0">🔥 2.0s • Frenético (Retenção Máxima Shorts/TikTok)</option>
+                    <option value="3.5" selected>⚡ 3.5s • Viral Equilibrado (Padrão FrimeRise)</option>
+                    <option value="5.5">🎬 5.5s • Cinema / Documentário Contemplativo</option>
+                  </select>
+                </div>
+                <div>
+                  <label for="fac-music-file" class="block text-[11px] font-bold text-frimepink uppercase mb-1">Trilha Musical de Fundo</label>
+                  <select id="fac-music-file" class="fr-input text-xs" onchange="onMusicFileChange()">
+                    <option value="auto" selected>🎵 Automática do Preset / Clima do Tema</option>
+                    <option value="flow_vault">🌊 Flow Music Vault (Trilha Exclusiva IA)</option>
+                    <option value="none">🔇 Sem Trilha Musical (Voz + SFX)</option>
+                  </select>
+                </div>
+                <div>
+                  <div class="flex items-center justify-between mb-1">
+                    <label for="fac-music-vol" class="text-[11px] font-bold text-frimelilac uppercase">Volume da Música</label>
+                    <strong id="fac-music-vol-label" class="text-xs font-black text-frimelime">18%</strong>
+                  </div>
+                  <div class="pt-1.5">
+                    <input id="fac-music-vol" type="range" min="0" max="40" step="1" value="18" class="w-full fr-range" oninput="updateMusicVolLabel()" />
+                  </div>
+                  <div class="flex justify-between text-[10px] text-[#B6A9D4] mt-0.5">
+                    <span>0% Mudo</span>
+                    <span>18% Broadcast</span>
+                    <span>40% Alto</span>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <label for="fac-custom-directives" class="block text-[11px] font-bold text-frimegold uppercase mb-1">✍️ Diretrizes Criativas Extras (Roteiro, Visual, Clima, Enquadramento)</label>
+                <textarea id="fac-custom-directives" rows="3" class="fr-input text-xs" placeholder="Ex: Comece com um gancho chocante nos primeiros 2 segundos, clima sombrio de documentário de mistério, destaque datas históricas na tela, termine com pergunta aberta para gerar comentários..." oninput="updateRecipeSummary()"></textarea>
+              </div>
+            </div>
+          </details>
+
+          <!-- Google Flow & Flow Music Pro Controls -->
+          <div class="p-4 rounded-xl bg-[#0B0713]/90 border border-frimelilac/35 space-y-3">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <span class="text-xs font-black uppercase text-frimegold">🌊 Google Flow &amp; Flow Music Pro</span>
+                <span id="flow-mode-pill" class="text-[10px] font-extrabold px-2 py-0.5 rounded-full bg-frimelime/15 text-frimelime border border-frimelime/40">Cofre FlowVault 0-Crédito Ativo</span>
+              </div>
+              <div class="flex items-center gap-1.5">
+                <button type="button" onclick="loginGoogleFlow('flow')" class="btn-ghost px-2.5 py-1 text-[11px] font-bold">🔐 Login Flow.google</button>
+                <button type="button" onclick="loginGoogleFlow('flowmusic')" class="btn-ghost px-2.5 py-1 text-[11px] font-bold">🎵 Login FlowMusic</button>
+              </div>
+            </div>
+            <div class="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
+              <div class="sm:col-span-7">
+                <label for="fac-flow-mode" class="block text-[11px] font-bold text-[#B6A9D4] mb-1">Modo de Geração Visual &amp; Guardião de Créditos</label>
+                <select id="fac-flow-mode" class="fr-input text-xs" onchange="toggleFlowCreditsCap()">
+                  <option value="economico_pro" selected>🟢 Econômico Pro (Nano Banana 2 + 2.5D Parallax CPU • 0 cr Veo)</option>
+                  <option value="gancho_de_ouro">🟡 Gancho de Ouro (~15 cr • Cena 1 Veo 3.1 Light + Cenas 2..N 2.5D CPU)</option>
+                  <option value="cinema_full_veo">🔴 Cinema Full Veo (Veo 3.1 com Teto Máximo de Créditos)</option>
+                </select>
+              </div>
+              <div class="sm:col-span-2">
+                <label for="fac-flow-cap" class="block text-[11px] font-bold text-frimegold mb-1">Teto Máx (cr)</label>
+                <input id="fac-flow-cap" type="number" min="0" max="1000" step="5" value="45" class="fr-input text-xs text-center" title="Teto máximo de créditos Google Flow por vídeo (max_credits_cap)" />
+              </div>
+              <div class="sm:col-span-3">
+                <label class="flex items-center gap-2 p-2.5 rounded-xl bg-[#140E24] border border-frimepink/35 cursor-pointer">
+                  <input id="opt-flow-music" type="checkbox" class="fr-check w-4 h-4" onchange="onFlowMusicCheckboxChange()" />
+                  <span class="text-[11px] font-extrabold text-white">🎵 Flow Music Vault</span>
+                </label>
+              </div>
+            </div>
+          </div>
+
           <!-- Pro Options Checkboxes + Multi-Language Global Cloning -->
           <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
             <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.18)] cursor-pointer hover:border-frimelilac/50">
-              <input id="opt-motion" type="checkbox" class="fr-check w-4 h-4" checked />
+              <input id="opt-motion" type="checkbox" class="fr-check w-4 h-4" checked onchange="syncMotionCardWithSkia()" />
               <span class="text-xs font-bold text-white">Motion Graphics &amp; Lower Thirds Skia</span>
             </label>
             <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.18)] cursor-pointer hover:border-frimelilac/50">
@@ -326,40 +602,51 @@
           </button>
         </div>
 
-        <!-- Right: Live Render Pipeline & Queue -->
-        <div class="lg:col-span-5 glass-card p-6 flex flex-col justify-between space-y-4">
-          <div class="space-y-4">
-            <div class="flex items-center justify-between">
-              <h3 class="text-lg font-extrabold text-white">Monitor de Produção Ao Vivo</h3>
-              <span id="live-queue-badge" class="text-xs font-bold px-2.5 py-1 rounded-full bg-frimelilac/15 text-frimelilac border border-frimelilac/35">Fila: 0</span>
+        <!-- Right: Live Render Pipeline & Creative Recipe Preview -->
+        <div class="lg:col-span-5 lg:sticky lg:top-28 space-y-5">
+          <div class="glass-card p-6 flex flex-col justify-between space-y-4">
+            <div class="space-y-4">
+              <div class="flex items-center justify-between">
+                <h3 class="text-lg font-extrabold text-white">Monitor de Produção Ao Vivo</h3>
+                <span id="live-queue-badge" class="text-xs font-bold px-2.5 py-1 rounded-full bg-frimelilac/15 text-frimelilac border border-frimelilac/35">Fila: 0</span>
+              </div>
+
+              <div id="active-job-card" class="p-4 rounded-xl bg-[#0B0713]/90 border border-[rgba(179,136,255,0.22)] space-y-3">
+                <div class="flex items-center justify-between gap-2">
+                  <span id="active-job-title" class="text-sm font-bold text-white truncate">Pronto para fabricar</span>
+                  <span id="active-job-pct" class="text-sm font-black text-frimelime">0%</span>
+                </div>
+                <div class="lime-progress-track">
+                  <div id="active-job-bar" class="lime-progress-fill" style="width: 0%;"></div>
+                </div>
+                <p id="active-job-stage" class="text-xs text-frimelilac font-semibold">Aguardando comando...</p>
+                <pre id="active-job-log" class="text-[11px] leading-relaxed text-[#B6A9D4] bg-[#07040D] p-3 rounded-lg h-56 overflow-y-auto custom-scroll whitespace-pre-wrap">3 Motores Skia C++ (Bespoke 2.5D, Cartoon 2D, Netflix Doc) e Intel QuickSync iHD prontos em standby.</pre>
+              </div>
             </div>
 
-            <div id="active-job-card" class="p-4 rounded-xl bg-[#0B0713]/90 border border-[rgba(179,136,255,0.22)] space-y-3">
-              <div class="flex items-center justify-between gap-2">
-                <span id="active-job-title" class="text-sm font-bold text-white truncate">Pronto para fabricar</span>
-                <span id="active-job-pct" class="text-sm font-black text-frimelime">0%</span>
+            <!-- Live Creative Recipe Summary -->
+            <div id="recipe-summary-box" class="p-3.5 rounded-xl bg-[#0B0713]/85 border border-frimepink/30 space-y-2 text-[11px]">
+              <div class="flex items-center justify-between">
+                <span class="font-black uppercase text-frimegold">📋 Receita Criativa Selecionada</span>
+                <span id="recipe-mix-pill" class="text-[10px] font-extrabold text-frimelime">4 bibliotecas</span>
               </div>
-              <div class="lime-progress-track">
-                <div id="active-job-bar" class="lime-progress-fill" style="width: 0%;"></div>
-              </div>
-              <p id="active-job-stage" class="text-xs text-frimelilac font-semibold">Aguardando comando...</p>
-              <pre id="active-job-log" class="text-[11px] leading-relaxed text-[#B6A9D4] bg-[#07040D] p-3 rounded-lg h-56 overflow-y-auto custom-scroll whitespace-pre-wrap">3 Motores Skia C++ (Bespoke 2.5D, Cartoon 2D, Netflix Doc) e Intel QuickSync iHD prontos em standby.</pre>
+              <div id="recipe-summary-lines" class="text-[#B6A9D4] leading-relaxed"></div>
             </div>
-          </div>
 
-          <!-- Hardware Guard Info -->
-          <div class="grid grid-cols-3 gap-2 text-center text-xs">
-            <div class="p-2.5 rounded-xl bg-[#0B0713]/70 border border-[rgba(179,136,255,0.16)]">
-              <div class="text-[#B6A9D4]">Encoder</div>
-              <div class="font-extrabold text-frimelime">h264_vaapi</div>
-            </div>
-            <div class="p-2.5 rounded-xl bg-[#0B0713]/70 border border-[rgba(179,136,255,0.16)]">
-              <div class="text-[#B6A9D4]">Áudio FM</div>
-              <div class="font-extrabold text-frimelilac">-14 LUFS</div>
-            </div>
-            <div class="p-2.5 rounded-xl bg-[#0B0713]/70 border border-[rgba(179,136,255,0.16)]">
-              <div class="text-[#B6A9D4]">Guardião</div>
-              <div class="font-extrabold text-frimegold">≤ 85°C Auto</div>
+            <!-- Hardware Guard Info -->
+            <div class="grid grid-cols-3 gap-2 text-center text-xs">
+              <div class="p-2.5 rounded-xl bg-[#0B0713]/70 border border-[rgba(179,136,255,0.16)]">
+                <div class="text-[#B6A9D4]">Encoder</div>
+                <div class="font-extrabold text-frimelime">h264_vaapi</div>
+              </div>
+              <div class="p-2.5 rounded-xl bg-[#0B0713]/70 border border-[rgba(179,136,255,0.16)]">
+                <div class="text-[#B6A9D4]">Áudio FM</div>
+                <div class="font-extrabold text-frimelilac">-14 LUFS</div>
+              </div>
+              <div class="p-2.5 rounded-xl bg-[#0B0713]/70 border border-[rgba(179,136,255,0.16)]">
+                <div class="text-[#B6A9D4]">Guardião</div>
+                <div class="font-extrabold text-frimegold">≤ 85°C Auto</div>
+              </div>
             </div>
           </div>
         </div>
@@ -859,6 +1146,6 @@
     </div>
   </dialog>
 
-  <script src="/static/app.js?v=5"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>

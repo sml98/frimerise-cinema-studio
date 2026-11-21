@@ -1,12 +1,18 @@
-/* FrimeRise Dashboard Client Logic — 3 Master Engines + Twin Channels + DNA X-Ray + Google Flow Pro */
+/* FrimeRise Dashboard Client Logic — 3 Master Engines + Estúdio de Criação Personalizada + Twin Channels + DNA X-Ray + Google Flow Pro */
 let STATE = {
   settings: {},
   presets: [],
   clients: [],
   skills: [],
   luts: [],
+  music: [],
   edge_voices: [],
+  edge_voices_all: [],
   gemini_voices: [],
+  kokoro_voices: [],
+  visual_libraries_catalog: [],
+  duration_presets: [],
+  caption_styles: [],
   flow_pro: { credits_remaining: 10000, credits_total: 10000 },
   doc_queue: { channels: {}, episodes: [] },
   jobs: [],
@@ -16,7 +22,64 @@ let STATE = {
   activeStyle: 'cinematic_broll',
   selectedVipJobId: null,
   lastAnalyzedDna: null,
+  userCustomizedLibs: false,
 };
+
+const DEFAULT_GEMINI_VOICES = [
+  { id: 'Puck', name: 'Puck (Masculino • Energético / Comédia)' },
+  { id: 'Charon', name: 'Charon (Masculino • Grave / Épico / Chefe)' },
+  { id: 'Fenrir', name: 'Fenrir (Masculino • Intenso / Dramático)' },
+  { id: 'Orus', name: 'Orus (Masculino • Firme / Narrador)' },
+  { id: 'Kore', name: 'Kore (Feminino • Firme / Comercial)' },
+  { id: 'Aoede', name: 'Aoede (Feminino • Expressiva / Storytelling)' },
+  { id: 'Zephyr', name: 'Zephyr (Feminino • Jovem / Dinâmica)' },
+  { id: 'Leda', name: 'Leda (Feminino • Suave / Elegante)' },
+];
+
+const DEFAULT_EDGE_VOICES = [
+  { id: 'pt-BR-AntonioNeural', name: '🇧🇷 Antonio Neural (PT-BR • Grave / Documentário)' },
+  { id: 'pt-BR-FranciscaNeural', name: '🇧🇷 Francisca Neural (PT-BR • Clara / Comercial)' },
+  { id: 'pt-BR-ThalitaMultilingualNeural', name: '🇧🇷 Thalita Multilingual (PT-BR • Expressiva)' },
+  { id: 'en-US-AndrewMultilingualNeural', name: '🇺🇸 Andrew Multilingual (EN-US • Vault Files Grave)' },
+  { id: 'en-US-AvaMultilingualNeural', name: '🇺🇸 Ava Multilingual (EN-US • Expressiva)' },
+  { id: 'en-US-GuyNeural', name: '🇺🇸 Guy Neural (EN-US • Narrador YouTube)' },
+  { id: 'es-MX-JorgeNeural', name: '🇲🇽 Jorge Neural (ES-MX • Narrador Grave)' },
+  { id: 'es-MX-DaliaNeural', name: '🇲🇽 Dalia Neural (ES-MX • Natural / Storytelling)' },
+];
+
+const DEFAULT_KOKORO_VOICES = [
+  { id: 'pm_alex', name: '🎙️ pm_alex (PT-BR Masculino Grave • Local)' },
+  { id: 'pf_dora', name: '🎙️ pf_dora (PT-BR Feminino Natural • Local)' },
+  { id: 'pm_santa', name: '🎙️ pm_santa (PT-BR Histórias / Sombrio • Local)' },
+  { id: 'af_heart', name: '🎙️ af_heart (EN-US Feminino Expressivo • Local)' },
+  { id: 'am_adam', name: '🎙️ am_adam (EN-US Masculino Narrador • Local)' },
+];
+
+const LIBRARY_MIX_PRESETS = {
+  cinema_real: ['real_broll', 'photos_25d', 'video_over_video', 'skia_graphics', 'cinema_35mm_sfx'],
+  antistock_ai: ['bespoke_ai', 'photos_25d', 'skia_graphics', 'cinema_35mm_sfx'],
+  cartoon_real: ['cartoon_2d_layer', 'real_broll', 'skia_graphics', 'cinema_35mm_sfx'],
+  all_layers: ['real_broll', 'photos_25d', 'video_over_video', 'skia_graphics', 'cartoon_2d_layer', 'bespoke_ai', 'cinema_35mm_sfx'],
+};
+
+function normalizeVoiceList(rawList, fallbackList) {
+  const seen = new Set();
+  const out = [];
+  const fallbackMap = new Map((fallbackList || []).map((v) => [v.id, v.name]));
+  const pushItem = (item) => {
+    if (!item) return;
+    const id = typeof item === 'string' ? item : item.id;
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    const name = typeof item === 'string'
+      ? (fallbackMap.get(id) || id)
+      : (item.name || item.label || fallbackMap.get(id) || id);
+    out.push({ id, name });
+  };
+  (rawList || []).forEach(pushItem);
+  (fallbackList || []).forEach(pushItem);
+  return out;
+}
 
 function showToast(msg, isError = false) {
   const box = document.getElementById('toast-box');
@@ -104,9 +167,41 @@ function selectEngineStyle(style) {
     } else if (style === 'netflix_doc') {
       const match = Array.from(sk.options).find((o) => o.value.includes('10_netflix') || o.value.includes('02_curiosity'));
       if (match) sk.value = match.value;
-      syncDocChannelSelection();
+      syncDocChannelSelection(false);
     }
   }
+
+  // Sync universal aspect ratio, FPS, and default library mix sensibly when user switches Master Engine
+  if (style === 'netflix_doc') {
+    const docAsp = document.getElementById('doc-aspect')?.value || '16:9';
+    syncUniversalAspectFrom(docAsp);
+    if (!STATE.userCustomizedLibs) {
+      applyLibraryMixValues(['real_broll', 'photos_25d', 'video_over_video', 'skia_graphics', 'cinema_35mm_sfx'], false);
+    }
+  } else if (style === 'cartoon_2d') {
+    const cAsp = document.getElementById('fac-aspect')?.value || '9:16';
+    syncUniversalAspectFrom(cAsp);
+    const fpsUni = document.getElementById('fac-fps-universal');
+    const fpsCart = document.getElementById('fac-fps');
+    if (fpsUni && fpsCart) {
+      fpsUni.value = '60';
+      fpsCart.value = '60';
+    }
+    if (!STATE.userCustomizedLibs) {
+      applyLibraryMixValues(['cartoon_2d_layer', 'skia_graphics', 'cinema_35mm_sfx'], false);
+    }
+  } else {
+    const curAsp = document.getElementById('fac-aspect-universal')?.value || '9:16';
+    if (curAsp === '16:9') {
+      syncUniversalAspectFrom('9:16');
+    }
+    if (!STATE.userCustomizedLibs) {
+      applyLibraryMixValues(['real_broll', 'photos_25d', 'skia_graphics', 'cinema_35mm_sfx'], false);
+    }
+  }
+
+  updateAdvancedSummaryPill();
+  updateRecipeSummary();
   updateManufactureCtaText();
 }
 
@@ -114,14 +209,458 @@ document.querySelectorAll('.style-btn').forEach((btn) => {
   btn.addEventListener('click', () => selectEngineStyle(btn.dataset.style));
 });
 
-function syncDocChannelSelection() {
-  const lang = document.getElementById('doc-lang')?.value || 'pt_br';
+function syncDocChannelSelection(fromDocSelect = false) {
+  const docLangEl = document.getElementById('doc-lang');
+  const facLangEl = document.getElementById('fac-language');
+  const lang = docLangEl?.value || 'pt_br';
+  if (fromDocSelect && facLangEl && (lang === 'pt_br' || lang === 'en_us')) {
+    facLangEl.value = lang;
+  }
   const targetName = lang === 'en_us' ? 'Vault Files' : 'Dossiê Capital';
   const found = (STATE.clients || []).find((c) => c.name === targetName);
   const cliSel = document.getElementById('fac-client');
   if (found && cliSel) {
     cliSel.value = String(found.id);
+    onFactoryClientChange();
   }
+  updateRecipeSummary();
+}
+
+/* -------------------- Estúdio de Criação Personalizada (Tab 1) -------------------- */
+function getSelectedFactoryClient() {
+  const cid = String(document.getElementById('fac-client')?.value || '');
+  return (STATE.clients || []).find((c) => String(c.id) === cid) || (STATE.clients || [])[0] || null;
+}
+
+function getAllVoicePools() {
+  const gemini = normalizeVoiceList(STATE.gemini_voices, DEFAULT_GEMINI_VOICES);
+  const edge = normalizeVoiceList(
+    (STATE.edge_voices_all && STATE.edge_voices_all.length) ? STATE.edge_voices_all : STATE.edge_voices,
+    DEFAULT_EDGE_VOICES
+  );
+  const kokoro = normalizeVoiceList(STATE.kokoro_voices, DEFAULT_KOKORO_VOICES);
+  return { gemini, edge, kokoro };
+}
+
+function syncFactoryVoiceList(preferredVoiceId = null) {
+  const engEl = document.getElementById('fac-voice-engine');
+  const vSel = document.getElementById('fac-voice-id');
+  if (!engEl || !vSel) return;
+
+  const eng = engEl.value || 'auto';
+  const prev = preferredVoiceId !== null ? preferredVoiceId : vSel.value;
+  const pools = getAllVoicePools();
+  const client = getSelectedFactoryClient();
+
+  if (eng === 'auto') {
+    const clientVoiceLabel = client ? `${client.voice_id || 'pt-BR-AntonioNeural'} (${client.voice_engine || 'edge'})` : 'Automática';
+    vSel.innerHTML = `
+      <option value="">✨ Padrão do Cliente — ${clientVoiceLabel}</option>
+      <optgroup label="🎭 Google Gemini TTS Expressivo">
+        ${pools.gemini.map((v) => `<option value="${v.id}">${v.name}</option>`).join('')}
+      </optgroup>
+      <optgroup label="⚡ Edge-TTS Neural (PT-BR / EN-US / ES)">
+        ${pools.edge.map((v) => `<option value="${v.id}">${v.name}</option>`).join('')}
+      </optgroup>
+      <optgroup label="🎙️ Kokoro-ONNX Voice Blender Local">
+        ${pools.kokoro.map((v) => `<option value="${v.id}">${v.name}</option>`).join('')}
+      </optgroup>
+    `;
+    const allIds = ['', ...pools.gemini.map((v) => v.id), ...pools.edge.map((v) => v.id), ...pools.kokoro.map((v) => v.id)];
+    vSel.value = allIds.includes(prev) ? prev : '';
+  } else {
+    const list = eng === 'gemini_tts' ? pools.gemini : (eng === 'kokoro' ? pools.kokoro : pools.edge);
+    vSel.innerHTML = list.map((v) => `<option value="${v.id}">${v.name}</option>`).join('');
+    if (prev && list.some((v) => v.id === prev)) {
+      vSel.value = prev;
+    } else if (list.length > 0) {
+      // Pick language-matching default when Edge-TTS is selected
+      if (eng === 'edge') {
+        const lang = document.getElementById('fac-language')?.value || 'pt_br';
+        const wanted = lang === 'en_us' ? 'en-US-AndrewMultilingualNeural' : (lang === 'es' ? 'es-MX-DaliaNeural' : 'pt-BR-AntonioNeural');
+        vSel.value = list.some((v) => v.id === wanted) ? wanted : list[0].id;
+      } else {
+        vSel.value = list[0].id;
+      }
+    }
+  }
+
+  // Keep Cartoon 2D voice selector synced when applicable
+  const cVoice = document.getElementById('fac-cartoon-voice');
+  if (cVoice && (eng === 'gemini_tts' || eng === 'edge')) {
+    cVoice.value = eng;
+  }
+  updateRecipeSummary();
+}
+
+function syncCartoonVoiceEngine() {
+  const cVoice = document.getElementById('fac-cartoon-voice');
+  const fEng = document.getElementById('fac-voice-engine');
+  if (cVoice && fEng) {
+    fEng.value = cVoice.value;
+    syncFactoryVoiceList();
+  }
+}
+
+function resolveEffectiveFactoryVoice() {
+  const engRaw = document.getElementById('fac-voice-engine')?.value || 'auto';
+  const voiceRaw = document.getElementById('fac-voice-id')?.value || '';
+  const pools = getAllVoicePools();
+  const client = getSelectedFactoryClient();
+
+  if (engRaw !== 'auto') {
+    const fallbackId = engRaw === 'gemini_tts' ? 'Puck' : (engRaw === 'kokoro' ? 'pm_alex' : 'pt-BR-AntonioNeural');
+    return { voice_engine: engRaw, voice_id: voiceRaw || fallbackId };
+  }
+  if (voiceRaw) {
+    if (pools.gemini.some((v) => v.id === voiceRaw)) return { voice_engine: 'gemini_tts', voice_id: voiceRaw };
+    if (pools.kokoro.some((v) => v.id === voiceRaw)) return { voice_engine: 'kokoro', voice_id: voiceRaw };
+    return { voice_engine: 'edge', voice_id: voiceRaw };
+  }
+  return {
+    voice_engine: client?.voice_engine || 'edge',
+    voice_id: client?.voice_id || 'pt-BR-AntonioNeural',
+  };
+}
+
+async function previewFactoryVoice() {
+  const btn = document.getElementById('btn-fac-voice-preview');
+  const audio = document.getElementById('fac-voice-audio');
+  if (!btn || !audio) return;
+
+  const { voice_engine, voice_id } = resolveEffectiveFactoryVoice();
+  const voice_rate = document.getElementById('fac-voice-rate')?.value || '+8%';
+  const voice_pitch = document.getElementById('fac-voice-pitch')?.value || '+0Hz';
+  const lang = document.getElementById('fac-language')?.value || 'pt_br';
+  const customTopic = (document.getElementById('fac-topic')?.value || '').trim();
+
+  const defaultSamples = {
+    pt_br: 'Atenção! Esta é a prévia oficial da sua voz escolhida no estúdio FrimeRise, pronta para transformar qualquer ideia em um vídeo de cinema.',
+    en_us: 'Attention! This is the live preview of your selected FrimeRise voice, calibrated for high-retention storytelling and broadcast clarity.',
+    es: '¡Atención! Esta es la vista previa en vivo de tu voz elegida en FrimeRise, calibrada para máxima retención y calidad cinematográfica.',
+  };
+  const sample_text = customTopic
+    ? (lang === 'en_us'
+        ? `Tonight we uncover the hidden story behind: ${customTopic.slice(0, 120)}.`
+        : lang === 'es'
+          ? `Hoy revelamos la historia oculta detrás de: ${customTopic.slice(0, 120)}.`
+          : `Hoje você vai descobrir a verdade oculta por trás de: ${customTopic.slice(0, 120)}.`)
+    : (defaultSamples[lang] || defaultSamples.pt_br);
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Gerando voz...';
+  try {
+    const res = await api('/api/voice/preview', {
+      method: 'POST',
+      body: JSON.stringify({
+        voice_engine,
+        voice_id,
+        voice_rate,
+        voice_pitch,
+        voice_blend: {
+          pf_dora: Number(document.getElementById('blend-dora')?.value || 35) / 100,
+          pm_alex: Number(document.getElementById('blend-alex')?.value || 65) / 100,
+          pm_santa: Number(document.getElementById('blend-santa')?.value || 0) / 100,
+        },
+        sample_text,
+      }),
+    });
+    audio.src = `${res.audio_url}?t=${Date.now()}`;
+    audio.classList.remove('hidden');
+    await audio.play().catch(() => {});
+    showToast(`🎙️ Prévia pronta (${voice_id} • ${voice_rate} • ${voice_pitch} • ${res.duration_s}s)`);
+  } catch (e) {
+    showToast(`Erro na prévia de voz: ${e.message}`, true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '▶ Ouvir Voz';
+  }
+}
+
+function onFactoryClientChange() {
+  const eng = document.getElementById('fac-voice-engine')?.value || 'auto';
+  if (eng === 'auto') {
+    syncFactoryVoiceList(document.getElementById('fac-voice-id')?.value || '');
+  }
+  onFactoryPresetChange();
+  updateRecipeSummary();
+}
+
+function formatDurationLabel(seconds) {
+  const s = Math.max(10, Math.min(900, Math.round(Number(seconds) || 30)));
+  if (s <= 20) return `${s}s • Gancho Relâmpago`;
+  if (s <= 45) return `${s}s • Viral Curto`;
+  if (s <= 90) return `${s}s • Shorts / Reels Completo`;
+  const mins = Number((s / 60).toFixed(1));
+  if (s <= 240) return `${mins} min • YouTube Mini-Doc`;
+  if (s <= 600) return `${mins} min • Mid-Roll Alto RPM`;
+  return `${mins} min • Documentário Cinema`;
+}
+
+function setFactoryDuration(val, source = 'pill') {
+  const parsed = Number(val);
+  const clamped = Number.isFinite(parsed) ? Math.max(10, Math.min(900, Math.round(parsed))) : 30;
+  const numEl = document.getElementById('fac-duration-s');
+  const rngEl = document.getElementById('fac-duration-range');
+  const lblEl = document.getElementById('fac-duration-label');
+
+  if (numEl && source !== 'number') numEl.value = String(clamped);
+  if (rngEl && source !== 'range') {
+    rngEl.value = String(Math.max(15, clamped));
+  }
+  if (rngEl) {
+    const pct = Math.max(0, Math.min(100, ((Math.max(15, clamped) - 15) / (900 - 15)) * 100));
+    rngEl.style.setProperty('--progress', `${pct.toFixed(1)}%`);
+  }
+  if (lblEl) {
+    lblEl.textContent = formatDurationLabel(clamped);
+  }
+
+  document.querySelectorAll('.dur-pill-btn').forEach((btn) => {
+    btn.classList.toggle('active', Number(btn.dataset.seconds) === clamped);
+  });
+
+  // Sync Netflix Doc duration select to closest value when not coming from doc select
+  const docMin = document.getElementById('doc-minutes');
+  if (docMin && source !== 'doc') {
+    const mins = clamped / 60;
+    const opts = Array.from(docMin.options).map((o) => Number(o.value));
+    const nearest = opts.reduce((best, cur) => (Math.abs(cur - mins) < Math.abs(best - mins) ? cur : best), opts[0]);
+    docMin.value = String(nearest);
+  }
+  updateRecipeSummary();
+}
+
+function syncDurationFromDocMinutes() {
+  const mins = Number(document.getElementById('doc-minutes')?.value || 0.5);
+  setFactoryDuration(Math.round(mins * 60), 'doc');
+}
+
+function onUniversalAspectChange() {
+  const ratio = document.getElementById('fac-aspect-universal')?.value || '9:16';
+  const cAsp = document.getElementById('fac-aspect');
+  const dAsp = document.getElementById('doc-aspect');
+  if (cAsp && Array.from(cAsp.options).some((o) => o.value === ratio)) cAsp.value = ratio;
+  if (dAsp && Array.from(dAsp.options).some((o) => o.value === ratio)) dAsp.value = ratio;
+  updateRecipeSummary();
+}
+
+function syncUniversalAspectFrom(ratio) {
+  const uni = document.getElementById('fac-aspect-universal');
+  const cAsp = document.getElementById('fac-aspect');
+  const dAsp = document.getElementById('doc-aspect');
+  if (uni && Array.from(uni.options).some((o) => o.value === ratio)) uni.value = ratio;
+  if (cAsp && Array.from(cAsp.options).some((o) => o.value === ratio)) cAsp.value = ratio;
+  if (dAsp && Array.from(dAsp.options).some((o) => o.value === ratio)) dAsp.value = ratio;
+  updateRecipeSummary();
+}
+
+function onFactoryLanguageChange() {
+  const lang = document.getElementById('fac-language')?.value || 'pt_br';
+  const docLang = document.getElementById('doc-lang');
+  if (docLang && (lang === 'pt_br' || lang === 'en_us')) {
+    docLang.value = lang;
+    if (STATE.activeStyle === 'netflix_doc') {
+      syncDocChannelSelection(false);
+    }
+  }
+  // If user is on Edge-TTS, auto-switch voice to match chosen language
+  const vEng = document.getElementById('fac-voice-engine')?.value || 'auto';
+  const vSel = document.getElementById('fac-voice-id');
+  if (vEng === 'edge' && vSel) {
+    const targetVoice = lang === 'en_us' ? 'en-US-AndrewMultilingualNeural' : (lang === 'es' ? 'es-MX-DaliaNeural' : 'pt-BR-AntonioNeural');
+    if (Array.from(vSel.options).some((o) => o.value === targetVoice)) {
+      vSel.value = targetVoice;
+    }
+  }
+  updateRecipeSummary();
+}
+
+function onFactoryPresetChange() {
+  const box = document.getElementById('fac-preset-swatches');
+  if (!box) return;
+  const presetId = document.getElementById('fac-preset')?.value || '';
+  const client = getSelectedFactoryClient();
+  const effectiveId = presetId || client?.preset_id || 'frimerise_signature';
+  const p = (STATE.presets || []).find((x) => x.id === effectiveId);
+  if (p) {
+    box.innerHTML = `
+      <span class="w-3.5 h-3.5 rounded-full inline-block shrink-0" style="background:${p.primary_color}"></span>
+      <span class="w-3.5 h-3.5 rounded-full inline-block shrink-0" style="background:${p.secondary_color}"></span>
+      <span class="w-3.5 h-3.5 rounded-full inline-block shrink-0" style="background:${p.highlight_color}"></span>
+      <span class="w-3.5 h-3.5 rounded-full inline-block shrink-0" style="background:${p.accent_gold}"></span>
+      <span class="truncate text-white font-semibold">${p.name}</span>
+    `;
+  }
+  updateRecipeSummary();
+}
+
+/* -------------------- Misturador de Bibliotecas ("Misturar Bibliotecas") -------------------- */
+function getSelectedVisualLibraries() {
+  return Array.from(document.querySelectorAll('.lib-mix-check:checked')).map((el) => el.value);
+}
+
+function updateLibraryMixCount() {
+  const boxes = Array.from(document.querySelectorAll('.lib-mix-check'));
+  let count = 0;
+  boxes.forEach((cb) => {
+    const card = cb.closest('.lib-mix-card');
+    if (card) card.classList.toggle('active', cb.checked);
+    if (cb.checked) count += 1;
+  });
+
+  const badge = document.getElementById('lib-mix-count');
+  if (badge) {
+    if (count === 0) {
+      badge.textContent = '⚠️ Selecione ao menos 1 biblioteca';
+      badge.className = 'text-[11px] font-extrabold px-2.5 py-0.5 rounded-full bg-frimepink/20 text-frimepink border border-frimepink/50';
+    } else {
+      badge.textContent = count === 1 ? '1 biblioteca ativa no mix' : `${count} bibliotecas ativas no mix`;
+      badge.className = 'text-[11px] font-extrabold px-2.5 py-0.5 rounded-full bg-frimelime/15 text-frimelime border border-frimelime/45';
+    }
+  }
+  const recipePill = document.getElementById('recipe-mix-pill');
+  if (recipePill) {
+    recipePill.textContent = count === 1 ? '1 biblioteca' : `${count} bibliotecas`;
+  }
+  updateRecipeSummary();
+}
+
+function applyLibraryMixValues(values, markCustomized = true) {
+  const wanted = new Set(values || []);
+  document.querySelectorAll('.lib-mix-check').forEach((cb) => {
+    cb.checked = wanted.has(cb.value);
+  });
+  const optMotion = document.getElementById('opt-motion');
+  if (optMotion) {
+    optMotion.checked = wanted.has('skia_graphics');
+  }
+  if (markCustomized) {
+    STATE.userCustomizedLibs = true;
+  }
+  updateLibraryMixCount();
+}
+
+function applyLibraryMixPreset(presetKey, btnEl = null) {
+  const list = LIBRARY_MIX_PRESETS[presetKey] || LIBRARY_MIX_PRESETS.cinema_real;
+  applyLibraryMixValues(list, true);
+  document.querySelectorAll('.mix-preset-btn').forEach((b) => {
+    b.classList.toggle('active', b === btnEl || b.dataset.mix === presetKey);
+  });
+  showToast(`🧩 Mix aplicado: ${list.length} bibliotecas combinadas!`);
+}
+
+function onLibraryMixToggle(checkbox) {
+  STATE.userCustomizedLibs = true;
+  document.querySelectorAll('.mix-preset-btn').forEach((b) => b.classList.remove('active'));
+  if (checkbox && checkbox.value === 'skia_graphics') {
+    const optMotion = document.getElementById('opt-motion');
+    if (optMotion) optMotion.checked = checkbox.checked;
+  }
+  updateLibraryMixCount();
+}
+
+function syncMotionCardWithSkia() {
+  const optMotion = document.getElementById('opt-motion');
+  const libSkia = document.getElementById('lib-skia_graphics');
+  if (optMotion && libSkia) {
+    libSkia.checked = optMotion.checked;
+    updateLibraryMixCount();
+  }
+}
+
+/* -------------------- Configurações Avançadas (<details>) -------------------- */
+function syncFpsControl(sourceId) {
+  const src = document.getElementById(sourceId);
+  const uni = document.getElementById('fac-fps-universal');
+  const cart = document.getElementById('fac-fps');
+  if (!src) return;
+  if (uni && sourceId !== 'fac-fps-universal') uni.value = src.value;
+  if (cart && sourceId !== 'fac-fps') cart.value = src.value;
+  updateAdvancedSummaryPill();
+  updateRecipeSummary();
+}
+
+function onMusicFileChange() {
+  const val = document.getElementById('fac-music-file')?.value || 'auto';
+  const flowMusicCb = document.getElementById('opt-flow-music');
+  if (flowMusicCb) {
+    if (val === 'flow_vault') flowMusicCb.checked = true;
+    else if (val === 'none' || val.endsWith('.mp3')) flowMusicCb.checked = false;
+  }
+  updateAdvancedSummaryPill();
+  updateRecipeSummary();
+}
+
+function onFlowMusicCheckboxChange() {
+  const flowMusicCb = document.getElementById('opt-flow-music');
+  const musicSel = document.getElementById('fac-music-file');
+  if (!flowMusicCb || !musicSel) return;
+  if (flowMusicCb.checked) {
+    if (musicSel.value === 'auto' || musicSel.value === 'none') {
+      musicSel.value = 'flow_vault';
+    }
+  } else if (musicSel.value === 'flow_vault') {
+    musicSel.value = 'auto';
+  }
+  updateAdvancedSummaryPill();
+  updateRecipeSummary();
+}
+
+function updateMusicVolLabel() {
+  const range = document.getElementById('fac-music-vol');
+  const lbl = document.getElementById('fac-music-vol-label');
+  if (!range || !lbl) return;
+  const val = Number(range.value || 18);
+  lbl.textContent = `${val}%`;
+  const pct = Math.max(0, Math.min(100, (val / 40) * 100));
+  range.style.setProperty('--progress', `${pct.toFixed(1)}%`);
+  updateAdvancedSummaryPill();
+}
+
+function updateAdvancedSummaryPill() {
+  const pill = document.getElementById('fac-adv-summary-pill');
+  if (!pill) return;
+  const fps = document.getElementById('fac-fps-universal')?.value || '30';
+  const cadence = document.getElementById('fac-cut-cadence')?.value || '3.5';
+  const music = document.getElementById('fac-music-file')?.value || 'auto';
+  const vol = document.getElementById('fac-music-vol')?.value || '18';
+  const musicLbl = music === 'none' ? 'Sem Trilha' : (music === 'flow_vault' ? 'Flow Music' : (music === 'auto' ? `Trilha Auto (${vol}%)` : `${music.replace('.mp3', '')} (${vol}%)`));
+  pill.textContent = `${fps} FPS • ${cadence}s • ${musicLbl}`;
+}
+
+function updateRecipeSummary() {
+  const box = document.getElementById('recipe-summary-lines');
+  if (!box) return;
+  const engLabels = {
+    cinematic_broll: '🎬 Dinâmico / Bespoke 2.5D',
+    cartoon_2d: '🎭 Cartoon 2D',
+    netflix_doc: '🎞️ Doc Cinema Netflix',
+  };
+  const capLabels = {
+    hormozi_neon: 'Hormozi Neon Spring',
+    karaoke_glow: 'Karaokê Glow',
+    word_slam: 'Word Slam 3D',
+    cinema_minimal: 'Cinema Minimalista',
+    typewriter_highlight: 'Dossiê Typewriter',
+    none: 'Sem Legendas',
+  };
+  const { voice_engine, voice_id } = resolveEffectiveFactoryVoice();
+  const rate = document.getElementById('fac-voice-rate')?.value || '+8%';
+  const pitch = document.getElementById('fac-voice-pitch')?.value || '+0Hz';
+  const aspect = document.getElementById('fac-aspect-universal')?.value || '9:16';
+  const dur = Number(document.getElementById('fac-duration-s')?.value || 30);
+  const cap = document.getElementById('fac-caption-style')?.value || 'hormozi_neon';
+  const lang = (document.getElementById('fac-language')?.value || 'pt_br').toUpperCase().replace('_', '-');
+  const fps = document.getElementById('fac-fps-universal')?.value || '30';
+  const libs = getSelectedVisualLibraries();
+  const directives = (document.getElementById('fac-custom-directives')?.value || '').trim();
+
+  box.innerHTML = `
+    <div><strong class="text-white">${engLabels[STATE.activeStyle] || STATE.activeStyle}</strong> • <span class="text-frimelime font-bold">${aspect}</span> • <span class="text-frimegold font-bold">${formatDurationLabel(dur)}</span> • ${fps} FPS • ${lang}</div>
+    <div>🎙️ <span class="text-frimepink font-bold">${voice_id}</span> (${voice_engine} • ${rate} / ${pitch}) • 💬 <span class="text-frimelilac">${capLabels[cap] || cap}</span></div>
+    <div>🧩 Mix: <span class="text-white">${libs.length ? libs.join(', ') : 'Nenhuma selecionada'}</span>${directives ? ' • ✍️ <span class="text-frimegold">Diretrizes extras ativas</span>' : ''}</div>
+  `;
 }
 
 /* -------------------- Google Flow & Flow Music Pro Controls -------------------- */
@@ -266,7 +805,15 @@ async function saveDnaAsPreset() {
     if (res.preset && res.preset.id) {
       document.getElementById('cli-preset-id').value = res.preset.id;
     }
+    renderSelectors();
     renderPresetsGrid();
+    if (res.preset && res.preset.id) {
+      const facPreset = document.getElementById('fac-preset');
+      if (facPreset) {
+        facPreset.value = res.preset.id;
+        onFactoryPresetChange();
+      }
+    }
     showToast(`💾 Preset "${res.preset?.name || presetName}" salvo permanentemente no SQLite!`);
   } catch (e) {
     showToast(`Erro ao salvar DNA como Preset: ${e.message}`, true);
@@ -453,29 +1000,83 @@ function renderSelectors() {
   skSel.innerHTML = STATE.skills.map((s) => `<option value="${s.id}">${s.name}</option>`).join('');
   if (prevSk) skSel.value = prevSk;
 
-  // LUTs
-  const lutSel = document.getElementById('cli-lut');
-  lutSel.innerHTML = STATE.luts.map((l) => `<option value="${l}">${l.replace('.cube', '').replaceAll('_', ' ')}</option>`).join('');
+  // Factory Presets (#fac-preset)
+  const facPresetSel = document.getElementById('fac-preset');
+  if (facPresetSel) {
+    const prevPreset = facPresetSel.value;
+    facPresetSel.innerHTML = `<option value="">✨ Padrão do Cliente (Automático)</option>` +
+      (STATE.presets || []).map((p) => `<option value="${p.id}">${p.name}${p.is_default ? ' (Padrão)' : ''}</option>`).join('');
+    if (prevPreset && (STATE.presets || []).some((p) => p.id === prevPreset)) {
+      facPresetSel.value = prevPreset;
+    }
+  }
 
-  // Voice list synced to selected voice engine
+  // Factory LUTs (#fac-lut) & Client LUTs (#cli-lut)
+  const lutOptions = (STATE.luts || []).map((l) => `<option value="${l}">${l.replace('.cube', '').replaceAll('_', ' ')}</option>`).join('');
+  const facLutSel = document.getElementById('fac-lut');
+  if (facLutSel) {
+    const prevLut = facLutSel.value;
+    facLutSel.innerHTML = `<option value="">🎞️ Automática do Preset / Cliente</option>${lutOptions}`;
+    if (prevLut && (STATE.luts || []).includes(prevLut)) {
+      facLutSel.value = prevLut;
+    }
+  }
+  const lutSel = document.getElementById('cli-lut');
+  const prevCliLut = lutSel.value;
+  lutSel.innerHTML = lutOptions;
+  if (prevCliLut && (STATE.luts || []).includes(prevCliLut)) {
+    lutSel.value = prevCliLut;
+  }
+
+  // Factory Music Selector (#fac-music-file)
+  const musicSel = document.getElementById('fac-music-file');
+  if (musicSel) {
+    const prevMusic = musicSel.value || 'auto';
+    const mp3Opts = (STATE.music || []).map((m) => `<option value="${m}">🎧 ${m.replace('.mp3', '').replaceAll('_', ' ')} (${m})</option>`).join('');
+    musicSel.innerHTML = `
+      <option value="auto">🎵 Automática do Preset / Clima do Tema</option>
+      <option value="flow_vault">🌊 Flow Music Vault (Trilha Exclusiva IA)</option>
+      <option value="none">🔇 Sem Trilha Musical (Voz + SFX)</option>
+      ${mp3Opts ? `<optgroup label="Biblioteca Local (assets/music)">${mp3Opts}</optgroup>` : ''}
+    `;
+    const validMusicValues = ['auto', 'flow_vault', 'none', ...(STATE.music || [])];
+    musicSel.value = validMusicValues.includes(prevMusic) ? prevMusic : 'auto';
+  }
+
+  // Factory Caption Styles (#fac-caption-style) synced from backend catalog when available
+  const capSel = document.getElementById('fac-caption-style');
+  if (capSel && Array.isArray(STATE.caption_styles) && STATE.caption_styles.length > 0) {
+    const prevCap = capSel.value || 'hormozi_neon';
+    capSel.innerHTML = STATE.caption_styles
+      .map((cs) => `<option value="${cs.id}">${cs.label || cs.name || cs.id}</option>`)
+      .join('');
+    if (STATE.caption_styles.some((cs) => cs.id === prevCap)) {
+      capSel.value = prevCap;
+    }
+  }
+
+  // Voice lists synced to selected voice engines (both Tab 1 Factory & Tab 3 Clients)
   syncVoiceListForEngine();
+  syncFactoryVoiceList();
 
   // Load first client into form if empty
   if (!document.getElementById('cli-id').value && STATE.clients.length > 0) {
     loadClientIntoForm(STATE.clients[0]);
   }
+
+  onFactoryPresetChange();
+  updateLibraryMixCount();
+  updateMusicVolLabel();
+  updateAdvancedSummaryPill();
+  updateRecipeSummary();
 }
 
 function syncVoiceListForEngine(preferredVoiceId = null) {
   const eng = document.getElementById('cli-voice-engine').value || 'edge';
   const vSel = document.getElementById('cli-voice-id');
   const prev = preferredVoiceId || vSel.value;
-  const edgeWithUs = [
-    ...(STATE.edge_voices || []),
-    { id: 'en-US-AndrewMultilingualNeural', name: 'Andrew Multilingual (EN-US • Vault Files Grave)' },
-    { id: 'es-MX-DaliaNeural', name: 'Dalia Neural (ES-MX • Espanhol Nativo)' },
-  ];
-  const list = eng === 'gemini_tts' ? (STATE.gemini_voices || []) : edgeWithUs;
+  const pools = getAllVoicePools();
+  const list = eng === 'gemini_tts' ? pools.gemini : (eng === 'kokoro' ? pools.kokoro : pools.edge);
   vSel.innerHTML = list.map((v) => `<option value="${v.id}">${v.name}</option>`).join('');
   if (prev && list.some((v) => v.id === prev)) {
     vSel.value = prev;
@@ -669,10 +1270,32 @@ document.getElementById('btn-manufacture').addEventListener('click', async () =>
       .map((s) => s.trim())
       .filter(Boolean);
 
-    const isDoc = STATE.activeStyle === 'netflix_doc';
-    const aspectRatio = isDoc
-      ? (document.getElementById('doc-aspect')?.value || '16:9')
-      : (document.getElementById('fac-aspect')?.value || '9:16');
+    const durSec = Math.max(10, Math.min(900, Math.round(Number(document.getElementById('fac-duration-s')?.value || 30))));
+    const aspectRatio = document.getElementById('fac-aspect-universal')?.value
+      || (STATE.activeStyle === 'netflix_doc'
+        ? (document.getElementById('doc-aspect')?.value || '16:9')
+        : (document.getElementById('fac-aspect')?.value || '9:16'));
+
+    const fpsVal = Number(document.getElementById('fac-fps-universal')?.value || document.getElementById('fac-fps')?.value || 30);
+    const voiceEngineRaw = document.getElementById('fac-voice-engine')?.value || 'auto';
+    const voiceIdRaw = document.getElementById('fac-voice-id')?.value || '';
+    const resolvedVoice = resolveEffectiveFactoryVoice();
+    const effectiveVoiceEngine = voiceEngineRaw === 'auto'
+      ? (voiceIdRaw ? resolvedVoice.voice_engine : 'auto')
+      : voiceEngineRaw;
+
+    const musicFile = document.getElementById('fac-music-file')?.value || 'auto';
+    const useFlowMusic = musicFile === 'flow_vault'
+      || (musicFile === 'auto' && Boolean(document.getElementById('opt-flow-music')?.checked));
+    const musicVol = Number(document.getElementById('fac-music-vol')?.value || 18) / 100;
+
+    const visualLibraries = getSelectedVisualLibraries();
+    const language = document.getElementById('fac-language')?.value || 'pt_br';
+    const presetVal = (document.getElementById('fac-preset')?.value || '').trim();
+    const lutVal = (document.getElementById('fac-lut')?.value || '').trim();
+    const captionStyle = document.getElementById('fac-caption-style')?.value || 'hormozi_neon';
+    const cutCadence = Number(document.getElementById('fac-cut-cadence')?.value || 3.5);
+    const customDirectives = (document.getElementById('fac-custom-directives')?.value || '').trim();
 
     const payload = {
       client_id: Number(document.getElementById('fac-client').value || 1),
@@ -680,14 +1303,16 @@ document.getElementById('btn-manufacture').addEventListener('click', async () =>
       engine_style: STATE.activeStyle,
       aspect_ratio: aspectRatio,
       cartoon_tone: document.getElementById('fac-tone')?.value || 'Comédia Nordestina/BR',
-      cartoon_fps: Number(document.getElementById('fac-fps')?.value || 60),
-      cartoon_voice_engine: document.getElementById('fac-cartoon-voice')?.value || 'gemini_tts',
+      cartoon_fps: fpsVal,
+      cartoon_voice_engine: (effectiveVoiceEngine === 'gemini_tts' || effectiveVoiceEngine === 'edge')
+        ? effectiveVoiceEngine
+        : (document.getElementById('fac-cartoon-voice')?.value || 'gemini_tts'),
       clone_languages: Boolean(document.getElementById('opt-clone-langs')?.checked),
       flow_mode: document.getElementById('fac-flow-mode')?.value || 'economico_pro',
       max_credits_cap: Number(document.getElementById('fac-flow-cap')?.value || 45),
-      use_flow_music: Boolean(document.getElementById('opt-flow-music')?.checked),
-      doc_lang: document.getElementById('doc-lang')?.value || 'pt_br',
-      target_minutes: Number(document.getElementById('doc-minutes')?.value || 0.5),
+      use_flow_music: useFlowMusic,
+      doc_lang: language === 'en_us' ? 'en_us' : (document.getElementById('doc-lang')?.value || 'pt_br'),
+      target_minutes: Number((durSec / 60).toFixed(2)),
       thumb_3words: (document.getElementById('doc-thumb-hook')?.value || '').trim() || null,
       auto_shorts_cascade: Boolean(document.getElementById('opt-ab')?.checked),
       topic: document.getElementById('fac-topic').value.trim(),
@@ -695,15 +1320,33 @@ document.getElementById('btn-manufacture').addEventListener('click', async () =>
       source_url: document.getElementById('fac-url').value.trim(),
       reference_mp4_path: document.getElementById('fac-ref-mp4-path').value.trim(),
       skill_id: document.getElementById('fac-skill').value,
-      motion_cards: document.getElementById('opt-motion').checked,
+      preset_id: presetVal || null,
+      lut_file: lutVal || null,
+      motion_cards: visualLibraries.length > 0
+        ? visualLibraries.includes('skia_graphics')
+        : Boolean(document.getElementById('opt-motion').checked),
       seamless_loop: document.getElementById('opt-loop').checked,
       dual_hook_ab: document.getElementById('opt-ab').checked,
+      // Full Estúdio de Criação Personalizada overrides
+      voice_engine: effectiveVoiceEngine,
+      voice_id: voiceIdRaw || null,
+      voice_rate: document.getElementById('fac-voice-rate')?.value || '+8%',
+      voice_pitch: document.getElementById('fac-voice-pitch')?.value || '+0Hz',
+      target_duration_s: durSec,
+      cut_cadence_s: cutCadence,
+      fps: fpsVal,
+      music_file: musicFile,
+      music_volume: Number(musicVol.toFixed(2)),
+      caption_style: captionStyle,
+      language: language,
+      visual_libraries: visualLibraries,
+      custom_directives: customDirectives,
     };
     const res = await api('/api/factory/manufacture', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
-    showToast(`🚀 ${res.count} vídeo(s) enviado(s) para a fábrica FrimeRise (${STATE.activeStyle})!`);
+    showToast(`🚀 ${res.count} vídeo(s) enviado(s) para a fábrica FrimeRise (${STATE.activeStyle} • ${aspectRatio} • ${durSec}s • ${visualLibraries.length} libs)!`);
     await refreshAll();
   } catch (e) {
     showToast(`Erro ao enfileirar: ${e.message}`, true);
@@ -814,9 +1457,16 @@ function renderVipJob(jobId) {
     document.getElementById('vip-cover-img').src = `/${job.cover_path}`;
   }
   const qr = job.quality_report || {};
+  const cc = qr.creative_config || {};
+  const ccMix = Array.isArray(cc.visual_libraries) && cc.visual_libraries.length
+    ? ` • 🧩 Mix: <span class="text-white font-semibold">${cc.visual_libraries.join(', ')}</span>`
+    : '';
+  const ccVoice = cc.voice_id
+    ? ` • 🎙️ <span class="text-frimepink font-semibold">${cc.voice_id}</span> (${cc.voice_rate || '+8%'})`
+    : '';
   document.getElementById('vip-job-meta').innerHTML = `
     <strong class="text-white block text-sm mb-1">${job.topic}</strong>
-    Motor: <span class="text-frimepink font-bold">${qr.engine_style || 'cinematic_broll'}</span> • Duração: <span class="text-frimelime font-bold">${job.duration_s}s</span> • Formato: <span class="text-frimelilac font-bold">${qr.aspect_ratio || '9:16'}</span> • Custo: <span class="text-frimegold font-bold">$${Number(job.cost_usd || 0).toFixed(5)}</span>
+    Motor: <span class="text-frimepink font-bold">${qr.engine_style || 'cinematic_broll'}</span> • Duração: <span class="text-frimelime font-bold">${job.duration_s}s</span> • Formato: <span class="text-frimelilac font-bold">${qr.aspect_ratio || '9:16'}</span> • Custo: <span class="text-frimegold font-bold">$${Number(job.cost_usd || 0).toFixed(5)}</span>${ccVoice}${ccMix}
   `;
 
   const ra = qr.retention_audit || {};
@@ -1197,6 +1847,11 @@ function renderFeedback() {
 }
 
 /* -------------------- Boot -------------------- */
+setFactoryDuration(30);
+updateLibraryMixCount();
+updateMusicVolLabel();
+updateAdvancedSummaryPill();
+updateRecipeSummary();
 refreshAll();
 pollTelemetry();
 setInterval(pollTelemetry, 4000);

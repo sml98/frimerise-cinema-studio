@@ -26,6 +26,11 @@ from engine.intel_vaapi import (
     nice_preexec,
     thermal_guard_wait,
 )
+from engine.kinetic_captions import (
+    CAPTION_STYLES,
+    draw_kinetic_captions,
+    resolve_caption_style,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FONTS_DIR = BASE_DIR / "assets" / "fonts"
@@ -240,6 +245,7 @@ class SkiaMotionCompositor:
         self.c_gold = hex_to_skia(preset.get("accent_gold", "#FFD166"))
         self.c_text = hex_to_skia(preset.get("text_color", "#FFFFFF"))
         self.c_stroke = skia.ColorSetARGB(255, 5, 3, 10)
+        self.caption_style = resolve_caption_style(preset.get("caption_style") or "hormozi_neon")
 
         self.surface = skia.Surface(self.w, self.h)
 
@@ -433,138 +439,34 @@ class SkiaMotionCompositor:
 
         canvas.restore()
 
-    def _draw_caption_chunk(self, canvas: skia.Canvas, chunk: Dict[str, Any], t: float) -> None:
-        """Hormozi / CapCut style floating captions:
-        - ZERO black backdrop bar behind the whole line
-        - 2-3 UPPERCASE words at 84px, StrokeWidth=12 + DropShadow
-        - Real inter-word space = measureText(' ') * 1.35 (NEVER glues words)
-        - Custom-fitted rounded pill ONLY on the actively spoken word (padding_x=28, padding_y=14)
-          rotating Verde Lima (#B8FF01), Rosa (#FF2E93), Dourado (#FFD166) with 1.12x pop.
-        """
-        words = chunk["words"]
-        if not words:
-            return
+    def _default_caption_y_ratio(self) -> float:
+        """Safe caption baseline ratio (0.76 on 9:16 Reels/TikTok to clear UI, 0.84 on 16:9)."""
+        return 0.84 if self.w > self.h else 0.76
 
-        base_size = 84.0
-        font = skia.Font(self.typeface, base_size)
-        emoji_font = skia.Font(self.emoji_typeface, base_size * 0.90) if self.emoji_typeface else font
-
-        # Real calculated space width between words (generous spacing so words & active pill NEVER touch)
-        space_w = max(30.0, float(font.measureText(" ")) * 1.45)
-        pad_x = 28.0
-        pad_y = 14.0
-
-        tokens = []
-        total_w = 0.0
-        for idx, w in enumerate(words):
-            raw = str(w["word"]).strip().upper()
-            if not raw:
-                continue
-            is_active = w["start"] <= t <= (w["end"] + 0.05)
-            age = t - w["start"] if is_active else -1.0
-            sc = _spring_pop_112(age) if is_active else 1.0
-            has_emoji = any(_is_emoji(ch) for ch in raw)
-            f_use = emoji_font if (has_emoji and len(raw) <= 2) else font
-            tw = float(f_use.measureText(raw))
-            # Reserve full expanded horizontal footprint for the popped active pill so neighbors NEVER overlap!
-            slot_w = (tw + pad_x * 2.0) * sc if is_active else tw
-            tokens.append(
-                {
-                    "text": raw,
-                    "w": tw,
-                    "slot_w": slot_w,
-                    "active": is_active,
-                    "scale": sc,
-                    "g_idx": int(w.get("g_idx", idx)),
-                    "font": f_use,
-                }
-            )
-            total_w += slot_w
-
-        if not tokens:
-            return
-        total_w += space_w * (len(tokens) - 1)
-
-        # Safe width check: keep at least 70px margin on left & right (max 940px)
-        line_scale = min(1.0, 920.0 / max(1.0, total_w))
-        cy = 1445.0
-
-        fm = font.getMetrics()
-        ascent = abs(float(fm.fAscent))
-        descent = abs(float(fm.fDescent))
-
-        canvas.save()
-        canvas.translate(self.w / 2.0, cy)
-        canvas.scale(line_scale, line_scale)
-
-        cursor_x = -total_w / 2.0
-
-        # Compute exact non-overlapping center X for each word slot
-        draw_order = [tok for tok in tokens if not tok["active"]] + [tok for tok in tokens if tok["active"]]
-        positions = {}
-        cx_iter = cursor_x
-        for tok in tokens:
-            positions[id(tok)] = cx_iter + tok["slot_w"] / 2.0
-            cx_iter += tok["slot_w"] + space_w
-
-        for tok in draw_order:
-            w_cx = positions[id(tok)]
-            canvas.save()
-            canvas.translate(w_cx, 0.0)
-
-            if tok["active"]:
-                canvas.scale(tok["scale"], tok["scale"])
-                pill_bg_hex, pill_txt_hex, (gr, gg, gb, ga) = ACTIVE_PILL_PALETTE[tok["g_idx"] % len(ACTIVE_PILL_PALETTE)]
-
-                # Tightly fitted rounded pill around ONLY this spoken word
-                pill_rect = skia.Rect.MakeXYWH(
-                    -tok["w"] / 2.0 - pad_x,
-                    -ascent - pad_y,
-                    tok["w"] + pad_x * 2.0,
-                    ascent + descent + pad_y * 2.0,
-                )
-                pill_paint = skia.Paint(AntiAlias=True, Color=hex_to_skia(pill_bg_hex))
-                pill_paint.setImageFilter(
-                    skia.ImageFilters.DropShadow(0, 6, 18, 18, skia.ColorSetARGB(ga, gr, gg, gb))
-                )
-                canvas.drawRoundRect(pill_rect, 22, 22, pill_paint)
-
-                # Crisp text inside active pill
-                txt_paint = skia.Paint(AntiAlias=True, Color=hex_to_skia(pill_txt_hex))
-                if pill_txt_hex == "#FFFFFF":
-                    # Add subtle dark outline for white text on pink pill
-                    st_p = skia.Paint(
-                        AntiAlias=True,
-                        Style=skia.Paint.kStroke_Style,
-                        StrokeWidth=5.0,
-                        StrokeJoin=skia.Paint.kRound_Join,
-                        StrokeCap=skia.Paint.kRound_Cap,
-                        Color=skia.ColorSetARGB(200, 11, 7, 19),
-                    )
-                    canvas.drawString(tok["text"], -tok["w"] / 2.0, 0.0, tok["font"], st_p)
-                canvas.drawString(tok["text"], -tok["w"] / 2.0, 0.0, tok["font"], txt_paint)
-            else:
-                # Floating white/gold bold word with thick black StrokeWidth=12 + DropShadow
-                shadow_p = skia.Paint(
-                    AntiAlias=True,
-                    Style=skia.Paint.kStroke_Style,
-                    StrokeWidth=12.0,
-                    StrokeJoin=skia.Paint.kRound_Join,
-                    StrokeCap=skia.Paint.kRound_Cap,
-                    Color=self.c_stroke,
-                )
-                shadow_p.setImageFilter(
-                    skia.ImageFilters.DropShadow(0, 8, 14, 14, skia.ColorSetARGB(220, 0, 0, 0))
-                )
-                canvas.drawString(tok["text"], -tok["w"] / 2.0, 0.0, tok["font"], shadow_p)
-
-                fill_color = self.c_gold if any(ch.isdigit() for ch in tok["text"]) else self.c_text
-                fill_p = skia.Paint(AntiAlias=True, Color=fill_color)
-                canvas.drawString(tok["text"], -tok["w"] / 2.0, 0.0, tok["font"], fill_p)
-
-            canvas.restore()
-
-        canvas.restore()
+    def _draw_caption_chunk(
+        self,
+        canvas: skia.Canvas,
+        chunk: Dict[str, Any],
+        t: float,
+        caption_style: Optional[str] = None,
+        y_ratio: Optional[float] = None,
+        font_size: Optional[float] = None,
+    ) -> None:
+        """Delegate caption rendering to the studio-grade Kinetic Caption Engine."""
+        eff_style = resolve_caption_style(caption_style if caption_style is not None else self.caption_style)
+        eff_y = self._default_caption_y_ratio() if y_ratio is None else float(y_ratio)
+        draw_kinetic_captions(
+            canvas=canvas,
+            chunks=[chunk],
+            t=t,
+            w=self.w,
+            h=self.h,
+            typeface=self.typeface,
+            style=eff_style,
+            y_ratio=eff_y,
+            font_size=font_size,
+            palette=ACTIVE_PILL_PALETTE,
+        )
 
     def render_frame_rgba(
         self,
@@ -573,6 +475,9 @@ class SkiaMotionCompositor:
         chunks: List[Dict[str, Any]],
         motion_cards: List[Dict[str, Any]],
         show_motion_cards: bool = True,
+        caption_style: Optional[str] = None,
+        y_ratio: Optional[float] = None,
+        font_size: Optional[float] = None,
     ) -> bytes:
         canvas = self.surface.getCanvas()
         canvas.clear(skia.Color4f(0, 0, 0, 0))
@@ -583,10 +488,21 @@ class SkiaMotionCompositor:
             for card in motion_cards:
                 self._draw_motion_card(canvas, card, t)
 
-        for ch in chunks:
-            if ch["start"] <= t <= ch["end"]:
-                self._draw_caption_chunk(canvas, ch, t)
-                break
+        eff_style = resolve_caption_style(caption_style if caption_style is not None else self.caption_style)
+        if eff_style != "none" and chunks:
+            eff_y = self._default_caption_y_ratio() if y_ratio is None else float(y_ratio)
+            draw_kinetic_captions(
+                canvas=canvas,
+                chunks=chunks,
+                t=t,
+                w=self.w,
+                h=self.h,
+                typeface=self.typeface,
+                style=eff_style,
+                y_ratio=eff_y,
+                font_size=font_size,
+                palette=ACTIVE_PILL_PALETTE,
+            )
 
         return self.surface.makeImageSnapshot().tobytes()
 
@@ -601,13 +517,18 @@ class SkiaMotionCompositor:
         fps: int = 30,
         show_motion_cards: bool = True,
         thermal_limit_c: float = 85.0,
+        caption_style: Optional[str] = None,
+        y_ratio: Optional[float] = None,
+        font_size: Optional[float] = None,
     ) -> Path:
         """Stream RGBA Skia frames via stdin pipe directly into FFmpeg + Intel QuickSync VAAPI.
         Applies subtle depth-of-field boxblur on background video ONLY during the 2.5s-3.5s
-        windows when a Motion Card is displayed.
+        windows when a Motion Card is displayed, and renders studio-grade kinetic captions
+        via `engine.kinetic_captions.draw_kinetic_captions`.
         """
         thermal_guard_wait(limit_c=thermal_limit_c)
-        chunks = group_words_into_chunks(words, max_words=3)
+        eff_style = resolve_caption_style(caption_style if caption_style is not None else self.caption_style)
+        chunks = group_words_into_chunks(words, max_words=3) if eff_style != "none" else []
         total_frames = max(1, int(math.ceil(duration_s * fps)))
 
         pre_args, enc_args, hw_suffix = build_video_encode_args(qp=19)
@@ -684,6 +605,9 @@ class SkiaMotionCompositor:
                     chunks=chunks,
                     motion_cards=motion_cards,
                     show_motion_cards=show_motion_cards,
+                    caption_style=eff_style,
+                    y_ratio=y_ratio,
+                    font_size=font_size,
                 )
                 proc.stdin.write(raw)
         except BrokenPipeError:
@@ -699,6 +623,37 @@ class SkiaMotionCompositor:
         if proc.returncode != 0:
             raise RuntimeError(f"Skia/FFmpeg composite failed: {stderr.decode(errors='ignore')}")
         return output_mp4
+
+    def composite_video(
+        self,
+        bg_video: Path,
+        audio_m4a: Path,
+        output_mp4: Path,
+        duration_s: float,
+        words: List[Dict[str, Any]],
+        motion_cards: List[Dict[str, Any]],
+        fps: int = 30,
+        show_motion_cards: bool = True,
+        thermal_limit_c: float = 85.0,
+        caption_style: str = "hormozi_neon",
+        y_ratio: Optional[float] = None,
+        font_size: Optional[float] = None,
+    ) -> Path:
+        """Alias for `composite_onto_video` exposing `caption_style='hormozi_neon'` directly."""
+        return self.composite_onto_video(
+            bg_video=bg_video,
+            audio_m4a=audio_m4a,
+            output_mp4=output_mp4,
+            duration_s=duration_s,
+            words=words,
+            motion_cards=motion_cards,
+            fps=fps,
+            show_motion_cards=show_motion_cards,
+            thermal_limit_c=thermal_limit_c,
+            caption_style=caption_style,
+            y_ratio=y_ratio,
+            font_size=font_size,
+        )
 
 
 def render_cover_9x16(

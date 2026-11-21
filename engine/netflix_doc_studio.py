@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import os
 import re
@@ -35,11 +36,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import edge_tts
+import httpx
 from pydantic import BaseModel, Field
 import skia
 
-from agents.llm_router import _extract_json, get_settings, record_token_usage
-from agents.retention_doctor import audit_viral_script_dict
+from agents.llm_router import _extract_json
+from agents.retention_doctor import OPEN_LOOP_MARKERS_RE, audit_netflix_doc_plan
+from database import get_settings, record_token_usage
 from engine.audio_dsp import (
     _estimate_word_timestamps,
     _get_wav_duration,
@@ -50,6 +53,7 @@ from engine.audio_dsp import (
 from engine.doc_media_engine import (
     VideoLayerReader,
     fetch_doc_broll_clip,
+    fetch_doc_hero_or_archival_photo,
     fetch_doc_real_photo,
     load_skia_image_cover,
     separate_photo_25d_u2netp,
@@ -70,6 +74,18 @@ from engine.skia_compositor import (
     group_words_into_chunks,
     hex_to_skia,
 )
+
+try:
+    from engine.kinetic_captions import draw_kinetic_captions, resolve_caption_style
+except Exception:
+    draw_kinetic_captions = None  # type: ignore
+    resolve_caption_style = None  # type: ignore
+
+try:
+    from engine.pro_sfx_studio import ensure_pro_cinema_sfx, select_music_for_mood
+except Exception:
+    ensure_pro_cinema_sfx = None  # type: ignore
+    select_music_for_mood = None  # type: ignore
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ASSETS_DIR = BASE_DIR / "assets"
@@ -128,6 +144,30 @@ _ARROW_AND_GLYPH_MAP: Dict[str, str] = {
 }
 
 
+DocMoodType = Literal[
+    "dark_horror",
+    "investigative_crime",
+    "epic_history",
+    "corporate_thriller",
+]
+
+VALID_DOC_MOODS: Tuple[str, ...] = (
+    "dark_horror",
+    "investigative_crime",
+    "epic_history",
+    "corporate_thriller",
+)
+
+CINEMA_XFADE_DURATION_S: float = 0.35
+CINEMA_XFADE_POOL: Tuple[str, ...] = (
+    "fadeblack",
+    "smoothleft",
+    "zoomin",
+    "dissolve",
+    "wiperight",
+)
+
+
 def _ease_out_back(x: float) -> float:
     """Snappy cinematic overshoot spring easing for PiP monitor & Polaroid entrances."""
     t = max(0.0, min(1.0, float(x)))
@@ -136,7 +176,11 @@ def _ease_out_back(x: float) -> float:
     return 1.0 + c3 * ((t - 1.0) ** 3) + c1 * ((t - 1.0) ** 2)
 
 
-def _sanitize_glyphs(text: str, typeface: Optional[skia.Typeface] = None) -> str:
+def _sanitize_glyphs(
+    text: str,
+    typeface: Optional[skia.Typeface] = None,
+    preserve_spacing: bool = False,
+) -> str:
     """Replace unsupported Unicode arrows/bullets with clean ASCII/verified glyphs so Skia NEVER renders a '[]' box."""
     s = str(text or "")
     for bad_ch, repl in _ARROW_AND_GLYPH_MAP.items():
@@ -154,20 +198,22 @@ def _sanitize_glyphs(text: str, typeface: Optional[skia.Typeface] = None) -> str
             else:
                 out_chars.append(" ")
         s = "".join(out_chars)
+    if preserve_spacing:
+        return s.strip()
     return " ".join(s.split())
 
 
 def _spaced_chapter_label(roman: str, lang: str = "pt_br") -> str:
-    """Return wide letter-spaced cinema chapter title, always including C A P Í T U L O."""
+    """Return wide letter-spaced cinema chapter title with generous gap before the Roman numeral."""
     r_spaced = " ".join(list(roman.strip()))
     if lang == "en_us":
-        return f"C A P Í T U L O   {r_spaced}   •   C H A P T E R   {r_spaced}"
-    return f"C A P Í T U L O   {r_spaced}"
+        return f"C A P Í T U L O     {r_spaced}   •   C H A P T E R     {r_spaced}"
+    return f"C A P Í T U L O     {r_spaced}"
 
 
-def _clean_doc_text(text: str) -> str:
+def _clean_doc_text(text: str, preserve_spacing: bool = False) -> str:
     cleaned = FORBIDDEN_DEBUG_RE.sub("", str(text or "")).strip()
-    return _sanitize_glyphs(cleaned)
+    return _sanitize_glyphs(cleaned, preserve_spacing=preserve_spacing)
 
 
 def _draw_safe_string(
@@ -177,9 +223,10 @@ def _draw_safe_string(
     y: float,
     font: skia.Font,
     paint: skia.Paint,
+    preserve_spacing: bool = False,
 ) -> None:
     """Draw a string after verifying every character has a real glyph in the active typeface."""
-    safe_txt = _sanitize_glyphs(text, typeface=font.getTypeface())
+    safe_txt = _sanitize_glyphs(text, typeface=font.getTypeface(), preserve_spacing=preserve_spacing)
     if safe_txt:
         canvas.drawString(safe_txt, x, y, font, paint)
 
@@ -206,22 +253,26 @@ class NetflixDocScene(BaseModel):
     chapter_card: Optional[str] = None
     chapter_subtitle: Optional[str] = None
     visual_mode: VisualModeType = "broll_video_pip"
+    mood: str = "corporate_thriller"
     narration: str
     lower_third_title: str
     lower_third_subtitle: str
     highlight_color: str = "#FFD166"
-    evidence_headline: str = "CLASSIFIED FINANCIAL AUDIT REPORT"
-    evidence_quote: str = "Internal ledgers revealed concealed multi-million transfers across offshore accounts."
-    map_origin: str = "LONDON"
-    map_destination: str = "SINGAPORE"
-    map_metric: str = "$1.4 BILLION EXPOSURE"
+    evidence_headline: str = "ARCHIVAL DOCUMENTARY RECORD"
+    evidence_quote: str = "Historical records and archival testimonies reveal the hidden story behind these events."
+    map_origin: str = "ORIGEM"
+    map_destination: str = "DESTINO"
+    map_metric: str = "ARQUIVO HISTÓRICO"
     timeline_points: List[TimelinePoint] = Field(default_factory=list)
     board_nodes: List[BoardNode] = Field(default_factory=list)
-    image_prompt_en: str = "cinematic dark archival investigative financial trading floor photograph"
-    broll_query_en: str = "london financial district skyline night"
-    pip_broll_query_en: str = "stock market trading monitors"
-    photo_query_en: str = "historic bank building london"
+    image_prompt_en: str = "cinematic dark archival documentary still photograph"
+    bespoke_image_prompt_en: str = ""
+    prefer_gemini_photo: bool = False
+    broll_query_en: str = "dark atmospheric night documentary"
+    pip_broll_query_en: str = "historic architecture night fog"
+    photo_query_en: str = "historic archive candle dark"
     extra_photo_queries_en: List[str] = Field(default_factory=list)
+    transition_type: Optional[str] = None
 
 
 # Backwards/shorthand alias
@@ -232,14 +283,20 @@ class NetflixDocPlan(BaseModel):
     title: str
     subtitle: str
     channel_name: str = "Dossiê Capital"
+    mood: str = "corporate_thriller"
     lang: str = "pt_br"
     aspect_ratio: Literal["16:9", "9:16"] = "16:9"
     target_minutes: float = 0.5
     lut_file: str = "02_dark_wealth.cube"
     voice_id: str = "pt-BR-AntonioNeural"
-    thumbnail_hook: str = "ESCONDEU $1.4 BILHÃO"
+    caption_style: str = "cinema_minimal"
+    thumbnail_hook: str = "A VERDADE OCULTA"
+    topic_source: str = "curated"
+    tokens_used: int = 0
+    cost_usd: float = 0.0
     scenes: List[NetflixDocScene]
-    hashtags: List[str] = Field(default_factory=lambda: ["#documentario", "#investigacao", "#financas", "#cinema"])
+    hashtags: List[str] = Field(default_factory=lambda: ["#documentario", "#historia", "#investigacao", "#cinema"])
+    retention_audit: Dict[str, Any] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +304,7 @@ class NetflixDocPlan(BaseModel):
 # ---------------------------------------------------------------------------
 _CURATED_DOSSIERS: List[Dict[str, Any]] = [
     {
-        "keywords": ("leeson", "barings", "88888", "rainha", "singapura"),
+        "keywords": ("leeson", "barings", "88888", "banco da rainha", "queen's oldest bank"),
         "title_pt": "Nick Leeson: O Operador que Quebrou o Banco da Rainha",
         "title_en": "Nick Leeson: The Rogue Trader Who Collapsed Barings Bank",
         "sub_pt": "Dossiê Forense • Conta Secreta #88888",
@@ -313,7 +370,7 @@ _CURATED_DOSSIERS: List[Dict[str, Any]] = [
         ],
     },
     {
-        "keywords": ("luxottica", "óculos", "oculos", "monopólio", "monopolio", "ray-ban", "oakley"),
+        "keywords": ("luxottica", "essilorluxottica", "óculos de luxo", "oculos de luxo", "império secreto dos óculos", "eyewear illusion", "eyewear monopoly", "ray-ban", "oakley"),
         "title_pt": "A Ilusão da Escolha: O Império Secreto dos Óculos",
         "title_en": "The Illusion of Choice: Inside the Eyewear Monopoly",
         "sub_pt": "Dossiê Antitruste • Margem de 2.000%",
@@ -378,7 +435,7 @@ _CURATED_DOSSIERS: List[Dict[str, Any]] = [
         ],
     },
     {
-        "keywords": ("theranos", "holmes", "elizabeth", "sangue", "edison", "caixa vazia"),
+        "keywords": ("theranos", "elizabeth holmes", "projeto edison", "sangue falso da theranos", "blood-testing mirage"),
         "title_pt": "Theranos: A Fraude de US$ 9 Bilhões dentro de uma Caixa Vazia",
         "title_en": "Theranos: The $9 Billion Silicon Valley Blood Mirage",
         "sub_pt": "Dossiê Vale do Silício • Projeto Edison",
@@ -443,7 +500,7 @@ _CURATED_DOSSIERS: List[Dict[str, Any]] = [
         ],
     },
     {
-        "keywords": ("evaldas", "rimasauskas", "boleto", "fatura", "quanta", "google", "facebook"),
+        "keywords": ("evaldas", "rimasauskas", "boletos falsos", "fake invoices", "operação quanta"),
         "title_pt": "O Homem que Enviou Boletos Falsos para o Vale do Silício — E Eles Pagaram",
         "title_en": "The Man Who Emailed Fake Invoices to Big Tech — And They Paid $122M",
         "sub_pt": "Dossiê Crimes Cibernéticos • Operação Quanta",
@@ -508,7 +565,7 @@ _CURATED_DOSSIERS: List[Dict[str, Any]] = [
         ],
     },
     {
-        "keywords": ("camarão", "camarao", "red lobster", "infinito", "endless shrimp"),
+        "keywords": ("camarão infinito", "camarao infinito", "red lobster", "endless shrimp"),
         "title_pt": "O Dia em que o Camarão Infinito de US$ 20 Afundou uma Rede Bilionária",
         "title_en": "How $20 Endless Shrimp Sank a Billion-Dollar Restaurant Empire",
         "sub_pt": "Dossiê Corporativo • Colapso Red Lobster",
@@ -573,7 +630,7 @@ _CURATED_DOSSIERS: List[Dict[str, Any]] = [
         ],
     },
     {
-        "keywords": ("adidas", "puma", "irmãos", "irmaos", "dassler", "herzogenaurach"),
+        "keywords": ("adidas", "puma", "dassler", "herzogenaurach"),
         "title_pt": "A Cidade Dividida ao Meio: A Guerra Secreta entre os Irmãos Adidas e Puma",
         "title_en": "Blood Rivals: How Two Feuding Brothers Split a Town into Adidas and Puma",
         "sub_pt": "Dossiê Histórico • Herzogenaurach, 1948",
@@ -638,7 +695,7 @@ _CURATED_DOSSIERS: List[Dict[str, Any]] = [
         ],
     },
     {
-        "keywords": ("pepsi", "caça", "caca", "harrier", "jato", "7.000.000", "leonard"),
+        "keywords": ("pepsi", "harrier", "john leonard", "7 milhões de pontos", "7 million pepsi"),
         "title_pt": "O Estudante que Juntou 7 Milhões de Pontos e Exigiu o Caça Militar da Pepsi",
         "title_en": "The College Student Who Bought 7 Million Pepsi Points to Claim a Fighter Jet",
         "sub_pt": "Dossiê Jurídico • Leonard v. Pepsico (1996)",
@@ -703,7 +760,7 @@ _CURATED_DOSSIERS: List[Dict[str, Any]] = [
         ],
     },
     {
-        "keywords": ("wirecard", "marsalek", "fantasma", "2b", "2 bilhões", "alemanha", "dax"),
+        "keywords": ("wirecard", "marsalek", "dinheiro fantasma", "2 bilhões fantasmas", "ghost fortune"),
         "title_pt": "Wirecard: Os US$ 2 Bilhões Fantasmas que Enganaram a Europa Inteira",
         "title_en": "Wirecard: The $2 Billion Ghost Fortune That Fooled Europe",
         "sub_pt": "Dossiê Frankfurt & Manila • O Dinheiro Que Nunca Existiu",
@@ -768,7 +825,7 @@ _CURATED_DOSSIERS: List[Dict[str, Any]] = [
         ],
     },
     {
-        "keywords": ("forest city", "cidade fantasma", "100b", "100 bilhões", "malásia", "vazia", "98%"),
+        "keywords": ("forest city", "estreito de johor", "metrópole futurista de us$ 100", "futuristic mega-city", "ghost archipelago"),
         "title_pt": "Forest City: A Metrópole Futurista de US$ 100 Bilhões que Está 98% Vazia",
         "title_en": "Forest City: Inside the $100 Billion Futuristic Megacity Sitting 98% Empty",
         "sub_pt": "Dossiê Megaprojetos • Estreito de Johor",
@@ -833,7 +890,7 @@ _CURATED_DOSSIERS: List[Dict[str, Any]] = [
         ],
     },
     {
-        "keywords": ("pudim", "pudins", "pudding", "12.150", "milhas", "phillips", "engenheiro"),
+        "keywords": ("12.150", "12,150", "david phillips", "pudim", "pudins", "pudding", "milhas aéreas infinitas", "milhas aéreas vitalícias"),
         "title_pt": "O Engenheiro que Comprou 12.150 Pudins de US$ 0,25 e Ganhou Milhas Aéreas Vitalícias",
         "title_en": "The Engineer Who Bought 12,150 Cups of 25-Cent Pudding for Lifetime Frequent-Flyer Miles",
         "sub_pt": "Dossiê Arbitragem • A Brecha de 1,25 Milhão de Milhas",
@@ -900,82 +957,665 @@ _CURATED_DOSSIERS: List[Dict[str, Any]] = [
 ]
 
 
-def _build_universal_dossier(topic: str, lang: str = "pt_br") -> Dict[str, Any]:
-    """Match one of the 10 signature investigative dossiers or synthesize a tailored dossier for any topic."""
-    t_low = topic.lower()
-    for d in _CURATED_DOSSIERS:
-        if any(k in t_low for k in d["keywords"]):
-            return d
+_DARK_HORROR_TOPIC_RE = re.compile(
+    r"("
+    r"macabr|terror|horror|sombri|assustador|maldi[cç]|dem[oô]ni|krampus|saturn[aá]lia|"
+    r"brux|witch|fantasm|ghost|ocult|ritual|pag[aã]o|pagan|vampir|dr[aá]cula|exorcis|"
+    r"monstr|pesadelo|cemit[eé]ri|catacumb|creepy|haunted|folclore|folklore|lenda|"
+    r"sinistr|assombra|sobrenatural|infern|bizarro|satan|natal\s+macabr|lado\s+sombri|"
+    r"dark\s+history|dark\s+secret|macabre|cursed|scary|disturbing|nightmare|grim"
+    r")",
+    re.IGNORECASE,
+)
 
-    clean_t = _clean_doc_text(topic) or ("O Império Oculto do Capital" if lang == "pt_br" else "The Hidden Empire of Capital")
-    short_upper = clean_t.upper()[:26]
-    # Extract clean English/ASCII keywords from custom topic to blend with high-yield documentary queries
-    ascii_words = [w for w in re.findall(r"[a-zA-Z]{4,}", topic) if w.lower() not in {"como", "para", "sobre", "historia", "caso", "dossie"}]
-    topic_hint = " ".join(ascii_words[:3]) if ascii_words else "financial district"
-    return {
-        "keywords": (),
-        "title_pt": f"Dossiê Confidencial: {clean_t}",
-        "title_en": f"Classified File: {clean_t}",
-        "sub_pt": "Investigação Forense • Arquivos do Capital",
-        "sub_en": "Forensic Investigation • The Capital Vault",
-        "hook_pt": "O SEGREDO OCULTO",
-        "hook_en": "THE HIDDEN TRUTH",
-        "origin": "ZURIQUE",
-        "dest": "NOVA YORK",
-        "metric_pt": "US$ 2.4 BILHÕES RASTREADOS",
-        "metric_en": "$2.4 BILLION TRACED",
-        "headline": f"FORENSIC AUDIT UNCOVERS HIDDEN LEDGERS BEHIND {short_upper}",
-        "quote_pt": f"Registros confidenciais revelaram como a operação por trás de {clean_t} movimentou bilhões fora do radar público.",
-        "quote_en": f"Declassified ledgers exposed how the architecture behind {clean_t} moved billions beneath public scrutiny.",
-        "broll_queries": [
-            f"{topic_hint} city skyline night",
-            "stock market trading monitors",
-            "london financial district skyline night",
-            "corporate boardroom executives",
-            "bank vault money bills",
-            "singapore skyline night aerial",
+_CRIME_TOPIC_RE = re.compile(
+    r"("
+    r"crime|assassin|serial\s+killer|mist[eé]ri|desaparec|sequestr|fbi|pol[ií]ci|"
+    r"detetive|caso\s+real|true\s+crime|conspira[cç]|m[aá]fia|cartel|espionag|"
+    r"murder|unsolved|mystery|heist|roubo|pris[aã]o|fuga|enigma|homic[ií]di|"
+    r"investiga[cç][aã]o\s+criminal|cold\s+case"
+    r")",
+    re.IGNORECASE,
+)
+
+_CORPORATE_TOPIC_RE = re.compile(
+    r"("
+    r"banco|bank|bilh[oõ]es|billion|milh[oõ]es|million|bolsa|stock|fraude|fraud|"
+    r"monop[oó]li|empresa|startup|corporate|finan[cç]|wall\s+street|cripto|crypto|"
+    r"bitcoin|im[oó]veis|dinheiro|money|capital|mercado|a[cç][oõ]es|fal[eê]ncia|"
+    r"investidor|ceo|economia|imposto|offshore|esquema|pir[aâ]mide|golpe\s+financeiro"
+    r")",
+    re.IGNORECASE,
+)
+
+_HISTORY_TOPIC_RE = re.compile(
+    r"("
+    r"hist[oó]ri|imp[eé]ri|roma|egit|gr[eé]ci|guerra|medieval|s[eé]culo|antiguid|"
+    r"civiliza[cç]|batalha|fara[oó]|viking|samurai|revolu[cç]|descobert|ci[eê]nci|"
+    r"espa[cç]o|universo|biografi|inventor|rei|rainha|imperador|mitologia|natal|"
+    r"history|ancient|empire|war|biography|science|origin|origens|origem"
+    r")",
+    re.IGNORECASE,
+)
+
+_FORBIDDEN_FINANCE_LEFTOVERS_RE = re.compile(
+    r"\b(barings|leeson|88888|singapura|singapore|zurique|zurich|londres\s*[•\-]\s*singapura|"
+    r"conta\s+secreta|holding\s+offshore|auditoria\s+forense|stock\s+market\s+trading|"
+    r"historic\s+bank\s+building\s+london|london\s+financial\s+district)\b",
+    re.IGNORECASE,
+)
+
+_OPEN_TOPIC_FALLBACK_MEDIA: Dict[str, Dict[str, List[str]]] = {
+    "dark_horror": {
+        "broll": [
+            "snow forest night",
+            "candle flame dark",
+            "medieval castle fog",
+            "gothic cathedral dark",
+            "fireplace burning dark",
+            "winter snow village",
         ],
-        "pip_queries": [
+        "pip": [
+            "candle flame dark",
+            "fireplace burning dark",
+            "snow forest night",
+            "gothic cathedral dark",
+            "medieval castle fog",
+        ],
+        "photos": [
+            "dark snowy pine forest winter night",
+            "burning candle dark shadow",
+            "gothic cathedral candle",
+            "medieval european village snow night",
+            "old parchment leather book candle",
+            "foggy medieval castle night",
+        ],
+    },
+    "investigative_crime": {
+        "broll": [
+            "rainy city street night",
+            "dark alley fog night",
+            "police lights night",
+            "courthouse building architecture",
+            "old library archive dark",
+            "newspaper printing press",
+        ],
+        "pip": [
+            "newspaper printing press",
+            "police lights night",
+            "old library archive dark",
+            "rainy city street night",
+            "courthouse building architecture",
+        ],
+        "photos": [
+            "rainy city street night noir",
+            "historic courthouse building",
+            "old archive files library",
+            "dark foggy alley night",
+            "vintage detective desk lamp",
+            "newspaper archive vintage",
+        ],
+    },
+    "epic_history": {
+        "broll": [
+            "ancient roman ruins",
+            "medieval castle fog",
+            "gothic cathedral dark",
+            "candle flame dark",
+            "historic european village",
+            "old book library candle",
+        ],
+        "pip": [
+            "candle flame dark",
+            "ancient roman ruins",
+            "old book library candle",
+            "gothic cathedral dark",
+            "medieval castle fog",
+        ],
+        "photos": [
+            "ancient roman ruins colosseum",
+            "medieval stone castle europe",
+            "gothic cathedral interior candle",
+            "old parchment manuscript book",
+            "ancient marble statue museum",
+            "historic european architecture",
+        ],
+    },
+    "corporate_thriller": {
+        "broll": [
+            "city skyline night aerial",
+            "stock market trading screen",
+            "modern skyscraper architecture",
+            "corporate boardroom executives",
+            "money bills dark finance",
+            "newspaper printing press",
+        ],
+        "pip": [
             "stock market trading monitors",
             "newspaper printing press",
             "bank vault money bills",
             "modern skyscraper architecture",
             "corporate boardroom executives",
         ],
-        "photo_queries": [
-            "london financial district skyline",
+        "photos": [
+            "modern skyscraper architecture night",
             "stock market trading floor",
-            "historic bank building architecture",
-            "businessman suit office portrait",
             "corporate boardroom office",
+            "historic bank building architecture",
             "money bills finance dark",
+            "businessman suit office portrait",
         ],
-        "timeline": [
-            {"date": "FASE I", "label": "Operação Silenciosa", "value": "US$ 18M"},
-            {"date": "FASE II", "label": "Expansão Offshore", "value": "US$ 340M"},
-            {"date": "FASE III", "label": "Pico de Alavancagem", "value": "US$ 2.4B"},
-            {"date": "DESFECHO", "label": "Auditoria & Revelação", "value": "EXPOSTO"},
-        ],
-        "nodes": [
-            {"id": "n1", "title": short_upper[:18], "role": "Operação Central", "badge": "ALVO #1"},
-            {"id": "n2", "title": "HOLDING OFFSHORE", "role": "Blindagem Financeira", "badge": "CAIXA PRETA"},
-            {"id": "n3", "title": "AUDITORIA FORENSE", "role": "Rastreamento Global", "badge": "US$ 2.4 BILHÕES"},
-            {"id": "n4", "title": "IMPACTO DE MERCADO", "role": "Colapso do Esquema", "badge": "REVELADO"},
-        ],
-        "narr_pt": [
-            f"Nos bastidores de {clean_t}, um único detalhe escondido nos relatórios oficiais mudou o destino de bilhões de dólares sem que o público percebesse.",
-            f"Documentos de arquivo mostram que a engrenagem central de {clean_t} começou com uma brecha silenciosa que parecia impossível de rastrear.",
-            "À medida que o capital cruzava fronteiras entre centros financeiros internacionais, cada transferência era camuflada em dezenas de contas intermediárias.",
-            "Quando a linha do tempo completa veio à tona na auditoria forense, os números reais superavam em dez vezes qualquer estimativa oficial.",
-            f"O caso de {clean_t} provou para sempre que no topo do mercado global nenhum segredo bilionário permanece enterrado para sempre.",
-        ],
-        "narr_en": [
-            f"Behind the scenes of {clean_t}, a single anomaly buried inside official filings shifted billions of dollars before the public ever noticed.",
-            f"Archival records reveal that the core mechanism driving {clean_t} began with a quiet loophole designed to stay invisible.",
-            "As capital moved across international financial hubs, every wire was routed through layers of interconnected shell entities.",
-            "When the complete chronological trail was reconstructed by forensic auditors, the real figures exceeded official estimates tenfold.",
-            f"Ultimately, the story of {clean_t} proved that in high-stakes finance, no billion-dollar secret stays buried forever.",
-        ],
+    },
+}
+
+
+def _classify_topic_mood(topic: str) -> str:
+    """Classify any arbitrary documentary topic into one of the 4 cinema moods."""
+    t = str(topic or "")
+    if _DARK_HORROR_TOPIC_RE.search(t):
+        return "dark_horror"
+    if _CRIME_TOPIC_RE.search(t):
+        return "investigative_crime"
+    if _CORPORATE_TOPIC_RE.search(t) and not _HISTORY_TOPIC_RE.search(t):
+        return "corporate_thriller"
+    if _HISTORY_TOPIC_RE.search(t):
+        return "epic_history"
+    if _CORPORATE_TOPIC_RE.search(t):
+        return "corporate_thriller"
+    return "epic_history"
+
+
+def _normalize_mood(raw_mood: Optional[str], topic: str) -> str:
+    m = str(raw_mood or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if m in VALID_DOC_MOODS:
+        # If topic clearly screams dark_horror (e.g. macabra/terror/krampus), never let LLM downgrade it to corporate_thriller
+        if _DARK_HORROR_TOPIC_RE.search(topic) and m == "corporate_thriller":
+            return "dark_horror"
+        return m
+    if any(k in m for k in ("horror", "dark", "macabr", "terror", "gothic", "folklore")):
+        return "dark_horror"
+    if any(k in m for k in ("crime", "mystery", "detective", "forensic", "thriller_crime")):
+        return "investigative_crime"
+    if any(k in m for k in ("history", "historic", "epic", "ancient", "bio", "science")):
+        return "epic_history"
+    return _classify_topic_mood(topic)
+
+
+def _extract_clean_json(raw: str) -> Dict[str, Any]:
+    """Parse JSON safely, stripping DeepSeek special tokens (<|...|>) and markdown code fences."""
+    cleaned = re.sub(r"<\|[^|>]*\|>", "", str(raw or "")).strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    parsed = _extract_json(cleaned)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _match_curated_dossier(topic: str) -> Optional[Dict[str, Any]]:
+    """Return one of the 10 curated financial dossiers ONLY when the topic clearly matches it."""
+    t_low = str(topic or "").lower()
+    for d in _CURATED_DOSSIERS:
+        if any(k in t_low for k in d["keywords"]):
+            return d
+    return None
+
+
+def _default_channel_for_mood(mood: str, is_en: bool) -> str:
+    if mood == "dark_horror":
+        return "Dark Vault Files" if is_en else "Arquivos Sombrios"
+    if mood == "investigative_crime":
+        return "Forensic Case Files" if is_en else "Dossiê Investigativo"
+    if mood == "epic_history":
+        return "Hidden Chronicles" if is_en else "Crônicas Ocultas"
+    return "Vault Files" if is_en else "Dossiê Capital"
+
+
+def _default_chapter_subtitles_for_mood(mood: str, is_en: bool) -> List[str]:
+    if mood == "dark_horror":
+        return (
+            ["FORBIDDEN ORIGINS", "THE WINTER SHADOW", "BURIED IN HISTORY", "THE MASK REMAINS"]
+            if is_en
+            else ["AS ORIGENS PROIBIDAS", "A SOMBRA NO INVERNO", "O PASSADO APAGADO", "A MÁSCARA MODERNA"]
+        )
+    if mood == "investigative_crime":
+        return (
+            ["THE FIRST CLUE", "THE HIDDEN TRAIL", "THE BREAKING POINT", "THE FINAL TRUTH"]
+            if is_en
+            else ["A PRIMEIRA PISTA", "A ROTA OCULTA", "O PONTO DE RUPTURA", "A VERDADE REVELADA"]
+        )
+    if mood == "epic_history":
+        return (
+            ["THE ANCIENT DAWN", "THE HIDDEN TURNING POINT", "THE ERA OF SHADOWS", "THE LASTING LEGACY"]
+            if is_en
+            else ["A ORIGEM ANTIGA", "A VIRADA ESQUECIDA", "A ERA DAS SOMBRAS", "O LEGADO OCULTO"]
+        )
+    return (
+        ["THE HIDDEN ANOMALY", "THE OFFSHORE MONEY TRAIL", "THE BREAKING POINT", "THE FINAL COLLAPSE"]
+        if is_en
+        else ["A ANOMALIA NOS ARQUIVOS", "A ROTA DO CAPITAL OCULTO", "O PONTO DE RUPTURA", "O COLAPSO DO IMPÉRIO"]
+    )
+
+
+def _select_transition_for_scene(s_idx: int, visual_mode: str, has_chapter: bool) -> str:
+    """Choose a Hollywood cinema xfade transition matching the editorial rhythm of the cut."""
+    if has_chapter:
+        return "fadeblack"
+    mode_map = {
+        "newspaper_highlighter": "smoothleft",
+        "dark_map_route": "dissolve",
+        "parallax_25d_photo": "zoomin",
+        "red_string_board": "wiperight",
+        "sliding_timeline": "smoothleft",
+        "video_pip_evidence": "dissolve",
+        "broll_video_pip": "fadeblack",
+    }
+    return mode_map.get(visual_mode, CINEMA_XFADE_POOL[s_idx % len(CINEMA_XFADE_POOL)])
+
+
+def _ensure_topic_open_loops(
+    scenes: List[NetflixDocScene],
+    mood: str,
+    clean_lang: str,
+) -> None:
+    """Ensure gripping topic-authentic open-loop questions exist every ~14s BEFORE Retention Doctor
+    runs, so Retention Doctor audits clichés cleanly without ever injecting financial bridges into
+    horror/history/crime documentaries!
+    """
+    is_en = clean_lang == "en_us"
+    bridges_by_mood = {
+        "dark_horror": (
+            [
+                "What terrifying truth was buried beneath this tradition?",
+                "Yet why did official history try so hard to erase what happened next?",
+                "And what ancient ritual still hides behind the celebration today?",
+            ]
+            if is_en
+            else [
+                "Mas qual segredo macabro foi enterrado sob essa tradição?",
+                "E por que a história oficial tentou apagar o que acontecia naquela noite?",
+                "Será que o ritual original nunca desapareceu de verdade?",
+            ]
+        ),
+        "investigative_crime": (
+            [
+                "What crucial clue did every investigator overlook at first?",
+                "Yet who was pulling the strings behind the scenes all along?",
+                "And how did one tiny detail finally crack the entire case open?",
+            ]
+            if is_en
+            else [
+                "Qual pista crucial passou despercebida por todos os investigadores?",
+                "Mas quem realmente controlava cada passo nos bastidores desse mistério?",
+                "E como um único detalhe esquecido mudou toda a investigação?",
+            ]
+        ),
+        "epic_history": (
+            [
+                "What forgotten event changed the course of history overnight?",
+                "Yet why was this chapter nearly erased from modern chronicles?",
+                "And how does that ancient turning point still echo today?",
+            ]
+            if is_en
+            else [
+                "Qual evento esquecido mudou o rumo da história da noite para o dia?",
+                "Mas por que esse capítulo quase desapareceu dos livros oficiais?",
+                "E como essa virada histórica ainda ecoa até hoje?",
+            ]
+        ),
+        "corporate_thriller": (
+            [
+                "How did nobody inside the boardroom notice what was happening?",
+                "Yet what hidden detail inside the records triggered the collapse?",
+                "And why did the warning signs go ignored until it was too late?",
+            ]
+            if is_en
+            else [
+                "Como ninguém nos bastidores percebeu o tamanho do risco a tempo?",
+                "Mas qual detalhe oculto nos registros acelerou a virada decisiva?",
+                "E por que todos os alertas foram ignorados até o último instante?",
+            ]
+        ),
+    }
+    pool = bridges_by_mood.get(mood, bridges_by_mood["epic_history"])
+    since_loop_s = 0.0
+    b_idx = 0
+    for idx, sc in enumerate(scenes):
+        txt = sc.narration.strip()
+        dur_est = max(2.2, len(txt.split()) / 2.65)
+        since_loop_s += dur_est
+        if OPEN_LOOP_MARKERS_RE.search(txt):
+            since_loop_s = 0.0
+            continue
+        # Inject an authentic mood-matched question on scene 0 or whenever >= 12s elapsed without a hook
+        if idx == 0 or (idx < len(scenes) - 1 and since_loop_s >= 12.0):
+            q = pool[b_idx % len(pool)]
+            b_idx += 1
+            sc.narration = f"{txt.rstrip('.!?')} — {q}"
+            since_loop_s = 0.0
+
+
+def _call_open_topic_director_llm(
+    topic: str,
+    n_scenes: int,
+    clean_lang: str,
+    mood_hint: str,
+    custom_directives: str = "",
+) -> Optional[Tuple[Dict[str, Any], str, int, float]]:
+    """Call LIVE DeepSeek (`deepseek-chat`) OR Google Gemini (`gemini-flash-lite-latest` via
+    `headers={"x-goog-api-key": gkey}`) with automatic failover to author a 100% original, deeply
+    researched, gripping Netflix / Dark History documentary blueprint for ANY arbitrary topic.
+    """
+    settings = get_settings() or {}
+    dkey = str(settings.get("deepseek_api_key") or "").strip()
+    gkey = str(settings.get("gemini_api_key") or "").strip()
+    default_llm = str(settings.get("default_llm") or "gemini-flash-lite-latest").strip().lower()
+    if not dkey and not gkey:
+        return None
+
+    is_en = clean_lang == "en_us"
+    lang_label = "American English" if is_en else "Brazilian Portuguese (PT-BR)"
+    skill_path = SKILLS_DIR / "10_netflix_investigative_doc.md"
+    skill_excerpt = skill_path.read_text(encoding="utf-8")[:900] if skill_path.exists() else ""
+
+    sys_prompt = (
+        f"You are an Emmy-winning Netflix / A24 / MagnatesMedia Documentary Showrunner & Historian writing in {lang_label}. "
+        "Create a 100% ORIGINAL, deeply researched, gripping documentary blueprint strictly about the user's EXACT TOPIC.\n"
+        "ABSOLUTE RULES:\n"
+        "1. Research real historical facts, real dates/centuries, real places, real folklore/entities, and concrete details about the topic.\n"
+        "2. NEVER use unrelated financial/corporate/Barings/London-Singapore/Wall-Street boilerplate unless the user's topic is genuinely about finance!\n"
+        "3. ZERO robotic AI clichés (NEVER write 'Em um mundo onde', 'Vamos mergulhar', 'Em conclusão', 'In a world where', 'Let's dive in').\n"
+        "4. Every narration line must be 18-26 crisp, cinematic spoken words. Scene 0 MUST open with a shocking cold-open hook and end with an intriguing question (?). Include a natural investigative question (?) at least every 2nd scene.\n"
+        "5. Visual queries (`broll_query_en`, `pip_broll_query_en`, `photo_query_en`, `extra_photo_queries_en`) MUST BE IN ENGLISH, concrete, photographic, and topic-authentic:\n"
+        "   - `broll_query_en` and `pip_broll_query_en`: 3-4 concrete stock-video keywords that exist on Pixabay (e.g. 'snow forest night', 'candle flame dark', 'medieval castle fog', 'gothic cathedral dark', 'fireplace burning dark', 'ancient roman ruins', 'winter snow village'). `pip_broll_query_en` MUST differ from `broll_query_en`.\n"
+        "   - `photo_query_en` and `extra_photo_queries_en` (4 distinct items): 2-4 concrete photo/Wikimedia keywords (e.g. 'Krampus Austria mask', 'Saturnalia Roman painting', 'gothic cathedral candles', 'old parchment leather book candle').\n"
+        "   - `bespoke_image_prompt_en`: rich 15-24 word English dark-cinema photographic scene description with ZERO text/letters.\n"
+        "   - `prefer_gemini_photo`: true for folklore/macabre/ancient ritual scenes where bespoke cinema art shines, false for real-world places.\n"
+        "6. Classify `mood` strictly as ONE of: \"dark_horror\", \"investigative_crime\", \"epic_history\", \"corporate_thriller\".\n"
+        "7. Keep UI text crisp and punchy so it fits cleanly on screen: `thumbnail_hook` = 2-3 UPPERCASE words, `board_nodes` = exactly 4 real entities from the topic (title <= 18 chars, role <= 26 chars, badge <= 16 chars), `timeline_points` = exactly 4 real chronological dates/facts.\n"
+        "Return ONLY valid JSON matching this exact schema:\n"
+        "{\n"
+        '  "title": "Editorial documentary title",\n'
+        '  "subtitle": "Short archival subtitle (e.g. Arquivo Histórico • Roma & Alpes)",\n'
+        '  "channel_name": "Topic-authentic cinema channel name",\n'
+        '  "mood": "dark_horror | investigative_crime | epic_history | corporate_thriller",\n'
+        '  "thumbnail_hook": "2-3 PUNCHY WORDS",\n'
+        '  "chapter_subtitles": ["CHAPTER 1 SUBTITLE", "CHAPTER 2 SUBTITLE", "CHAPTER 3 SUBTITLE", "CHAPTER 4 SUBTITLE"],\n'
+        '  "map_origin": "REAL ORIGIN PLACE",\n'
+        '  "map_destination": "REAL DESTINATION PLACE",\n'
+        '  "map_metric": "DRAMATIC HISTORICAL METRIC/ERA",\n'
+        '  "evidence_headline": "DRAMATIC ARCHIVAL HEADLINE",\n'
+        '  "evidence_quote": "1-2 gripping sentences of real documented evidence about the topic.",\n'
+        '  "timeline_points": [\n'
+        '    {"date": "REAL YEAR/ERA", "label": "Short real milestone", "value": "Concise impact tag"}\n'
+        "  ],\n"
+        '  "board_nodes": [\n'
+        '    {"id": "n1", "title": "ENTITY 1", "role": "Short role", "badge": "SHORT BADGE"}\n'
+        "  ],\n"
+        '  "scenes": [\n'
+        "    {\n"
+        '      "narration": "18-26 gripping words...",\n'
+        '      "lower_third_title": "SPECIFIC LOCATION • REAL ERA/YEAR",\n'
+        '      "lower_third_subtitle": "SPECIFIC ARCHIVAL CONTEXT • DETAIL",\n'
+        '      "evidence_headline": "Scene-specific dramatic headline",\n'
+        '      "evidence_quote": "Scene-specific documented quote/detail",\n'
+        '      "map_origin": "Origin location",\n'
+        '      "map_destination": "Destination location",\n'
+        '      "map_metric": "Scene dramatic stat/era",\n'
+        '      "broll_query_en": "3-4 word concrete English video query",\n'
+        '      "pip_broll_query_en": "different 3-4 word English video query",\n'
+        '      "photo_query_en": "2-4 word concrete English photo query",\n'
+        '      "extra_photo_queries_en": ["photo q1", "photo q2", "photo q3", "photo q4"],\n'
+        '      "bespoke_image_prompt_en": "dark cinema photorealistic scene description, no text",\n'
+        '      "prefer_gemini_photo": true\n'
+        "    }\n"
+        "  ],\n"
+        '  "hashtags": ["#tag1", "#tag2", "#tag3", "#tag4"]\n'
+        "}"
+    )
+
+    dir_block = f"\nUSER CREATIVE DIRECTIVES: {custom_directives.strip()}" if custom_directives.strip() else ""
+    user_prompt = (
+        f"EXACT DOCUMENTARY TOPIC: {topic}\n"
+        f"LANGUAGE: {lang_label}\n"
+        f"SUGGESTED MOOD: {mood_hint}\n"
+        f"EXACT NUMBER OF SCENES REQUIRED: {n_scenes}\n"
+        f"{dir_block}\n"
+        f"STYLE REFERENCE:\n{skill_excerpt}"
+    )
+
+    max_out_tokens = min(4096, 1100 + n_scenes * 280)
+    provider_order = ["deepseek", "gemini"] if "deepseek" in default_llm else ["gemini", "deepseek"]
+
+    for prov in provider_order:
+        if prov == "deepseek" and dkey:
+            try:
+                from openai import OpenAI
+
+                cli = OpenAI(api_key=dkey, base_url="https://api.deepseek.com", timeout=45.0)
+                resp = cli.chat.completions.create(
+                    model="deepseek-chat",
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=0.65,
+                    max_tokens=max_out_tokens,
+                    response_format={"type": "json_object"},
+                )
+                raw_txt = resp.choices[0].message.content or "{}"
+                data = _extract_clean_json(raw_txt)
+                if isinstance(data.get("scenes"), list) and len(data["scenes"]) >= min(4, n_scenes):
+                    u = resp.usage
+                    pt = int(getattr(u, "prompt_tokens", 850))
+                    ct = int(getattr(u, "completion_tokens", 950))
+                    cost = round((pt * 0.14 + ct * 0.28) / 1_000_000.0, 6)
+                    try:
+                        record_token_usage("deepseek", "deepseek-chat", pt, ct, 0, cost)
+                    except Exception:
+                        pass
+                    print(
+                        f"[NetflixDoc] Open-topic AI Director succeeded via DeepSeek (deepseek-chat) | "
+                        f"scenes={len(data['scenes'])} | mood={data.get('mood')}",
+                        flush=True,
+                    )
+                    return data, "llm_deepseek", pt + ct, cost
+            except Exception as exc:
+                print(f"[NetflixDoc] DeepSeek open-topic director failed, failing over: {exc}", flush=True)
+
+        if prov == "gemini" and gkey:
+            gemini_models = ("gemini-flash-lite-latest", "gemini-2.5-flash", "gemini-2.5-flash-lite")
+            headers = {"Content-Type": "application/json", "x-goog-api-key": gkey}
+            for gm in gemini_models:
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent"
+                    payload = {
+                        "system_instruction": {"parts": [{"text": sys_prompt}]},
+                        "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
+                        "generationConfig": {
+                            "temperature": 0.65,
+                            "maxOutputTokens": max_out_tokens,
+                            "responseMimeType": "application/json",
+                        },
+                    }
+                    r = httpx.post(url, json=payload, headers=headers, timeout=45.0)
+                    if r.status_code != 200:
+                        print(f"[NetflixDoc] Gemini ({gm}) HTTP {r.status_code}, trying next model...", flush=True)
+                        continue
+                    j = r.json()
+                    parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    txt = "".join(str(p.get("text") or "") for p in parts if not p.get("thought"))
+                    if not txt:
+                        txt = str(parts[0].get("text") or "") if parts else ""
+                    data = _extract_clean_json(txt)
+                    if isinstance(data.get("scenes"), list) and len(data["scenes"]) >= min(4, n_scenes):
+                        meta = j.get("usageMetadata", {})
+                        pt = int(meta.get("promptTokenCount", 850))
+                        ct = int(meta.get("candidatesTokenCount", 950))
+                        cost = round((pt * 0.05 + ct * 0.20) / 1_000_000.0, 6)
+                        try:
+                            record_token_usage("gemini", gm, pt, ct, 0, cost)
+                        except Exception:
+                            pass
+                        print(
+                            f"[NetflixDoc] Open-topic AI Director succeeded via Gemini ({gm}) | "
+                            f"scenes={len(data['scenes'])} | mood={data.get('mood')}",
+                            flush=True,
+                        )
+                        return data, f"llm_gemini:{gm}", pt + ct, cost
+                except Exception as exc:
+                    print(f"[NetflixDoc] Gemini ({gm}) open-topic director failed: {exc}", flush=True)
+                    continue
+
+    return None
+
+
+def _build_open_topic_offline_dossier(topic: str, clean_lang: str, mood: str) -> Dict[str, Any]:
+    """Mood-authentic zero-finance fallback dossier ONLY used if BOTH DeepSeek and Gemini are offline."""
+    is_en = clean_lang == "en_us"
+    clean_t = _clean_doc_text(topic) or ("A História Oculta" if not is_en else "The Hidden History")
+    short_upper = clean_t.upper()[:26]
+    media_pack = _OPEN_TOPIC_FALLBACK_MEDIA.get(mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
+
+    if mood == "dark_horror":
+        origin = "ANTIGUIDADE" if not is_en else "ANCIENT ERA"
+        dest = "EUROPA MEDIEVAL" if not is_en else "MEDIEVAL EUROPE"
+        metric = "ARQUIVO SOMBRIO • ORIGEM OCULTA" if not is_en else "DARK ARCHIVE • HIDDEN ORIGIN"
+        sub = "Arquivo Sombrio • História Oculta" if not is_en else "Dark Archive • Hidden History"
+        hook = "O LADO SOMBRIO" if not is_en else "THE DARK TRUTH"
+        headline = f"ARQUIVOS HISTÓRICOS REVELAM O LADO SOMBRIO DE {short_upper}" if not is_en else f"FORGOTTEN ARCHIVES EXPOSE THE DARK ORIGIN OF {short_upper}"
+        quote = (
+            f"Crônicas antigas preservam detalhes inquietantes sobre {clean_t} que a versão moderna tentou suavizar."
+            if not is_en
+            else f"Ancient chronicles preserve unsettling accounts behind {clean_t} that modern retellings quietly erased."
+        )
+        timeline = [
+            {"date": "ORIGEM", "label": "Primeiros Registros Antigos", "value": "RAIZ OCULTA"},
+            {"date": "SÉC. IV", "label": "Transformação Cultural", "value": "RITUAL ADAPTADO"},
+            {"date": "IDADE MÉDIA", "label": "Folclore & Advertências", "value": "LENDAS SOMBRIAS"},
+            {"date": "HOJE", "label": "A Máscara Moderna", "value": "VERDADE EXPOSTA"},
+        ]
+        nodes = [
+            {"id": "n1", "title": short_upper[:18], "role": "Origem Histórica", "badge": "ARQUIVO #01"},
+            {"id": "n2", "title": "RITUAIS ANTIGOS", "role": "Tradições Esquecidas", "badge": "FOLCLORE"},
+            {"id": "n3", "title": "CRÔNICAS VELADAS", "role": "Relatos Medievais", "badge": "PROVA HISTÓRICA"},
+            {"id": "n4", "title": "VERSÃO MODERNA", "role": "O Que Foi Apagado", "badge": "REVELADO"},
+        ]
+        narr = (
+            [
+                f"Por trás da imagem familiar de {clean_t}, arquivos antigos escondem uma origem muito mais sombria — o que realmente acontecia no começo?",
+                f"Manuscritos e crônicas de séculos passados mostram que {clean_t} nasceu em meio a temores antigos e rituais de inverno hoje quase esquecidos.",
+                "À medida que essas tradições cruzavam fronteiras pela Europa, figuras temidas e advertências noturnas moldaram o imaginário popular.",
+                "Com o passar dos séculos, relatos desconfortáveis foram reescritos para parecerem inofensivos — mas qual detalhe sobreviveu nas entrelinhas?",
+                f"Ao revisitar os documentos originais de {clean_t}, fica claro que a história verdadeira nunca foi tão inocente quanto parecia.",
+            ]
+            if not is_en
+            else [
+                f"Behind the familiar image of {clean_t}, ancient archives conceal a far darker origin — what truly happened in the beginning?",
+                f"Centuries-old chronicles reveal that {clean_t} took shape amid forgotten winter fears and stark ancient rituals.",
+                "As these traditions traveled across borders, grim folkloric figures and midnight warnings haunted entire villages.",
+                "Over generations, unsettling records were softened into harmless tales — yet which chilling trace survived intact?",
+                f"Reopening the primary archives of {clean_t} proves the real history was never as innocent as modern memory claims.",
+            ]
+        )
+    else:
+        origin = "ARQUIVO ORIGINAL" if not is_en else "PRIMARY ARCHIVE"
+        dest = "PRESENTE" if not is_en else "PRESENT DAY"
+        metric = "DOSSIÊ HISTÓRICO COMPLETO" if not is_en else "COMPLETE ARCHIVAL FILE"
+        sub = "Arquivo Documental • Investigação" if not is_en else "Archival Documentary • Investigation"
+        hook = "A VERDADE OCULTA" if not is_en else "THE HIDDEN TRUTH"
+        headline = f"DOCUMENTOS REVELAM A HISTÓRIA REAL POR TRÁS DE {short_upper}" if not is_en else f"ARCHIVAL RECORDS REVEAL THE REAL STORY BEHIND {short_upper}"
+        quote = (
+            f"Registros históricos e evidências preservadas revelam como {clean_t} transformou seu tempo de maneira inesperada."
+            if not is_en
+            else f"Preserved historical records reveal how {clean_t} reshaped its era in ways rarely told today."
+        )
+        timeline = [
+            {"date": "FASE I", "label": "Origem Documentada", "value": "INÍCIO"},
+            {"date": "FASE II", "label": "Virada Decisiva", "value": "RUPTURA"},
+            {"date": "FASE III", "label": "Clímax Histórico", "value": "IMPACTO"},
+            {"date": "LEGADO", "label": "Repercussão Atual", "value": "REVELADO"},
+        ]
+        nodes = [
+            {"id": "n1", "title": short_upper[:18], "role": "Tema Central", "badge": "ARQUIVO #01"},
+            {"id": "n2", "title": "TESTEMUNHOS", "role": "Registros de Época", "badge": "EVIDÊNCIA"},
+            {"id": "n3", "title": "PONTO DE VIRADA", "role": "Evento Decisivo", "badge": "CRÍTICO"},
+            {"id": "n4", "title": "LEGADO REAL", "role": "Impacto Duradouro", "badge": "HISTÓRIA"},
+        ]
+        narr = (
+            [
+                f"A história oficial sobre {clean_t} deixa de fora um capítulo decisivo — o que os arquivos antigos realmente escondem?",
+                f"Documentos de época mostram que as raízes de {clean_t} surgiram sob circunstâncias muito mais tensas do que se imagina.",
+                "Cada testemunho preservado conecta lugares distantes e revela como pequenas decisões alteraram o destino de milhares de pessoas.",
+                "Quando a cronologia completa é colocada lado a lado, o contraste entre mito e realidade chama atenção — por que isso foi esquecido?",
+                f"Entender a verdadeira trajetória de {clean_t} muda completamente a forma como enxergamos esse episódio até hoje.",
+            ]
+            if not is_en
+            else [
+                f"The familiar story of {clean_t} leaves out its most decisive chapter — what do the original archives actually reveal?",
+                f"Period records show the roots of {clean_t} emerged under far more dramatic circumstances than most people realize.",
+                "Each preserved testimony connects distant places and exposes how pivotal turning points reshaped an entire generation.",
+                "When the complete timeline is placed side by side, myth separates sharply from reality — why was this forgotten?",
+                f"Uncovering the true chronicle of {clean_t} transforms how we understand its lasting legacy today.",
+            ]
+        )
+
+    return {
+        "title": clean_t,
+        "subtitle": sub,
+        "channel_name": _default_channel_for_mood(mood, is_en),
+        "mood": mood,
+        "thumbnail_hook": hook,
+        "chapter_subtitles": _default_chapter_subtitles_for_mood(mood, is_en),
+        "map_origin": origin,
+        "map_destination": dest,
+        "map_metric": metric,
+        "evidence_headline": headline,
+        "evidence_quote": quote,
+        "timeline_points": timeline,
+        "board_nodes": nodes,
+        "broll_queries": list(media_pack["broll"]),
+        "pip_queries": list(media_pack["pip"]),
+        "photo_queries": list(media_pack["photos"]),
+        "narr": narr,
+    }
+
+
+def _build_universal_dossier(topic: str, lang: str = "pt_br") -> Dict[str, Any]:
+    """Backwards-compatible helper: returns curated financial dossier on exact match or mood-adapted open dossier."""
+    matched = _match_curated_dossier(topic)
+    if matched is not None:
+        return matched
+    clean_lang = "en_us" if str(lang).lower().startswith("en") else "pt_br"
+    mood = _classify_topic_mood(topic)
+    off = _build_open_topic_offline_dossier(topic, clean_lang=clean_lang, mood=mood)
+    return {
+        "keywords": (),
+        "mood": mood,
+        "title_pt": off["title"],
+        "title_en": off["title"],
+        "sub_pt": off["subtitle"],
+        "sub_en": off["subtitle"],
+        "hook_pt": off["thumbnail_hook"],
+        "hook_en": off["thumbnail_hook"],
+        "origin": off["map_origin"],
+        "dest": off["map_destination"],
+        "metric_pt": off["map_metric"],
+        "metric_en": off["map_metric"],
+        "headline": off["evidence_headline"],
+        "quote_pt": off["evidence_quote"],
+        "quote_en": off["evidence_quote"],
+        "broll_queries": off["broll_queries"],
+        "pip_queries": off["pip_queries"],
+        "photo_queries": off["photo_queries"],
+        "timeline": off["timeline_points"],
+        "nodes": off["board_nodes"],
+        "narr_pt": off["narr"],
+        "narr_en": off["narr"],
     }
 
 
@@ -984,171 +1624,473 @@ def generate_netflix_doc_plan(
     aspect_ratio: str = "16:9",
     target_minutes: float = 0.5,
     lang: str = "pt_br",
+    custom_directives: str = "",
+    caption_style: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Generate a complete investigative Netflix / MagnatesMedia documentary plan (dict).
-    Supports both 16:9 Widescreen (1920x1080) and 9:16 Vertical Doc (1080x1920),
-    scalable from quick 25s demos (target_minutes=0.45-0.5) up to 3-15 min mid-roll documentaries,
-    in PT-BR ('Dossiê Capital') or EN-US ('Vault Files').
+    """Generate a complete investigative Netflix / MagnatesMedia / Dark History documentary plan (dict).
+
+    - Matches the 10 curated financial dossiers when the topic clearly requests one of them.
+    - For ANY new arbitrary open topic (dark history, horror folklore, mysteries, true crime,
+      ancient history, biographies, science, etc.), invokes the user's LIVE DeepSeek (`deepseek-chat`)
+      or Google Gemini (`gemini-flash-lite-latest` via `x-goog-api-key`) AI Director with automatic
+      failover to author a 100% original, deeply researched documentary plan with zero financial boilerplate!
+    - Always runs the final plan through `agents.retention_doctor.audit_netflix_doc_plan`.
     """
     ar: Literal["16:9", "9:16"] = "9:16" if str(aspect_ratio).strip() == "9:16" else "16:9"
     clean_lang = "en_us" if str(lang).lower().startswith("en") else "pt_br"
-    t_min = max(0.35, min(15.0, float(target_minutes or 0.5)))
-
-    dossier = _build_universal_dossier(topic, lang=clean_lang)
     is_en = clean_lang == "en_us"
-    channel_name = "Vault Files" if is_en else "Dossiê Capital"
-    voice_id = "en-US-AndrewMultilingualNeural" if is_en else "pt-BR-AntonioNeural"
-    title = _clean_doc_text(dossier["title_en"] if is_en else dossier["title_pt"])
-    subtitle = _clean_doc_text(dossier["sub_en"] if is_en else dossier["sub_pt"])
-    thumb_hook = _clean_doc_text(dossier["hook_en"] if is_en else dossier["hook_pt"])
-    base_narr = list(dossier["narr_en"] if is_en else dossier["narr_pt"])
-
-    # Determine number of scenes based on target_minutes (~5.5s-6.5s per scene; minimum 5 scenes!)
+    t_min = max(0.35, min(15.0, float(target_minutes or 0.5)))
     target_seconds = max(25.0, t_min * 60.0)
     n_scenes = max(5, min(90, int(round(target_seconds / 6.0))))
+    voice_id = "en-US-AndrewMultilingualNeural" if is_en else "pt-BR-AntonioNeural"
+    resolved_cap_style = (
+        resolve_caption_style(caption_style)
+        if (caption_style and resolve_caption_style is not None)
+        else (str(caption_style or "cinema_minimal").strip() or "cinema_minimal")
+    )
 
-    # Optional LLM expansion when target_minutes > 1.0 and API key is configured
-    settings = get_settings()
-    dkey = (settings.get("deepseek_api_key") or "").strip()
-    gkey = (settings.get("gemini_api_key") or "").strip()
-    skill_path = SKILLS_DIR / "10_netflix_investigative_doc.md"
-    skill_md = skill_path.read_text(encoding="utf-8")[:1200] if skill_path.exists() else ""
+    matched_curated = _match_curated_dossier(topic)
+    tokens_used = 0
+    cost_usd = 0.0
+    topic_source = "curated"
 
-    if n_scenes > len(base_narr) and (dkey or gkey):
-        sys_p = (
-            f"You are an investigative documentary scriptwriter (Netflix / MagnatesMedia style) writing in {'American English' if is_en else 'Brazilian Portuguese'}. "
-            f"Write exactly {n_scenes} gripping, factual narration paragraphs (18-26 words each) about '{title}'. "
-            'Return ONLY valid JSON: {"lines":["..."]}'
-        )
-        try:
-            if dkey:
-                from openai import OpenAI
+    # =========================================================================
+    # PATH A: ONE OF THE 10 CURATED SIGNATURE FINANCIAL DOSSIERS
+    # =========================================================================
+    if matched_curated is not None:
+        dossier = matched_curated
+        mood = "corporate_thriller"
+        channel_name = "Vault Files" if is_en else "Dossiê Capital"
+        title = _clean_doc_text(dossier["title_en"] if is_en else dossier["title_pt"])
+        subtitle = _clean_doc_text(dossier["sub_en"] if is_en else dossier["sub_pt"])
+        thumb_hook = _clean_doc_text(dossier["hook_en"] if is_en else dossier["hook_pt"])
+        base_narr = list(dossier["narr_en"] if is_en else dossier["narr_pt"])
+        chapter_subs = _default_chapter_subtitles_for_mood(mood, is_en)
 
-                cli = OpenAI(api_key=dkey, base_url="https://api.deepseek.com")
-                resp = cli.chat.completions.create(
-                    model="deepseek-chat",
-                    messages=[{"role": "system", "content": sys_p}, {"role": "user", "content": f"TOPIC: {title}\n{skill_md}"}],
-                    temperature=0.7,
-                    max_tokens=min(4000, n_scenes * 75),
-                    response_format={"type": "json_object"},
+        # Optional LLM expansion for longer mid-roll curated documentaries (> 0.6 min)
+        settings = get_settings() or {}
+        dkey = str(settings.get("deepseek_api_key") or "").strip()
+        gkey = str(settings.get("gemini_api_key") or "").strip()
+        if n_scenes > len(base_narr) and (dkey or gkey):
+            sys_p = (
+                f"You are an investigative documentary scriptwriter (Netflix / MagnatesMedia style) writing in {'American English' if is_en else 'Brazilian Portuguese'}. "
+                f"Write exactly {n_scenes} gripping, factual narration paragraphs (18-26 words each) about '{title}'. "
+                'Return ONLY valid JSON: {"lines":["..."]}'
+            )
+            try:
+                if dkey:
+                    from openai import OpenAI
+
+                    cli = OpenAI(api_key=dkey, base_url="https://api.deepseek.com", timeout=35.0)
+                    resp = cli.chat.completions.create(
+                        model="deepseek-chat",
+                        messages=[{"role": "system", "content": sys_p}, {"role": "user", "content": f"TOPIC: {title}"}],
+                        temperature=0.7,
+                        max_tokens=min(4000, n_scenes * 75),
+                        response_format={"type": "json_object"},
+                    )
+                    data = _extract_clean_json(resp.choices[0].message.content or "{}")
+                    if isinstance(data.get("lines"), list) and len(data["lines"]) >= 5:
+                        base_narr = [str(x).strip() for x in data["lines"][:n_scenes]]
+                        u = resp.usage
+                        pt = int(getattr(u, "prompt_tokens", 500))
+                        ct = int(getattr(u, "completion_tokens", 500))
+                        tokens_used = pt + ct
+                        cost_usd = 0.0002
+                        record_token_usage("deepseek", "deepseek-chat", pt, ct, 0, cost_usd)
+            except Exception:
+                pass
+
+        while len(base_narr) < n_scenes:
+            idx_add = len(base_narr)
+            tp = dossier["timeline"][idx_add % len(dossier["timeline"])]
+            nd = dossier["nodes"][idx_add % len(dossier["nodes"])]
+            if is_en:
+                base_narr.append(
+                    f"In {tp['date']}, forensic investigators cross-referenced {nd['title']} ({nd['role']}) and uncovered a critical milestone of {tp['value']} linked directly to {dossier['dest']}."
                 )
-                data = _extract_json(resp.choices[0].message.content or "{}")
-                if isinstance(data.get("lines"), list) and len(data["lines"]) >= 5:
-                    base_narr = [str(x).strip() for x in data["lines"][:n_scenes]]
-                    u = resp.usage
-                    record_token_usage("deepseek", "deepseek-flash", int(getattr(u, "prompt_tokens", 500)), int(getattr(u, "completion_tokens", 500)), 0, 0.0002)
-        except Exception:
-            pass
+            else:
+                base_narr.append(
+                    f"Em {tp['date']}, os auditores forenses cruzaram os registros de {nd['title']} ({nd['role']}) e descobriram uma movimentação crítica de {tp['value']} conectada a {dossier['dest']}."
+                )
 
-    # If offline or target_minutes > 0.6 requires more scenes than base_narr, expand deterministically with investigative depth
+        broll_pool = list(dossier.get("broll_queries") or _OPEN_TOPIC_FALLBACK_MEDIA["corporate_thriller"]["broll"])
+        pip_pool = list(dossier.get("pip_queries") or _OPEN_TOPIC_FALLBACK_MEDIA["corporate_thriller"]["pip"])
+        photo_pool = list(dossier.get("photo_queries") or _OPEN_TOPIC_FALLBACK_MEDIA["corporate_thriller"]["photos"])
+
+        scenes: List[NetflixDocScene] = []
+        chapter_counter = 0
+        chapter_step = max(2, len(base_narr) // min(4, max(2, len(base_narr) // 2)))
+
+        for idx, line_txt in enumerate(base_narr):
+            vmode: VisualModeType = VISUAL_MODES[idx % len(VISUAL_MODES)]
+            chap_card: Optional[str] = None
+            chap_sub: Optional[str] = None
+            if idx == 0:
+                act_lbl = "COLD OPEN"
+            elif idx == 1 or (idx >= 3 and (idx - 1) % chapter_step == 0 and chapter_counter < 4):
+                roman = ROMAN_NUMERALS[min(chapter_counter, len(ROMAN_NUMERALS) - 1)]
+                chap_card = _spaced_chapter_label(roman, lang=clean_lang)
+                chap_sub = chapter_subs[min(chapter_counter, len(chapter_subs) - 1)]
+                act_lbl = f"CAPÍTULO {roman}" if not is_en else f"CHAPTER {roman}"
+                chapter_counter += 1
+            else:
+                roman = ROMAN_NUMERALS[max(0, min(chapter_counter - 1, len(ROMAN_NUMERALS) - 1))]
+                act_lbl = f"CAPÍTULO {roman}" if not is_en else f"CHAPTER {roman}"
+
+            tp_cur = dossier["timeline"][idx % len(dossier["timeline"])]
+            lt_title = f"{dossier['origin']} • {dossier['dest']} • {tp_cur['date']}"
+            lt_sub = f"{subtitle.upper()} • {tp_cur['value']}"
+
+            broll_q = broll_pool[idx % len(broll_pool)]
+            pip_q = pip_pool[idx % len(pip_pool)]
+            if pip_q.lower() == broll_q.lower() and len(pip_pool) > 1:
+                pip_q = pip_pool[(idx + 1) % len(pip_pool)]
+            photo_q = photo_pool[idx % len(photo_pool)]
+            extra_photos = [photo_pool[(idx + off) % len(photo_pool)] for off in range(4)]
+
+            scenes.append(
+                NetflixDocScene(
+                    scene_id=f"doc_sc_{idx + 1:02d}",
+                    act_label=act_lbl,
+                    chapter_card=chap_card,
+                    chapter_subtitle=chap_sub,
+                    visual_mode=vmode,
+                    mood=mood,
+                    narration=_clean_doc_text(line_txt),
+                    lower_third_title=_clean_doc_text(lt_title),
+                    lower_third_subtitle=_clean_doc_text(lt_sub),
+                    highlight_color="#FFD166" if idx % 2 == 0 else "#FF2E93",
+                    evidence_headline=_clean_doc_text(dossier["headline"]),
+                    evidence_quote=_clean_doc_text(dossier["quote_en"] if is_en else dossier["quote_pt"]),
+                    map_origin=_clean_doc_text(dossier["origin"]),
+                    map_destination=_clean_doc_text(dossier["dest"]),
+                    map_metric=_clean_doc_text(dossier["metric_en"] if is_en else dossier["metric_pt"]),
+                    timeline_points=[TimelinePoint(**pt) for pt in dossier["timeline"]],
+                    board_nodes=[BoardNode(**nd) for nd in dossier["nodes"]],
+                    image_prompt_en=photo_q,
+                    bespoke_image_prompt_en="",
+                    prefer_gemini_photo=False,
+                    broll_query_en=broll_q,
+                    pip_broll_query_en=pip_q,
+                    photo_query_en=photo_q,
+                    extra_photo_queries_en=extra_photos,
+                    transition_type=_select_transition_for_scene(idx, vmode, chap_card is not None),
+                )
+            )
+
+        _ensure_topic_open_loops(scenes, mood=mood, clean_lang=clean_lang)
+        plan_obj = NetflixDocPlan(
+            title=title,
+            subtitle=subtitle,
+            channel_name=channel_name,
+            mood=mood,
+            lang=clean_lang,
+            aspect_ratio=ar,
+            target_minutes=t_min,
+            lut_file="02_dark_wealth.cube",
+            voice_id=voice_id,
+            caption_style=resolved_cap_style,
+            thumbnail_hook=thumb_hook,
+            topic_source=topic_source,
+            tokens_used=tokens_used,
+            cost_usd=cost_usd,
+            scenes=scenes,
+            hashtags=["#documentario", "#investigacao", "#financas", "#dossiecapital" if not is_en else "#vaultfiles"],
+        )
+        return audit_netflix_doc_plan(plan_obj.model_dump(), lang=clean_lang)
+
+    # =========================================================================
+    # PATH B: TRUE UNLIMITED OPEN-TOPIC AI DOCUMENTARY DIRECTOR (ANY TOPIC!)
+    # =========================================================================
+    mood_hint = _classify_topic_mood(topic)
+    llm_res = _call_open_topic_director_llm(
+        topic=topic,
+        n_scenes=n_scenes,
+        clean_lang=clean_lang,
+        mood_hint=mood_hint,
+        custom_directives=custom_directives,
+    )
+
+    if llm_res is not None:
+        raw_plan, topic_source, tokens_used, cost_usd = llm_res
+        mood = _normalize_mood(raw_plan.get("mood"), topic)
+        media_defaults = _OPEN_TOPIC_FALLBACK_MEDIA.get(mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
+        off_seed = _build_open_topic_offline_dossier(topic, clean_lang=clean_lang, mood=mood)
+
+        def _safe_field(val: Any, fallback: str) -> str:
+            txt = _clean_doc_text(str(val or "").strip())
+            if not txt:
+                return fallback
+            if mood != "corporate_thriller" and _FORBIDDEN_FINANCE_LEFTOVERS_RE.search(txt):
+                return fallback
+            return txt
+
+        title = _safe_field(raw_plan.get("title"), off_seed["title"])
+        subtitle = _safe_field(raw_plan.get("subtitle"), off_seed["subtitle"])
+        channel_name = _safe_field(raw_plan.get("channel_name"), _default_channel_for_mood(mood, is_en))
+        thumb_hook = _safe_field(raw_plan.get("thumbnail_hook"), off_seed["thumbnail_hook"]).upper()
+        # Keep thumbnail hook crisp (max 3-4 words)
+        if len(thumb_hook.split()) > 4:
+            thumb_hook = " ".join(thumb_hook.split()[:3])
+
+        raw_chap_subs = raw_plan.get("chapter_subtitles")
+        default_chap_subs = _default_chapter_subtitles_for_mood(mood, is_en)
+        if isinstance(raw_chap_subs, list) and len(raw_chap_subs) >= 2:
+            chapter_subs = [_safe_field(c, default_chap_subs[i % len(default_chap_subs)]).upper() for i, c in enumerate(raw_chap_subs[:4])]
+            while len(chapter_subs) < 4:
+                chapter_subs.append(default_chap_subs[len(chapter_subs)])
+        else:
+            chapter_subs = default_chap_subs
+
+        global_origin = _safe_field(raw_plan.get("map_origin"), off_seed["map_origin"])
+        global_dest = _safe_field(raw_plan.get("map_destination"), off_seed["map_destination"])
+        global_metric = _safe_field(raw_plan.get("map_metric"), off_seed["map_metric"])
+        global_headline = _safe_field(raw_plan.get("evidence_headline"), off_seed["evidence_headline"])
+        global_quote = _safe_field(raw_plan.get("evidence_quote"), off_seed["evidence_quote"])
+
+        # Timeline points (4 real historical/topic milestones)
+        raw_tl = raw_plan.get("timeline_points")
+        timeline_pts: List[TimelinePoint] = []
+        if isinstance(raw_tl, list):
+            for idx_t, item in enumerate(raw_tl[:6]):
+                if isinstance(item, dict):
+                    fb_t = off_seed["timeline_points"][idx_t % len(off_seed["timeline_points"])]
+                    timeline_pts.append(
+                        TimelinePoint(
+                            date=_safe_field(item.get("date"), fb_t["date"]),
+                            label=_safe_field(item.get("label"), fb_t["label"]),
+                            value=_safe_field(item.get("value"), fb_t["value"]),
+                        )
+                    )
+        while len(timeline_pts) < 4:
+            fb_t = off_seed["timeline_points"][len(timeline_pts) % len(off_seed["timeline_points"])]
+            timeline_pts.append(TimelinePoint(**fb_t))
+
+        # Board nodes (4 real entities/concepts from the topic)
+        raw_nodes = raw_plan.get("board_nodes")
+        board_nodes: List[BoardNode] = []
+        if isinstance(raw_nodes, list):
+            for idx_n, item in enumerate(raw_nodes[:4]):
+                if isinstance(item, dict):
+                    fb_n = off_seed["board_nodes"][idx_n % len(off_seed["board_nodes"])]
+                    board_nodes.append(
+                        BoardNode(
+                            id=str(item.get("id") or f"n{idx_n + 1}"),
+                            title=_safe_field(item.get("title"), fb_n["title"])[:24],
+                            role=_safe_field(item.get("role"), fb_n["role"])[:32],
+                            badge=_safe_field(item.get("badge"), fb_n["badge"])[:20],
+                        )
+                    )
+        while len(board_nodes) < 4:
+            fb_n = off_seed["board_nodes"][len(board_nodes) % len(off_seed["board_nodes"])]
+            board_nodes.append(BoardNode(**fb_n))
+
+        raw_scenes = [s for s in (raw_plan.get("scenes") or []) if isinstance(s, dict)]
+        # Collect all topic-authentic English photo queries generated across scenes for rich multi-photo pools
+        topic_photo_pool: List[str] = []
+        for rs in raw_scenes:
+            pq_r = _safe_field(rs.get("photo_query_en"), "")
+            if pq_r and pq_r.lower() not in {x.lower() for x in topic_photo_pool}:
+                topic_photo_pool.append(pq_r)
+            for ep in (rs.get("extra_photo_queries_en") or []):
+                ep_c = _safe_field(ep, "")
+                if ep_c and ep_c.lower() not in {x.lower() for x in topic_photo_pool}:
+                    topic_photo_pool.append(ep_c)
+        for fb_p in media_defaults["photos"]:
+            if len(topic_photo_pool) >= 8:
+                break
+            if fb_p.lower() not in {x.lower() for x in topic_photo_pool}:
+                topic_photo_pool.append(fb_p)
+
+        # Pad scenes cleanly if LLM returned slightly fewer than n_scenes (e.g., long target_minutes)
+        while len(raw_scenes) < n_scenes:
+            idx_pad = len(raw_scenes)
+            tp_p = timeline_pts[idx_pad % len(timeline_pts)]
+            nd_p = board_nodes[idx_pad % len(board_nodes)]
+            narr_pad = (
+                f"In {tp_p.date}, historical accounts surrounding {nd_p.title} ({nd_p.role}) revealed a turning point marked by {tp_p.label}."
+                if is_en
+                else f"Em {tp_p.date}, os registros envolvendo {nd_p.title} ({nd_p.role}) revelaram uma virada decisiva marcada por {tp_p.label}."
+            )
+            raw_scenes.append({
+                "narration": narr_pad,
+                "lower_third_title": f"{global_origin} • {global_dest} • {tp_p.date}",
+                "lower_third_subtitle": f"{nd_p.title} • {tp_p.value}",
+                "evidence_headline": global_headline,
+                "evidence_quote": global_quote,
+                "map_origin": global_origin,
+                "map_destination": global_dest,
+                "map_metric": global_metric,
+                "broll_query_en": media_defaults["broll"][idx_pad % len(media_defaults["broll"])],
+                "pip_broll_query_en": media_defaults["pip"][idx_pad % len(media_defaults["pip"])],
+                "photo_query_en": topic_photo_pool[idx_pad % len(topic_photo_pool)],
+                "extra_photo_queries_en": [topic_photo_pool[(idx_pad + k) % len(topic_photo_pool)] for k in range(4)],
+                "bespoke_image_prompt_en": f"dark atmospheric 35mm documentary still of {nd_p.title} in {global_origin}, chiaroscuro lighting, no text",
+                "prefer_gemini_photo": mood in ("dark_horror", "epic_history"),
+            })
+
+        scenes = []
+        chapter_counter = 0
+        chapter_step = max(2, n_scenes // min(4, max(2, n_scenes // 2)))
+
+        for idx, rs in enumerate(raw_scenes[:n_scenes]):
+            vmode = VISUAL_MODES[idx % len(VISUAL_MODES)]
+            chap_card = None
+            chap_sub = None
+            if idx == 0:
+                act_lbl = "COLD OPEN"
+            elif idx == 1 or (idx >= 3 and (idx - 1) % chapter_step == 0 and chapter_counter < 4):
+                roman = ROMAN_NUMERALS[min(chapter_counter, len(ROMAN_NUMERALS) - 1)]
+                chap_card = _spaced_chapter_label(roman, lang=clean_lang)
+                chap_sub = chapter_subs[min(chapter_counter, len(chapter_subs) - 1)]
+                act_lbl = f"CAPÍTULO {roman}" if not is_en else f"CHAPTER {roman}"
+                chapter_counter += 1
+            else:
+                roman = ROMAN_NUMERALS[max(0, min(chapter_counter - 1, len(ROMAN_NUMERALS) - 1))]
+                act_lbl = f"CAPÍTULO {roman}" if not is_en else f"CHAPTER {roman}"
+
+            tp_cur = timeline_pts[idx % len(timeline_pts)]
+            sc_orig = _safe_field(rs.get("map_origin"), global_origin)
+            sc_dest = _safe_field(rs.get("map_destination"), global_dest)
+            sc_metric = _safe_field(rs.get("map_metric"), global_metric)
+            lt_title = _safe_field(rs.get("lower_third_title"), f"{sc_orig} • {sc_dest} • {tp_cur.date}")
+            lt_sub = _safe_field(rs.get("lower_third_subtitle"), f"{subtitle.upper()} • {tp_cur.value}")
+            sc_head = _safe_field(rs.get("evidence_headline"), global_headline)
+            sc_quote = _safe_field(rs.get("evidence_quote"), global_quote)
+            sc_narr = _safe_field(rs.get("narration"), off_seed["narr"][idx % len(off_seed["narr"])])
+
+            broll_q = _safe_field(rs.get("broll_query_en"), media_defaults["broll"][idx % len(media_defaults["broll"])])
+            pip_q = _safe_field(rs.get("pip_broll_query_en"), media_defaults["pip"][idx % len(media_defaults["pip"])])
+            if pip_q.lower() == broll_q.lower():
+                pip_q = media_defaults["pip"][(idx + 1) % len(media_defaults["pip"])]
+
+            photo_q = _safe_field(rs.get("photo_query_en"), topic_photo_pool[idx % len(topic_photo_pool)])
+            raw_extra = rs.get("extra_photo_queries_en")
+            extra_photos: List[str] = []
+            if isinstance(raw_extra, list):
+                for ep in raw_extra:
+                    ep_c = _safe_field(ep, "")
+                    if ep_c and ep_c.lower() not in {x.lower() for x in extra_photos}:
+                        extra_photos.append(ep_c)
+            for off_i in range(len(topic_photo_pool)):
+                if len(extra_photos) >= 4:
+                    break
+                cand = topic_photo_pool[(idx + off_i) % len(topic_photo_pool)]
+                if cand.lower() not in {x.lower() for x in extra_photos}:
+                    extra_photos.append(cand)
+
+            bespoke_p = _safe_field(
+                rs.get("bespoke_image_prompt_en"),
+                f"cinematic 35mm dark documentary still of {photo_q}, dramatic chiaroscuro lighting, no text",
+            )
+            pref_gem = bool(rs.get("prefer_gemini_photo", mood == "dark_horror" and idx in (0, 3)))
+
+            scenes.append(
+                NetflixDocScene(
+                    scene_id=f"doc_sc_{idx + 1:02d}",
+                    act_label=act_lbl,
+                    chapter_card=chap_card,
+                    chapter_subtitle=chap_sub,
+                    visual_mode=vmode,
+                    mood=mood,
+                    narration=sc_narr,
+                    lower_third_title=lt_title,
+                    lower_third_subtitle=lt_sub,
+                    highlight_color="#FFD166" if idx % 2 == 0 else "#FF2E93",
+                    evidence_headline=sc_head,
+                    evidence_quote=sc_quote,
+                    map_origin=sc_orig,
+                    map_destination=sc_dest,
+                    map_metric=sc_metric,
+                    timeline_points=timeline_pts,
+                    board_nodes=board_nodes,
+                    image_prompt_en=bespoke_p or photo_q,
+                    bespoke_image_prompt_en=bespoke_p,
+                    prefer_gemini_photo=pref_gem,
+                    broll_query_en=broll_q,
+                    pip_broll_query_en=pip_q,
+                    photo_query_en=photo_q,
+                    extra_photo_queries_en=extra_photos[:4],
+                    transition_type=_select_transition_for_scene(idx, vmode, chap_card is not None),
+                )
+            )
+
+        raw_tags = raw_plan.get("hashtags")
+        if isinstance(raw_tags, list) and raw_tags:
+            hashtags = [str(t).strip() for t in raw_tags[:6] if str(t).strip()]
+            hashtags = [t if t.startswith("#") else f"#{t}" for t in hashtags]
+        else:
+            hashtags = (
+                ["#documentario", "#historiaobscura", "#misterio", "#cinema"]
+                if mood == "dark_horror"
+                else ["#documentario", "#historia", "#investigacao", "#cinema"]
+            )
+
+        _ensure_topic_open_loops(scenes, mood=mood, clean_lang=clean_lang)
+        plan_obj = NetflixDocPlan(
+            title=title,
+            subtitle=subtitle,
+            channel_name=channel_name,
+            mood=mood,
+            lang=clean_lang,
+            aspect_ratio=ar,
+            target_minutes=t_min,
+            lut_file="02_dark_wealth.cube",
+            voice_id=voice_id,
+            caption_style=resolved_cap_style,
+            thumbnail_hook=thumb_hook,
+            topic_source=topic_source,
+            tokens_used=tokens_used,
+            cost_usd=cost_usd,
+            scenes=scenes,
+            hashtags=hashtags,
+        )
+        return audit_netflix_doc_plan(plan_obj.model_dump(), lang=clean_lang)
+
+    # =========================================================================
+    # PATH C: OFFLINE MOOD-ADAPTIVE FALLBACK (ONLY IF BOTH DEEPSEEK & GEMINI FAIL)
+    # =========================================================================
+    topic_source = "open_topic_synthesizer"
+    mood = mood_hint
+    off = _build_open_topic_offline_dossier(topic, clean_lang=clean_lang, mood=mood)
+    base_narr = list(off["narr"])
     while len(base_narr) < n_scenes:
         idx_add = len(base_narr)
-        tp = dossier["timeline"][idx_add % len(dossier["timeline"])]
-        nd = dossier["nodes"][idx_add % len(dossier["nodes"])]
-        if is_en:
-            base_narr.append(
-                f"In {tp['date']}, forensic investigators cross-referenced {nd['title']} ({nd['role']}) and uncovered a critical milestone of {tp['value']} linked directly to {dossier['dest']}."
-            )
-        else:
-            base_narr.append(
-                f"Em {tp['date']}, os auditores forenses cruzaram os registros de {nd['title']} ({nd['role']}) e descobriram uma movimentação crítica de {tp['value']} conectada a {dossier['dest']}."
-            )
+        tp = off["timeline_points"][idx_add % len(off["timeline_points"])]
+        nd = off["board_nodes"][idx_add % len(off["board_nodes"])]
+        base_narr.append(
+            f"In {tp['date']}, archival chronicles linked {nd['title']} ({nd['role']}) to {tp['label']}."
+            if is_en
+            else f"Em {tp['date']}, as crônicas históricas conectaram {nd['title']} ({nd['role']}) a {tp['label']}."
+        )
 
-    # Audit narrative lines with Retention Doctor principles (clean complete endings, zero debug words)
-    audited = audit_viral_script_dict(
-        {
-            "title": title,
-            "hook_a": base_narr[0],
-            "hook_b": base_narr[0],
-            "body_lines": base_narr[1:-1],
-            "closing_line": base_narr[-1],
-        }
-    )
-    final_narr = [audited["hook_a"], *audited["body_lines"], audited["closing_line"]]
-    while len(final_narr) < 5:
-        final_narr.append(base_narr[len(final_narr) % len(base_narr)])
-
-    # Build scenes cycling through all Netflix/MagnatesMedia visual modes:
-    # Scene 0: Cold Open (broll_video_pip -> Full-bleed moving HD video + PiP Forensic Monitor + archival photo)
-    # Scene 1: C A P Í T U L O   I (newspaper_highlighter -> Moving video + real photo in broadsheet + Multiply sweep)
-    # Scene 2: dark_map_route (Moving video + tactical route map + live Video-over-Video PiP monitor)
-    # Scene 3: C A P Í T U L O   I I (parallax_25d_photo -> Moving video + real u2netp 2.5D separated photo)
-    # Scene 4: red_string_board (Moving video + 3-4 distinct real Polaroid photos + glowing #FF2E93 strings)
-    # Scene 5+: sliding_timeline & video_pip_evidence (Split-Screen Video + Dossier)
-    chapter_subtitles_pt = [
-        "A ANOMALIA NOS ARQUIVOS",
-        "A ROTA DO CAPITAL OCULTO",
-        "O PONTO DE RUPTURA",
-        "O COLAPSO DO IMPÉRIO",
-    ]
-    chapter_subtitles_en = [
-        "THE HIDDEN ANOMALY",
-        "THE OFFSHORE MONEY TRAIL",
-        "THE BREAKING POINT",
-        "THE FINAL COLLAPSE",
-    ]
-
-    broll_pool: List[str] = list(dossier.get("broll_queries") or [
-        "london financial district skyline night",
-        "stock market trading monitors",
-        "singapore skyline night aerial",
-        "corporate boardroom executives",
-        "bank vault money bills",
-    ])
-    pip_pool: List[str] = list(dossier.get("pip_queries") or [
-        "stock market trading monitors",
-        "bank vault money bills",
-        "newspaper printing press",
-        "modern skyscraper architecture",
-    ])
-    photo_pool: List[str] = list(dossier.get("photo_queries") or [
-        "historic bank building london",
-        "stock market trading floor",
-        "singapore financial district skyline",
-        "businessman suit office portrait",
-        "london financial district skyline",
-    ])
-
-    scenes: List[NetflixDocScene] = []
+    scenes = []
     chapter_counter = 0
-    chapter_step = max(2, len(final_narr) // min(4, max(2, len(final_narr) // 2)))
+    chapter_step = max(2, len(base_narr) // min(4, max(2, len(base_narr) // 2)))
+    broll_pool = off["broll_queries"]
+    pip_pool = off["pip_queries"]
+    photo_pool = off["photo_queries"]
+    chap_subs = off["chapter_subtitles"]
 
-    for idx, line_txt in enumerate(final_narr):
-        vmode: VisualModeType = VISUAL_MODES[idx % len(VISUAL_MODES)]
-        chap_card: Optional[str] = None
-        chap_sub: Optional[str] = None
-
+    for idx, line_txt in enumerate(base_narr[:n_scenes]):
+        vmode = VISUAL_MODES[idx % len(VISUAL_MODES)]
+        chap_card = None
+        chap_sub = None
         if idx == 0:
             act_lbl = "COLD OPEN"
         elif idx == 1 or (idx >= 3 and (idx - 1) % chapter_step == 0 and chapter_counter < 4):
             roman = ROMAN_NUMERALS[min(chapter_counter, len(ROMAN_NUMERALS) - 1)]
             chap_card = _spaced_chapter_label(roman, lang=clean_lang)
-            chap_sub = (chapter_subtitles_en if is_en else chapter_subtitles_pt)[
-                min(chapter_counter, 3)
-            ]
+            chap_sub = chap_subs[min(chapter_counter, len(chap_subs) - 1)]
             act_lbl = f"CAPÍTULO {roman}" if not is_en else f"CHAPTER {roman}"
             chapter_counter += 1
         else:
             roman = ROMAN_NUMERALS[max(0, min(chapter_counter - 1, len(ROMAN_NUMERALS) - 1))]
             act_lbl = f"CAPÍTULO {roman}" if not is_en else f"CHAPTER {roman}"
 
-        tp_cur = dossier["timeline"][idx % len(dossier["timeline"])]
-        # Clean typography: use '•' instead of missing Unicode arrow '➔' so ZERO '[]' glyph boxes ever appear!
-        lt_title = f"{dossier['origin']} • {dossier['dest']} • {tp_cur['date']}"
-        lt_sub = f"{subtitle.upper()} • {tp_cur['value']}"
-
-        broll_q = broll_pool[idx % len(broll_pool)]
-        pip_q = pip_pool[idx % len(pip_pool)]
-        if pip_q.lower() == broll_q.lower() and len(pip_pool) > 1:
-            pip_q = pip_pool[(idx + 1) % len(pip_pool)]
+        tp_cur = off["timeline_points"][idx % len(off["timeline_points"])]
         photo_q = photo_pool[idx % len(photo_pool)]
-
-        # Rotate 4 distinct photo queries for multi-photo modes (red_string_board / sliding_timeline)
-        extra_photos = [
-            photo_pool[(idx + off) % len(photo_pool)]
-            for off in range(4)
-        ]
-
         scenes.append(
             NetflixDocScene(
                 scene_id=f"doc_sc_{idx + 1:02d}",
@@ -1156,39 +2098,49 @@ def generate_netflix_doc_plan(
                 chapter_card=chap_card,
                 chapter_subtitle=chap_sub,
                 visual_mode=vmode,
+                mood=mood,
                 narration=_clean_doc_text(line_txt),
-                lower_third_title=_clean_doc_text(lt_title),
-                lower_third_subtitle=_clean_doc_text(lt_sub),
+                lower_third_title=_clean_doc_text(f"{off['map_origin']} • {off['map_destination']} • {tp_cur['date']}"),
+                lower_third_subtitle=_clean_doc_text(f"{off['subtitle'].upper()} • {tp_cur['value']}"),
                 highlight_color="#FFD166" if idx % 2 == 0 else "#FF2E93",
-                evidence_headline=_clean_doc_text(dossier["headline"]),
-                evidence_quote=_clean_doc_text(dossier["quote_en"] if is_en else dossier["quote_pt"]),
-                map_origin=_clean_doc_text(dossier["origin"]),
-                map_destination=_clean_doc_text(dossier["dest"]),
-                map_metric=_clean_doc_text(dossier["metric_en"] if is_en else dossier["metric_pt"]),
-                timeline_points=[TimelinePoint(**pt) for pt in dossier["timeline"]],
-                board_nodes=[BoardNode(**nd) for nd in dossier["nodes"]],
+                evidence_headline=_clean_doc_text(off["evidence_headline"]),
+                evidence_quote=_clean_doc_text(off["evidence_quote"]),
+                map_origin=_clean_doc_text(off["map_origin"]),
+                map_destination=_clean_doc_text(off["map_destination"]),
+                map_metric=_clean_doc_text(off["map_metric"]),
+                timeline_points=[TimelinePoint(**pt) for pt in off["timeline_points"]],
+                board_nodes=[BoardNode(**nd) for nd in off["board_nodes"]],
                 image_prompt_en=photo_q,
-                broll_query_en=broll_q,
-                pip_broll_query_en=pip_q,
+                bespoke_image_prompt_en=f"dark atmospheric 35mm documentary still of {photo_q}, chiaroscuro lighting, no text",
+                prefer_gemini_photo=(mood == "dark_horror"),
+                broll_query_en=broll_pool[idx % len(broll_pool)],
+                pip_broll_query_en=pip_pool[idx % len(pip_pool)],
                 photo_query_en=photo_q,
-                extra_photo_queries_en=extra_photos,
+                extra_photo_queries_en=[photo_pool[(idx + k) % len(photo_pool)] for k in range(4)],
+                transition_type=_select_transition_for_scene(idx, vmode, chap_card is not None),
             )
         )
 
+    _ensure_topic_open_loops(scenes, mood=mood, clean_lang=clean_lang)
     plan_obj = NetflixDocPlan(
-        title=title,
-        subtitle=subtitle,
-        channel_name=channel_name,
+        title=off["title"],
+        subtitle=off["subtitle"],
+        channel_name=off["channel_name"],
+        mood=mood,
         lang=clean_lang,
         aspect_ratio=ar,
         target_minutes=t_min,
         lut_file="02_dark_wealth.cube",
         voice_id=voice_id,
-        thumbnail_hook=thumb_hook,
+        caption_style=resolved_cap_style,
+        thumbnail_hook=off["thumbnail_hook"],
+        topic_source=topic_source,
+        tokens_used=0,
+        cost_usd=0.0,
         scenes=scenes,
-        hashtags=["#documentario", "#investigacao", "#financas", "#dossiecapital" if not is_en else "#vaultfiles"],
+        hashtags=["#documentario", "#historia", "#misterio", "#cinema"],
     )
-    return plan_obj.model_dump()
+    return audit_netflix_doc_plan(plan_obj.model_dump(), lang=clean_lang)
 
 
 # ---------------------------------------------------------------------------
@@ -1201,6 +2153,8 @@ async def _synthesize_doc_scene_narration(
     work_dir: Path,
     tag: str,
     thermal_limit_c: float = 85.0,
+    rate: str = "+5%",
+    pitch: str = "-6Hz",
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
     """Synthesize authoritative deep documentary narration for a single scene."""
     raw_mp3 = work_dir / f"{tag}_raw.mp3"
@@ -1215,8 +2169,8 @@ async def _synthesize_doc_scene_narration(
             comm = edge_tts.Communicate(
                 text=text,
                 voice=v_try,
-                rate="+5%",
-                pitch="-6Hz",
+                rate=rate or "+5%",
+                pitch=pitch or "-6Hz",
                 boundary="WordBoundary",
             )
             words: List[Dict[str, Any]] = []
@@ -1626,7 +2580,15 @@ def _draw_mode_broll_video_pip(
 
     is_wide = w >= h
     rec_badge = "REC • VIDEO ARCHIVE" if is_en else "REC • ARQUIVO DE VÍDEO"
-    dossier_badge = f"CLASSIFIED FILE • {scene.act_label}" if is_en else f"DOSSIÊ CONFIDENCIAL • {scene.act_label}"
+    mood = str(getattr(scene, "mood", "corporate_thriller") or "corporate_thriller")
+    if mood == "dark_horror":
+        dossier_badge = f"DARK ARCHIVE • {scene.act_label}" if is_en else f"ARQUIVO SOMBRIO • {scene.act_label}"
+    elif mood == "epic_history":
+        dossier_badge = f"HISTORICAL ARCHIVE • {scene.act_label}" if is_en else f"ARQUIVO HISTÓRICO • {scene.act_label}"
+    elif mood == "investigative_crime":
+        dossier_badge = f"CASE FILE • {scene.act_label}" if is_en else f"DOSSIÊ CRIMINAL • {scene.act_label}"
+    else:
+        dossier_badge = f"CLASSIFIED FILE • {scene.act_label}" if is_en else f"DOSSIÊ CONFIDENCIAL • {scene.act_label}"
 
     if is_wide:
         # Left glassmorphic editorial dossier panel (clearly shows moving video behind & around it)
@@ -2180,8 +3142,28 @@ def _draw_mode_newspaper_highlighter(
     inner_w = paper_w - 92.0
     top_y = -paper_h * 0.5 + 42.0
 
-    # Masthead
-    mast_txt = "THE FINANCIAL DOSSIER   •   FORENSIC ARCHIVE EDITION"
+    # Mood-aware Archival Masthead (NEVER force Financial masthead on Horror/History/Crime docs!)
+    mood = str(getattr(scene, "mood", "corporate_thriller") or "corporate_thriller")
+    if mood == "dark_horror":
+        mast_txt = (
+            "DARK HISTORY CHRONICLE   •   RESTRICTED ARCHIVE EDITION"
+            if is_en
+            else "ARQUIVO HISTÓRICO OBSCURO   •   EDIÇÃO CONFIDENCIAL"
+        )
+    elif mood == "investigative_crime":
+        mast_txt = (
+            "INVESTIGATIVE CHRONICLE   •   FORENSIC CASE EDITION"
+            if is_en
+            else "CRÔNICA INVESTIGATIVA   •   EDIÇÃO FORENSE"
+        )
+    elif mood == "epic_history":
+        mast_txt = (
+            "HISTORICAL ARCHIVE   •   SPECIAL CHRONICLE EDITION"
+            if is_en
+            else "ARQUIVOS DA HISTÓRIA   •   EDIÇÃO ESPECIAL"
+        )
+    else:
+        mast_txt = "THE FINANCIAL DOSSIER   •   FORENSIC ARCHIVE EDITION"
     mast_font, mast_lns = _wrap_text_to_width(mast_txt, ui_tf, 21.0, 14.0, inner_w, 1)
     if mast_lns:
         _draw_safe_string(canvas, mast_lns[0], left_x, top_y, mast_font, ink_muted)
@@ -2479,7 +3461,15 @@ def _draw_mode_dark_map_route(
     m_font, m_lines = _wrap_text_to_width(scene.map_metric.upper(), title_tf, 31.0, 19.0, hud_w - 36.0, 1)
     if m_lines:
         _draw_safe_string(canvas, m_lines[0], mx + 44.0, my + 78.0, m_font, skia.Paint(AntiAlias=True, Color=hex_to_skia("#B8FF01")))
-    hud_sub_txt = "FORENSIC CAPITAL FLOW TRACKING" if is_en else "RASTREAMENTO FORENSE DE FLUXO"
+    mood = str(getattr(scene, "mood", "corporate_thriller") or "corporate_thriller")
+    if mood == "dark_horror":
+        hud_sub_txt = "HISTORICAL ORIGIN & FOLKLORE TRAIL" if is_en else "ORIGEM HISTÓRICA & ROTA DO MITO"
+    elif mood == "investigative_crime":
+        hud_sub_txt = "FORENSIC EVIDENCE & ROUTE TRACKING" if is_en else "RASTREAMENTO DE PISTAS & ROTA"
+    elif mood == "epic_history":
+        hud_sub_txt = "HISTORICAL ROUTE & CHRONOLOGY" if is_en else "ROTA HISTÓRICA & EXPANSÃO"
+    else:
+        hud_sub_txt = "FORENSIC CAPITAL FLOW TRACKING" if is_en else "RASTREAMENTO FORENSE DE FLUXO"
     sub_hud, sub_lns = _wrap_text_to_width(hud_sub_txt, ui_tf, 16.0, 12.0, hud_w - 36.0, 1)
     if sub_lns:
         _draw_safe_string(canvas, sub_lns[0], mx + 44.0, my + 46.0, sub_hud, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(215, 179, 136, 255)))
@@ -2534,9 +3524,9 @@ def _draw_mode_sliding_timeline(
     )
 
     pts = scene.timeline_points or [
-        TimelinePoint(date="FASE I", label="Origem", value="US$ 10M"),
-        TimelinePoint(date="FASE II", label="Escalada", value="US$ 240M"),
-        TimelinePoint(date="FASE III", label="Colapso", value="US$ 1.4B"),
+        TimelinePoint(date="FASE I", label="Origem Documentada", value="INÍCIO"),
+        TimelinePoint(date="FASE II", label="Virada Histórica", value="RUPTURA"),
+        TimelinePoint(date="FASE III", label="Clímax dos Eventos", value="REVELAÇÃO"),
     ]
     n_pts = len(pts)
     active_float = prog * max(1, n_pts - 1)
@@ -2712,10 +3702,10 @@ def _draw_mode_red_string_board(
     )
 
     nodes = (scene.board_nodes or [
-        BoardNode(id="n1", title="SUSPEITO #1", role="Operador Central", badge="ALVO"),
-        BoardNode(id="n2", title="CONTA OCULTA", role="Offshore", badge="CAIXA PRETA"),
-        BoardNode(id="n3", title="AUDITORIA", role="Relatório Forense", badge="PROVA"),
-        BoardNode(id="n4", title="COLAPSO", role="Impacto Global", badge="DESFECHO"),
+        BoardNode(id="n1", title="ORIGEM #01", role="Ponto Inicial", badge="ARQUIVO"),
+        BoardNode(id="n2", title="REGISTRO OCULTO", role="Crônica Antiga", badge="PROVA"),
+        BoardNode(id="n3", title="VIRADA CRÍTICA", role="Evento Decisivo", badge="EVIDÊNCIA"),
+        BoardNode(id="n4", title="LEGADO FINAL", role="Verdade Exposta", badge="DESFECHO"),
     ])[:4]
 
     photo_pool = media.extra_photos if media.extra_photos else ([media.primary_photo] if media.primary_photo is not None else [])
@@ -2742,16 +3732,16 @@ def _draw_mode_red_string_board(
         card_w, card_h = w - 130.0, 236.0
 
     if is_wide:
-        # Place thumbtack pins cleanly on the INNER corners of the 2x2 cards so glowing #FF2E93 strings
-        # weave dramatically across the open central corridor without ever crossing over text or Polaroid faces!
+        # Place thumbtack pins cleanly on the INNER edges of the 2x2 cards so glowing #FF2E93 strings
+        # weave dramatically across the open central corridor with generous clearance from card text!
         pin_coords = [
-            (centers[0][0] + card_w * 0.45, centers[0][1] + card_h * 0.10),
-            (centers[1][0] - card_w * 0.45, centers[1][1] + card_h * 0.10),
-            (centers[2][0] + card_w * 0.45, centers[2][1] - card_h * 0.12),
-            (centers[3][0] - card_w * 0.45, centers[3][1] - card_h * 0.12),
+            (centers[0][0] + card_w * 0.478, centers[0][1] + card_h * 0.10),
+            (centers[1][0] - card_w * 0.478, centers[1][1] + card_h * 0.10),
+            (centers[2][0] + card_w * 0.478, centers[2][1] - card_h * 0.12),
+            (centers[3][0] - card_w * 0.478, centers[3][1] - card_h * 0.12),
         ][: len(nodes)]
     else:
-        pin_coords = [(cx + (card_w * 0.44 if i % 2 == 0 else -card_w * 0.44), cy) for i, (cx, cy) in enumerate(centers[: len(nodes)])]
+        pin_coords = [(cx + (card_w * 0.465 if i % 2 == 0 else -card_w * 0.465), cy) for i, (cx, cy) in enumerate(centers[: len(nodes)])]
 
     # 1. Draw Polaroid-Mounted Obsidian Evidence Cards
     for idx, nd in enumerate(nodes):
@@ -2776,10 +3766,10 @@ def _draw_mode_red_string_board(
         b_col = hex_to_skia("#FF2E93" if idx % 2 == 0 else "#FFD166")
         canvas.drawRRect(c_rr, skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=2.8, Color=b_col))
 
-        # Left Polaroid Evidence Photo Frame (distinct REAL photograph per node!)
-        pol_w = 204.0 if is_wide else 186.0
+        # Left Polaroid Evidence Photo Frame (distinct REAL photograph per node; extra left inset on right-column cards to clear pin!)
+        pol_w = 198.0 if is_wide else 184.0
         pol_h = card_h - 34.0
-        pol_x = rx + 18.0
+        pol_x = rx + (28.0 if (is_wide and idx % 2 == 1) else 18.0)
         pol_y = ry + 17.0
         pol_rect = skia.Rect.MakeXYWH(pol_x, pol_y, pol_w, pol_h)
 
@@ -2825,9 +3815,10 @@ def _draw_mode_red_string_board(
         )
         canvas.restore()
 
-        # Right Obsidian Node Text Info (auto-wrapped, guaranteed zero clipping!)
+        # Right Obsidian Node Text Info (extra right-side padding on left-column cards so text stays generously clear of the pink pin!)
         tx = pol_x + pol_w + 22.0
-        tw_max = (rx + card_w - 20.0) - tx
+        right_pin_pad = 58.0 if (idx % 2 == 0) else 28.0
+        tw_max = max(120.0, (rx + card_w - right_pin_pad) - tx)
 
         b_font, b_lns = _wrap_text_to_width(nd.badge.upper(), ui_tf, 19.0, 13.5, tw_max, 1)
         if b_lns:
@@ -2921,14 +3912,22 @@ def _draw_chapter_card_overlay(
     canvas.drawLine(w * 0.5 - line_w * 0.5, h * 0.43, w * 0.5 + line_w * 0.5, h * 0.43, line_p)
     canvas.drawLine(w * 0.5 - line_w * 0.5, h * 0.59, w * 0.5 + line_w * 0.5, h * 0.59, line_p)
 
-    # Wide letter-spaced C A P Í T U L O   I
-    clean_ct = _sanitize_glyphs(chapter_title, typeface=title_tf)
-    c_font, c_lns = _wrap_text_to_width(clean_ct, title_tf, 58.0, 28.0, w - 160.0, 1)
-    if c_lns:
-        cw = float(c_font.measureText(c_lns[0]))
+    # Wide letter-spaced C A P Í T U L O     I (preserving generous multi-space gap before Roman numeral!)
+    clean_ct = _sanitize_glyphs(chapter_title, typeface=title_tf, preserve_spacing=True)
+    # Guarantee generous visual gap before Roman numeral even if caller passed tighter spacing
+    clean_ct = re.sub(r"(C A P Í T U L O)\s+([IVX])", r"\1     \2", clean_ct)
+    clean_ct = re.sub(r"(C H A P T E R)\s+([IVX])", r"\1     \2", clean_ct)
+    if clean_ct:
+        max_ct_w = w - 160.0
+        ct_size = 58.0
+        c_font = skia.Font(title_tf, ct_size)
+        while ct_size > 26.0 and float(c_font.measureText(clean_ct)) > max_ct_w:
+            ct_size -= 2.5
+            c_font = skia.Font(title_tf, ct_size)
+        cw = float(c_font.measureText(clean_ct))
         cp = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(alpha, 255, 209, 102))
         cp.setImageFilter(skia.ImageFilters.DropShadow(0, 0, 24, 24, skia.ColorSetARGB(int(alpha * 0.65), 255, 209, 102)))
-        _draw_safe_string(canvas, c_lns[0], (w - cw) * 0.5, h * 0.39, c_font, cp)
+        _draw_safe_string(canvas, clean_ct, (w - cw) * 0.5, h * 0.39, c_font, cp, preserve_spacing=True)
 
     if chapter_subtitle:
         clean_sub = _sanitize_glyphs(chapter_subtitle.upper(), typeface=ui_tf)
@@ -2988,17 +3987,22 @@ def _draw_doc_subtitles(
     chunks: List[Dict[str, Any]],
     t: float,
     caption_tf: skia.Typeface,
+    caption_style: str = "cinema_minimal",
 ) -> None:
-    """Render clean documentary subtitles with custom-fitted active word pill and guaranteed zero edge clipping."""
-    is_wide = w >= h
-    base_size = 58.0 if is_wide else 72.0
-    cap_font = skia.Font(caption_tf, base_size)
-    space_w = max(24.0, float(cap_font.measureText(" ")) * 1.42)
-    fm = cap_font.getMetrics()
-    ascent = abs(float(fm.fAscent))
-    descent = abs(float(fm.fDescent))
+    """Render studio-grade kinetic documentary subtitles via `engine.kinetic_captions.draw_kinetic_captions`
+    (supporting all 6 presets: `hormozi_neon`, `karaoke_glow`, `word_slam`, `cinema_minimal`,
+    `typewriter_highlight`, `none`) with guaranteed zero edge clipping and built-in fallback.
+    """
+    resolved_style = (
+        resolve_caption_style(caption_style)
+        if resolve_caption_style is not None
+        else str(caption_style or "cinema_minimal").strip().lower()
+    )
+    if resolved_style == "none":
+        return
 
-    # Contrast lower-third scrim
+    is_wide = w >= h
+    # Contrast lower-third cinema scrim so kinetic captions stay razor-sharp over moving footage
     scrim = skia.Paint()
     scrim.setShader(
         skia.GradientShader.MakeLinear(
@@ -3007,6 +4011,29 @@ def _draw_doc_subtitles(
         )
     )
     canvas.drawRect(skia.Rect.MakeXYWH(0, h * 0.80, w, h * 0.20), scrim)
+
+    if draw_kinetic_captions is not None:
+        draw_kinetic_captions(
+            canvas=canvas,
+            chunks=chunks,
+            t=t,
+            w=w,
+            h=h,
+            typeface=caption_tf,
+            style=resolved_style,
+            y_ratio=0.905 if is_wide else 0.84,
+            font_size=58.0 if is_wide else 72.0,
+            palette=ACTIVE_PILL_PALETTE,
+        )
+        return
+
+    # Built-in fallback if kinetic_captions module is unavailable
+    base_size = 58.0 if is_wide else 72.0
+    cap_font = skia.Font(caption_tf, base_size)
+    space_w = max(24.0, float(cap_font.measureText(" ")) * 1.42)
+    fm = cap_font.getMetrics()
+    ascent = abs(float(fm.fAscent))
+    descent = abs(float(fm.fDescent))
 
     for ch in chunks:
         if ch["start"] <= t <= ch["end"]:
@@ -3137,9 +4164,10 @@ def _render_single_doc_scene_to_disk(
     thermal_limit_c: float,
     media_assets: Optional[SceneMediaAssets] = None,
     lang: str = "pt_br",
+    caption_style: str = "cinema_minimal",
 ) -> Tuple[Path, bool]:
     """Render one documentary scene at 30fps in C++ Skia directly to disk with REAL moving B-roll video,
-    Video-over-Video PiP monitor, REAL photographs, LUT 02_dark_wealth.cube & 35mm film grain.
+    Video-over-Video PiP monitor, REAL photographs, kinetic captions, LUT 02_dark_wealth.cube & 35mm film grain.
     """
     try:
         os.nice(10)
@@ -3165,7 +4193,8 @@ def _render_single_doc_scene_to_disk(
 
     surface = skia.Surface(w, h)
     chunks = group_words_into_chunks(scene_words, max_words=3)
-    total_frames = max(1, int(math.ceil(scene_dur * fps)))
+    total_frames = max(1, int(round(scene_dur * fps)))
+    exact_dur = total_frames / float(fps)
 
     pre_args, enc_args, hw_suffix = build_video_encode_args(qp=19)
     vf_parts = []
@@ -3199,7 +4228,7 @@ def _render_single_doc_scene_to_disk(
         "-vf",
         vf_chain,
         "-t",
-        f"{scene_dur:.3f}",
+        f"{exact_dur:.4f}",
         *enc_args,
         "-an",
         str(out_scene_mp4),
@@ -3251,7 +4280,7 @@ def _render_single_doc_scene_to_disk(
                 )
             else:
                 body_t = max(0.0, local_t - chapter_intro_s)
-                body_dur = max(0.5, scene_dur - chapter_intro_s)
+                body_dur = max(0.5, exact_dur - chapter_intro_s)
                 prog = min(1.0, body_t / body_dur)
                 pip_frame = pip_reader.read_skia_frame(darken_alpha=0.0) if pip_reader is not None else None
 
@@ -3271,7 +4300,7 @@ def _render_single_doc_scene_to_disk(
                     _draw_mode_parallax_25d_photo(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, loaded_media, is_en=is_en)
 
                 _draw_sleek_lower_third(c, w, h, scene, body_t, body_dur, title_tf, ui_tf)
-                _draw_doc_subtitles(c, w, h, chunks, local_t, caption_tf)
+                _draw_doc_subtitles(c, w, h, chunks, local_t, caption_tf, caption_style=caption_style)
 
             # Top slim cinema progress bar
             bar_w = max(8.0, w * min(1.0, global_t / max(0.1, total_est_dur)))
@@ -3308,8 +4337,9 @@ def _prefetch_scene_media_sync(
     scenes: List[NetflixDocScene],
     work_dir: Path,
     aspect_ratio: str,
+    mood: str = "corporate_thriller",
 ) -> Tuple[List[SceneMediaAssets], Dict[str, Any]]:
-    """Fetch unique real HD B-roll videos, secondary PiP videos, and real archival photographs for all scenes."""
+    """Fetch unique real HD B-roll videos, secondary PiP videos, and real/bespoke Gemini archival photographs."""
     used_video_hashes: Set[str] = set()
     used_photo_urls: Set[str] = set()
 
@@ -3322,15 +4352,18 @@ def _prefetch_scene_media_sync(
 
     for s_idx, sc in enumerate(scenes):
         item = SceneMediaAssets()
+        sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
+        mood_defaults = _OPEN_TOPIC_FALLBACK_MEDIA.get(sc_mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
 
-        # 1. Primary HD B-Roll Video (EVERY SINGLE SCENE!)
-        broll_q = sc.broll_query_en or "london financial district skyline night"
+        # 1. Primary HD B-Roll Video (EVERY SINGLE SCENE — mood-aware, never finance stocks for horror/history!)
+        broll_q = sc.broll_query_en or mood_defaults["broll"][s_idx % len(mood_defaults["broll"])]
         main_mp4 = fetch_doc_broll_clip(
             broll_q,
             work_dir,
             f"sc{s_idx:02d}_main",
             used_video_hashes,
             aspect_ratio=aspect_ratio,
+            mood=sc_mood,
         )
         if main_mp4 is None and fallback_video_pool:
             main_mp4 = fallback_video_pool[s_idx % len(fallback_video_pool)]
@@ -3342,16 +4375,16 @@ def _prefetch_scene_media_sync(
 
         # 2. Secondary Video-over-Video (PiP) B-Roll Video
         if sc.visual_mode in PIP_ENABLED_MODES:
-            pip_q = sc.pip_broll_query_en or "stock market trading monitors"
+            pip_q = sc.pip_broll_query_en or mood_defaults["pip"][s_idx % len(mood_defaults["pip"])]
             pip_mp4 = fetch_doc_broll_clip(
                 pip_q,
                 work_dir,
                 f"sc{s_idx:02d}_pip",
                 used_video_hashes,
                 aspect_ratio="16:9",
+                mood=sc_mood,
             )
             if pip_mp4 is None and fallback_video_pool:
-                # Prefer a clip distinct from main_mp4 if available
                 alt = next((p for p in fallback_video_pool if p != main_mp4), fallback_video_pool[0])
                 pip_mp4 = alt
             if pip_mp4 is not None:
@@ -3360,25 +4393,23 @@ def _prefetch_scene_media_sync(
                 if pip_mp4 not in fallback_video_pool:
                     fallback_video_pool.append(pip_mp4)
 
-        # 3. Real Photographs (primary + multi-photo sets for red_string_board / sliding_timeline)
+        # 3. Real / Bespoke Archival Photographs (Gemini Native Image + Pixabay + Wikimedia seamless blend!)
         if sc.visual_mode == "red_string_board":
-            # Fetch 4 distinct real photographs (at least 3) for the Polaroid evidence nodes
             q_list = list(sc.extra_photo_queries_en or [])
             if not q_list:
-                q_list = [
-                    sc.photo_query_en or "london financial district skyline",
-                    "stock market trading floor",
-                    "historic bank building london",
-                    "businessman suit office portrait",
-                ]
+                q_list = [sc.photo_query_en or mood_defaults["photos"][0], *mood_defaults["photos"][:3]]
             for pi in range(4):
                 pq = q_list[pi % len(q_list)]
-                ppath = fetch_doc_real_photo(
+                ppath = fetch_doc_hero_or_archival_photo(
                     pq,
                     work_dir,
                     f"sc{s_idx:02d}_board_{pi + 1}",
                     min_width=640,
                     used_urls=used_photo_urls,
+                    mood=sc_mood,
+                    prefer_gemini=(bool(sc.prefer_gemini_photo) and pi == 0),
+                    aspect_ratio="16:9",
+                    bespoke_prompt_en=sc.bespoke_image_prompt_en if pi == 0 else "",
                 )
                 if ppath is None and fallback_photo_pool:
                     ppath = fallback_photo_pool[pi % len(fallback_photo_pool)]
@@ -3390,15 +4421,18 @@ def _prefetch_scene_media_sync(
             if item.extra_photo_paths:
                 item.primary_photo_path = item.extra_photo_paths[0]
         elif sc.visual_mode == "sliding_timeline":
-            q_list = list(sc.extra_photo_queries_en or [sc.photo_query_en or "stock market trading floor"])
+            q_list = list(sc.extra_photo_queries_en or [sc.photo_query_en or mood_defaults["photos"][0]])
             for pi in range(min(3, max(2, len(sc.timeline_points)))):
                 pq = q_list[pi % len(q_list)]
-                ppath = fetch_doc_real_photo(
+                ppath = fetch_doc_hero_or_archival_photo(
                     pq,
                     work_dir,
                     f"sc{s_idx:02d}_tl_{pi + 1}",
                     min_width=640,
                     used_urls=used_photo_urls,
+                    mood=sc_mood,
+                    prefer_gemini=(bool(sc.prefer_gemini_photo) and pi == 0),
+                    aspect_ratio="16:9",
                 )
                 if ppath is None and fallback_photo_pool:
                     ppath = fallback_photo_pool[pi % len(fallback_photo_pool)]
@@ -3411,13 +4445,17 @@ def _prefetch_scene_media_sync(
                 item.primary_photo_path = item.extra_photo_paths[0]
         elif sc.visual_mode in ("parallax_25d_photo", "newspaper_highlighter", "broll_video_pip", "video_pip_evidence"):
             min_w = 800 if sc.visual_mode == "parallax_25d_photo" else 640
-            pq = sc.photo_query_en or sc.image_prompt_en or "historic bank building london"
-            ppath = fetch_doc_real_photo(
+            pq = sc.photo_query_en or sc.image_prompt_en or mood_defaults["photos"][s_idx % len(mood_defaults["photos"])]
+            ppath = fetch_doc_hero_or_archival_photo(
                 pq,
                 work_dir,
                 f"sc{s_idx:02d}_photo",
                 min_width=min_w,
                 used_urls=used_photo_urls,
+                mood=sc_mood,
+                prefer_gemini=bool(sc.prefer_gemini_photo),
+                aspect_ratio=aspect_ratio,
+                bespoke_prompt_en=sc.bespoke_image_prompt_en or "",
             )
             if ppath is None and fallback_photo_pool:
                 ppath = fallback_photo_pool[s_idx % len(fallback_photo_pool)]
@@ -3441,18 +4479,215 @@ def _prefetch_scene_media_sync(
     return assets_list, telemetry
 
 
+def _pick_sfx(sfx_dir: Path, *names: str) -> Optional[Path]:
+    """Return the first existing upgraded Hollywood SFX file in `sfx_dir`."""
+    for name in names:
+        p = sfx_dir / name
+        if p.exists() and p.stat().st_size > 2048:
+            return p
+    return None
+
+
+def _select_doc_music_bed(
+    plan_obj: NetflixDocPlan,
+    music_mp3: Optional[Union[Path, str]] = None,
+    thermal_limit_c: float = 85.0,
+) -> Optional[Path]:
+    """Select the mood-matched cinema atmosphere music bed unless the caller explicitly forces a file or 'none'."""
+    if isinstance(music_mp3, str) and music_mp3.strip().lower() == "none":
+        return None
+    if music_mp3 is not None and str(music_mp3).strip().lower() not in ("", "auto"):
+        p_forced = Path(music_mp3)
+        if p_forced.exists():
+            return p_forced
+
+    music_dir = ASSETS_DIR / "music"
+    mood = str(plan_obj.mood or _classify_topic_mood(plan_obj.title)).strip().lower()
+
+    if mood in ("dark_horror", "investigative_crime"):
+        cand = music_dir / "dark_mystery_horror.mp3"
+        if cand.exists():
+            return cand
+        if select_music_for_mood is not None:
+            try:
+                return select_music_for_mood(plan_obj.title, default_file="dark_mystery_horror.mp3", mood=mood)
+            except Exception:
+                pass
+        return music_dir / "dark_pulse.mp3"
+
+    if mood == "corporate_thriller":
+        cand = music_dir / "dark_pulse.mp3"
+        return cand if cand.exists() else (music_dir / "epic_doc.mp3")
+
+    if mood == "epic_history":
+        cand = music_dir / "epic_doc.mp3"
+        return cand if cand.exists() else (music_dir / "dark_mystery_horror.mp3")
+
+    if select_music_for_mood is not None:
+        try:
+            return select_music_for_mood(plan_obj.title, default_file="epic_doc.mp3", mood=mood)
+        except Exception:
+            pass
+    return music_dir / "dark_pulse.mp3"
+
+
+def _probe_video_duration(path: Path) -> float:
+    """Return accurate container/stream duration in seconds via ffprobe."""
+    try:
+        res = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=nw=1:nk=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        val = float((res.stdout or "").strip() or 0.0)
+        if val > 0.05:
+            return val
+    except Exception:
+        pass
+    return _get_wav_duration(path)
+
+
+def _concat_scenes_with_xfade(
+    scene_mp4_paths: List[Path],
+    transitions: List[str],
+    xfade_dur: float,
+    fps: int,
+    out_mp4: Path,
+    work_dir: Path,
+    thermal_limit_c: float,
+) -> Tuple[Path, bool]:
+    """Concatenate rendered documentary scenes using smooth 0.35s FFmpeg `xfade` cinema transitions
+    (`fadeblack`, `smoothleft`, `zoomin`, `dissolve`, `wiperight`) with hardware QuickSync VAAPI
+    encoding (and automatic software fallback) while keeping Core i5 RAM & thermals safe.
+    """
+    if not scene_mp4_paths:
+        raise RuntimeError("Nenhuma cena renderizada para concatenar.")
+    if len(scene_mp4_paths) == 1:
+        run_ffmpeg_safe(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(scene_mp4_paths[0]), "-c:v", "copy", "-an", str(out_mp4)],
+            thermal_limit_c=thermal_limit_c,
+        )
+        return out_mp4, False
+
+    # Balanced batch reduction if documentary has > 10 scenes so RAM stays flat on Core i5!
+    if len(scene_mp4_paths) > 10:
+        batch_size = 8
+        batch_outs: List[Path] = []
+        batch_trs: List[str] = []
+        for b_idx, start in enumerate(range(0, len(scene_mp4_paths), batch_size)):
+            chunk_paths = scene_mp4_paths[start : start + batch_size]
+            chunk_trs = transitions[start : start + len(chunk_paths) - 1]
+            b_out = work_dir / f"_xfade_batch_{b_idx:02d}.mp4"
+            _concat_scenes_with_xfade(
+                chunk_paths,
+                chunk_trs,
+                xfade_dur=xfade_dur,
+                fps=fps,
+                out_mp4=b_out,
+                work_dir=work_dir,
+                thermal_limit_c=thermal_limit_c,
+            )
+            batch_outs.append(b_out)
+            boundary_tr_idx = start + len(chunk_paths) - 1
+            if boundary_tr_idx < len(transitions):
+                batch_trs.append(transitions[boundary_tr_idx])
+        return _concat_scenes_with_xfade(
+            batch_outs,
+            batch_trs,
+            xfade_dur=xfade_dur,
+            fps=fps,
+            out_mp4=out_mp4,
+            work_dir=work_dir,
+            thermal_limit_c=thermal_limit_c,
+        )
+
+    durs = [_probe_video_duration(p) for p in scene_mp4_paths]
+    eff_d = min(float(xfade_dur), max(0.12, min(durs) * 0.35))
+
+    def _run_xfade_pass(use_vaapi: Optional[bool]) -> None:
+        pre_args, enc_args, hw_suffix = build_video_encode_args(qp=19, use_vaapi=use_vaapi)
+        inputs: List[str] = []
+        filter_parts: List[str] = []
+        for idx, p in enumerate(scene_mp4_paths):
+            inputs.extend(["-i", str(p)])
+            filter_parts.append(f"[{idx}:v]fps={fps},format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS[v{idx}]")
+
+        accum_dur = durs[0]
+        prev_lbl = "[v0]"
+        for i in range(1, len(scene_mp4_paths)):
+            tr_name = transitions[i - 1] if (i - 1) < len(transitions) else CINEMA_XFADE_POOL[(i - 1) % len(CINEMA_XFADE_POOL)]
+            if tr_name not in ("fadeblack", "smoothleft", "zoomin", "dissolve", "wiperight", "fade", "hblur", "smoothright"):
+                tr_name = "fadeblack"
+            offset = max(0.05, round(accum_dur - eff_d, 4))
+            out_lbl = f"[xf{i}]"
+            filter_parts.append(
+                f"{prev_lbl}[v{i}]xfade=transition={tr_name}:duration={eff_d:.3f}:offset={offset:.4f}{out_lbl}"
+            )
+            prev_lbl = out_lbl
+            accum_dur = offset + durs[i]
+
+        filter_parts.append(f"{prev_lbl}{hw_suffix}[vout]")
+
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            *pre_args,
+            *inputs,
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "[vout]",
+            *enc_args,
+            "-an",
+            str(out_mp4),
+        ]
+        run_ffmpeg_safe(cmd, thermal_limit_c=thermal_limit_c, timeout=420)
+
+    try:
+        _run_xfade_pass(use_vaapi=None)
+        return out_mp4, True
+    except Exception as exc_hw:
+        print(f"[NetflixDoc] xfade VAAPI fallback -> libx264 ({exc_hw})", flush=True)
+        try:
+            _run_xfade_pass(use_vaapi=False)
+            return out_mp4, True
+        except Exception as exc_sw:
+            print(f"[NetflixDoc] xfade emergency concat fallback ({exc_sw})", flush=True)
+            video_concat_txt = work_dir / "doc_video_concat_fallback.txt"
+            video_concat_txt.write_text("\n".join(f"file '{p.resolve()}'" for p in scene_mp4_paths), encoding="utf-8")
+            run_ffmpeg_safe(
+                [
+                    "ffmpeg", "-y", "-v", "error",
+                    "-f", "concat", "-safe", "0", "-i", str(video_concat_txt),
+                    "-c:v", "copy", "-an",
+                    str(out_mp4),
+                ],
+                thermal_limit_c=thermal_limit_c,
+            )
+            return out_mp4, False
+
+
 async def render_netflix_documentary(
     plan: Union[Dict[str, Any], NetflixDocPlan],
     work_dir: Path,
     out_master_mp4: Path,
-    music_mp3: Optional[Path] = None,
+    music_mp3: Optional[Union[Path, str]] = None,
     fps: int = 30,
     thermal_limit_c: float = 85.0,
     progress_cb=None,
+    caption_style: Optional[str] = None,
+    music_volume: float = 0.17,
+    voice_rate: str = "+5%",
+    voice_pitch: str = "-6Hz",
 ) -> Dict[str, Any]:
-    """Render a complete Netflix / MagnatesMedia investigative documentary scene-by-scene to disk
-    with REAL moving HD B-roll video in every scene, Video-over-Video (PiP), REAL photographs + u2netp 2.5D parallax,
-    Chapter Cards + sub_boom.wav hits, LUT 02_dark_wealth.cube, 35mm film grain, and -14 LUFS broadcast audio mastering.
+    """Render a complete Netflix / MagnatesMedia / Dark History cinema documentary scene-by-scene to disk
+    with REAL moving HD B-roll video in every scene, Video-over-Video (PiP), REAL/Bespoke Gemini photographs
+    + u2netp 2.5D parallax, 0.35s FFmpeg `xfade` cinema transitions, Hollywood multi-layered SFX,
+    mood-matched atmosphere music bed, kinetic captions, LUT 02_dark_wealth.cube, 35mm film grain,
+    and -14 LUFS broadcast audio mastering.
     """
     fps = 30 if int(fps) <= 30 else 60
     work_dir = Path(work_dir)
@@ -3462,35 +4697,60 @@ async def render_netflix_documentary(
 
     plan_dict = plan.model_dump() if hasattr(plan, "model_dump") else dict(plan)
     plan_obj = NetflixDocPlan.model_validate(plan_dict)
+    doc_mood = _normalize_mood(plan_obj.mood, plan_obj.title)
+    plan_obj.mood = doc_mood
+    for sc in plan_obj.scenes:
+        if not sc.mood or (sc.mood == "corporate_thriller" and doc_mood != "corporate_thriller"):
+            sc.mood = doc_mood
+
+    eff_caption_style = str(caption_style or plan_obj.caption_style or "cinema_minimal").strip()
+    if resolve_caption_style is not None:
+        eff_caption_style = resolve_caption_style(eff_caption_style)
 
     w, h = (1920, 1080) if plan_obj.aspect_ratio == "16:9" else (1080, 1920)
     lut_path = ASSETS_DIR / "luts" / (plan_obj.lut_file or "02_dark_wealth.cube")
     sfx_dir = ASSETS_DIR / "sfx"
-    if music_mp3 is None or not Path(music_mp3).exists():
-        music_mp3 = ASSETS_DIR / "music" / "dark_pulse.mp3"
+
+    # Guarantee Pro Cinema Hollywood SFX & dark_mystery_horror.mp3 exist before audio mastering
+    if ensure_pro_cinema_sfx is not None:
+        try:
+            await asyncio.to_thread(ensure_pro_cinema_sfx, False, thermal_limit_c)
+        except Exception:
+            pass
+
+    resolved_music_mp3 = _select_doc_music_bed(plan_obj, music_mp3=music_mp3, thermal_limit_c=thermal_limit_c)
+    eff_music_vol = max(0.0, min(0.45, float(music_volume if music_volume is not None else 0.17)))
 
     title_tf, font_info = _load_verified_typeface("Montserrat-Black.ttf", role="doc_title")
     ui_tf, _ = _load_verified_typeface("PlusJakartaSans-ExtraBold.ttf", role="doc_ui")
     caption_tf, _ = _load_verified_typeface("Montserrat-Black.ttf", role="doc_caption")
 
-    # 1. Pre-fetch real HD B-roll videos, secondary PiP videos, and real archival photographs for all scenes
+    # 1. Pre-fetch real HD B-roll videos, secondary PiP videos, and real/bespoke archival photographs for all scenes
     if progress_cb:
-        progress_cb(10, "Capturando vídeos B-roll HD, feeds PiP e fotografias reais de arquivo...")
+        progress_cb(10, "Capturando vídeos B-roll HD, feeds PiP e fotografias/artes cinematográficas de arquivo...")
     scene_media_list, media_telemetry = await asyncio.to_thread(
         _prefetch_scene_media_sync,
         plan_obj.scenes,
         work_dir,
         plan_obj.aspect_ratio,
+        doc_mood,
     )
 
-    # 2. Synthesize narration per scene & compute exact timeline with Chapter Card intro windows
+    # 2. Synthesize narration per scene & compute exact timeline with Chapter Cards + Hollywood SFX
     scene_records: List[Dict[str, Any]] = []
     all_words: List[Dict[str, Any]] = []
     audio_parts: List[Path] = []
     sfx_events: List[Tuple[Path, float, float]] = []
+    transitions_plan: List[str] = []
+
+    def _add_sfx(t_s: float, vol: float, *cand_names: str) -> None:
+        p_sfx = _pick_sfx(sfx_dir, *cand_names)
+        if p_sfx is not None and t_s >= 0.0:
+            sfx_events.append((p_sfx, round(t_s, 3), float(vol)))
 
     cursor_t = 0.0
     pause_gap_s = 0.24
+    xfade_dur = CINEMA_XFADE_DURATION_S
     gap_wav = work_dir / "_doc_gap.wav"
     run_ffmpeg_safe(
         ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", f"{pause_gap_s:.2f}", str(gap_wav)],
@@ -3498,10 +4758,28 @@ async def render_netflix_documentary(
     )
 
     n_scenes = len(plan_obj.scenes)
+    is_dark_mood = doc_mood in ("dark_horror", "investigative_crime")
+
     for s_idx, sc in enumerate(plan_obj.scenes):
         if progress_cb:
             pct = 18 + int(24 * ((s_idx + 1) / float(max(1, n_scenes))))
-            progress_cb(pct, f"Sintetizando narração investigativa cena {s_idx + 1}/{n_scenes} ({sc.visual_mode})...")
+            progress_cb(pct, f"Sintetizando narração cinema cena {s_idx + 1}/{n_scenes} ({sc.visual_mode})...")
+
+        tr_name = sc.transition_type or _select_transition_for_scene(s_idx, sc.visual_mode, sc.chapter_card is not None)
+        if s_idx > 0:
+            transitions_plan.append(tr_name)
+            # Sync Hollywood transition SFX RIGHT on the 0.35s xfade cut!
+            if sc.chapter_card:
+                # Rising thriller tension leading straight into the black dip + Chapter Card braam/boom!
+                if cursor_t >= 1.4:
+                    _add_sfx(cursor_t - 1.25, 0.26, "riser_tension.wav")
+            elif tr_name in ("smoothleft", "wiperight"):
+                _add_sfx(max(0.0, cursor_t - 0.06), 0.42, "whoosh_deep.wav", "whoosh_fast.wav")
+            elif tr_name == "zoomin":
+                _add_sfx(max(0.0, cursor_t - 0.04), 0.44, "flash_impact.wav", "cinematic_hit.wav")
+            else:
+                _add_sfx(max(0.0, cursor_t - 0.05), 0.38, "whoosh_deep.wav")
+                _add_sfx(cursor_t + 0.03, 0.32, "sub_boom.wav")
 
         chapter_intro_s = 1.65 if sc.chapter_card else 0.0
         chap_gap_wav = work_dir / f"_chap_intro_{s_idx:03d}.wav"
@@ -3516,8 +4794,11 @@ async def render_netflix_documentary(
                 thermal_limit_c=thermal_limit_c,
             )
             audio_parts.append(chap_gap_wav)
-            # Mandatory sub_boom.wav hit on Chapter Card reveal
-            sfx_events.append((sfx_dir / "sub_boom.wav", cursor_t + 0.04, 0.42))
+            # Signature Chapter Card impact: chilling horror_braam for dark_horror, massive sub_boom for all others!
+            if doc_mood == "dark_horror":
+                _add_sfx(cursor_t + 0.04, 0.56, "horror_braam.wav", "sub_boom.wav")
+            else:
+                _add_sfx(cursor_t + 0.04, 0.54, "sub_boom.wav", "cinematic_hit.wav")
 
         wav_p, words, speech_dur = await _synthesize_doc_scene_narration(
             sc.narration,
@@ -3526,6 +4807,8 @@ async def render_netflix_documentary(
             work_dir,
             f"doc_narr_{s_idx:03d}",
             thermal_limit_c=thermal_limit_c,
+            rate=voice_rate,
+            pitch=voice_pitch,
         )
 
         # Shift scene words by chapter_intro_s (local scene time) and cursor_t (master time)
@@ -3545,32 +4828,40 @@ async def render_netflix_documentary(
                 }
             )
 
-        # Mode-specific subtle investigative sound design
+        # Hollywood mood-matched foley & scene-entrance SFX
         body_start_t = cursor_t + chapter_intro_s
         if s_idx == 0:
-            sfx_events.append((sfx_dir / "cinematic_hit.wav", 0.05, 0.36))
+            if is_dark_mood:
+                _add_sfx(0.04, 0.56, "horror_braam.wav", "sub_boom.wav")
+            else:
+                _add_sfx(0.04, 0.50, "cinematic_hit.wav", "sub_boom.wav")
         if sc.visual_mode == "broll_video_pip":
-            sfx_events.append((sfx_dir / "whoosh_fast.wav", body_start_t + 0.14, 0.28))
+            _add_sfx(body_start_t + 0.14, 0.34, "whoosh_fast.wav", "whoosh_deep.wav")
         elif sc.visual_mode == "video_pip_evidence":
-            sfx_events.append((sfx_dir / "ui_click.wav", body_start_t + 0.14, 0.28))
+            _add_sfx(body_start_t + 0.12, 0.36, "flash_impact.wav", "ui_click.wav")
         elif sc.visual_mode == "parallax_25d_photo":
-            sfx_events.append((sfx_dir / "camera_shutter.wav", body_start_t + 0.12, 0.28))
+            _add_sfx(body_start_t + 0.12, 0.40, "flash_impact.wav", "camera_shutter.wav")
         elif sc.visual_mode == "newspaper_highlighter":
-            sfx_events.append((sfx_dir / "whoosh_deep.wav", body_start_t + 0.10, 0.30))
+            _add_sfx(body_start_t + 0.10, 0.44, "paper_flip.wav", "whoosh_deep.wav")
         elif sc.visual_mode == "dark_map_route":
-            sfx_events.append((sfx_dir / "ui_click.wav", body_start_t + 0.15, 0.26))
+            _add_sfx(body_start_t + 0.14, 0.32, "ui_click.wav")
+            _add_sfx(body_start_t + 0.24, 0.28, "whoosh_fast.wav")
         elif sc.visual_mode == "sliding_timeline":
-            sfx_events.append((sfx_dir / "cash_chime.wav", body_start_t + 0.18, 0.28))
+            if doc_mood == "corporate_thriller":
+                _add_sfx(body_start_t + 0.16, 0.32, "cash_chime.wav", "ui_click.wav")
+            else:
+                _add_sfx(body_start_t + 0.14, 0.38, "sub_boom.wav", "ui_click.wav")
         elif sc.visual_mode == "red_string_board":
-            sfx_events.append((sfx_dir / "heartbeat.wav", body_start_t + 0.10, 0.28))
+            _add_sfx(body_start_t + 0.10, 0.38, "heartbeat.wav", "sub_boom.wav")
+            _add_sfx(body_start_t + 0.36, 0.30, "paper_flip.wav", "whoosh_fast.wav")
 
-        scene_dur = round(chapter_intro_s + speech_dur + pause_gap_s, 3)
+        audio_scene_dur = round(chapter_intro_s + speech_dur + pause_gap_s, 3)
         scene_records.append(
             {
                 "s_idx": s_idx,
                 "scene": sc,
                 "start_t": cursor_t,
-                "scene_dur": scene_dur,
+                "scene_dur": audio_scene_dur,
                 "chapter_intro_s": chapter_intro_s,
                 "local_words": local_words,
                 "media_assets": scene_media_list[s_idx],
@@ -3578,7 +4869,7 @@ async def render_netflix_documentary(
         )
         audio_parts.append(wav_p)
         audio_parts.append(gap_wav)
-        cursor_t = round(cursor_t + scene_dur, 3)
+        cursor_t = round(cursor_t + audio_scene_dur, 3)
 
     # Concatenate full narration WAV and master Broadcast Audio (-14 LUFS + 0.40s clean tail)
     concat_audio_txt = work_dir / "doc_audio_concat.txt"
@@ -3593,19 +4884,21 @@ async def render_netflix_documentary(
     master_audio, final_dur = await asyncio.to_thread(
         master_broadcast_audio,
         raw_full_wav,
-        music_mp3,
+        resolved_music_mp3,
         sfx_events,
         master_audio,
         cursor_t,
-        0.17,
+        eff_music_vol,
         0.40,
         thermal_limit_c=thermal_limit_c,
     )
 
-    # Extend last scene duration by the 0.40s broadcast audio tail so video & audio end together
+    # Extend last scene by 0.40s broadcast audio tail; add +0.35s visual handle to scenes 0..N-2 for exact A/V sync across xfade!
     if scene_records:
         tail_delta = max(0.0, round(final_dur - cursor_t, 3))
         scene_records[-1]["scene_dur"] = round(scene_records[-1]["scene_dur"] + tail_delta, 3)
+        for idx_r, rec in enumerate(scene_records):
+            rec["render_dur"] = round(rec["scene_dur"] + (xfade_dur if idx_r < len(scene_records) - 1 else 0.0), 3)
 
     # 3. Render each scene to disk one-by-one (os.nice(10) + thermal_guard_wait -> flat RAM!)
     scene_mp4_paths: List[Path] = []
@@ -3614,7 +4907,7 @@ async def render_netflix_documentary(
         s_idx = rec["s_idx"]
         sc: NetflixDocScene = rec["scene"]
         if progress_cb:
-            pct = 45 + int(42 * ((s_idx + 1) / float(max(1, n_scenes))))
+            pct = 45 + int(40 * ((s_idx + 1) / float(max(1, n_scenes))))
             progress_cb(
                 pct,
                 f"Renderizando cena Skia C++ {s_idx + 1}/{n_scenes} [{sc.visual_mode}] ({w}x{h} @ {fps}fps | Vídeo Real + PiP + Fotos)...",
@@ -3624,7 +4917,7 @@ async def render_netflix_documentary(
             _render_single_doc_scene_to_disk,
             sc,
             s_idx,
-            rec["scene_dur"],
+            rec["render_dur"],
             rec["chapter_intro_s"],
             rec["local_words"],
             rec["start_t"],
@@ -3640,23 +4933,25 @@ async def render_netflix_documentary(
             thermal_limit_c,
             rec["media_assets"],
             plan_obj.lang,
+            eff_caption_style,
         )
         if did_u2netp:
             u2netp_25d_used = True
         scene_mp4_paths.append(rendered_p)
 
-    # 4. Concatenate rendered scene MP4s with zero-reencode stream copy + mux master broadcast audio
-    video_concat_txt = work_dir / "doc_video_concat.txt"
-    video_concat_txt.write_text("\n".join(f"file '{p.resolve()}'" for p in scene_mp4_paths), encoding="utf-8")
+    # 4. Join rendered scenes with smooth 0.35s FFmpeg `xfade` cinema transitions + mux master broadcast audio
+    if progress_cb:
+        progress_cb(88, "Aplicando transições cinema FFmpeg xfade (0.35s) e mixagem master -14 LUFS...")
     base_scenes_mp4 = work_dir / "base_scenes.mp4"
-    run_ffmpeg_safe(
-        [
-            "ffmpeg", "-y", "-v", "error",
-            "-f", "concat", "-safe", "0", "-i", str(video_concat_txt),
-            "-c:v", "copy", "-an",
-            str(base_scenes_mp4),
-        ],
-        thermal_limit_c=thermal_limit_c,
+    base_scenes_mp4, xfade_active = await asyncio.to_thread(
+        _concat_scenes_with_xfade,
+        scene_mp4_paths,
+        transitions_plan,
+        xfade_dur,
+        fps,
+        base_scenes_mp4,
+        work_dir,
+        thermal_limit_c,
     )
 
     run_ffmpeg_safe(
@@ -3666,6 +4961,7 @@ async def render_netflix_documentary(
             "-i", str(master_audio),
             "-map", "0:v", "-map", "1:a",
             "-c:v", "copy", "-c:a", "copy",
+            "-shortest",
             "-movflags", "+faststart",
             str(out_master_mp4),
         ],
@@ -3680,21 +4976,29 @@ async def render_netflix_documentary(
         "master_audio": str(master_audio),
         "base_scenes_mp4": str(base_scenes_mp4),
         "words": all_words,
-        "duration_s": round(_get_wav_duration(out_master_mp4), 2),
+        "duration_s": round(_probe_video_duration(out_master_mp4), 2),
         "aspect_ratio": plan_obj.aspect_ratio,
         "width": w,
         "height": h,
         "fps": fps,
         "lang": plan_obj.lang,
+        "mood": doc_mood,
+        "music_bed": str(resolved_music_mp3) if resolved_music_mp3 else "none",
+        "caption_style": eff_caption_style,
         "channel_name": plan_obj.channel_name,
         "voice_id": plan_obj.voice_id,
         "lut_file": plan_obj.lut_file,
         "film_grain": "35mm_active",
-        "doc_engine": "netflix_magnates_cinema_v2_real_media",
+        "xfade_active": xfade_active,
+        "xfade_duration_s": xfade_dur if xfade_active else 0.0,
+        "transitions_used": transitions_plan,
+        "sfx_events_count": len(sfx_events),
+        "doc_engine": "netflix_magnates_cinema_v3_open_topic_xfade",
         "font_verified": font_info,
         "title": plan_obj.title,
         "subtitle": plan_obj.subtitle,
         "thumbnail_hook": plan_obj.thumbnail_hook,
+        "topic_source": plan_obj.topic_source,
         "scenes_count": len(plan_obj.scenes),
         "chapters": chapters_used,
         "visual_modes_used": modes_used,

@@ -30,6 +30,7 @@
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -45,7 +46,7 @@ import httpx
 import numpy as np
 import skia
 
-from database import get_settings
+from database import get_settings, record_token_usage
 from engine.smart_vision import (
     BAD_TAG_WORDS,
     CACHE_DIR as SMART_VISION_CACHE_DIR,
@@ -109,6 +110,107 @@ CURATED_DOC_PHOTO_QUERIES: List[str] = [
     "money bills finance dark",
 ]
 
+MOOD_DOC_BROLL_QUERIES: Dict[str, List[str]] = {
+    "dark_horror": [
+        "snow forest night",
+        "candle flame dark",
+        "medieval castle fog",
+        "gothic cathedral dark",
+        "fireplace burning dark",
+        "winter snow village",
+    ],
+    "investigative_crime": [
+        "rainy city street night",
+        "dark alley fog night",
+        "police lights night",
+        "courthouse building architecture",
+        "old library archive dark",
+        "newspaper printing press",
+    ],
+    "epic_history": [
+        "ancient roman ruins",
+        "medieval castle fog",
+        "gothic cathedral dark",
+        "candle flame dark",
+        "historic european village",
+        "old book library candle",
+    ],
+    "corporate_thriller": list(CURATED_DOC_BROLL_QUERIES),
+}
+
+MOOD_DOC_PHOTO_QUERIES: Dict[str, List[str]] = {
+    "dark_horror": [
+        "dark snowy pine forest winter night",
+        "burning candle dark shadow",
+        "gothic cathedral candle",
+        "medieval winter village snow night",
+        "old parchment leather book candle",
+        "foggy forest winter dark",
+    ],
+    "investigative_crime": [
+        "rainy city street night noir",
+        "historic courthouse building",
+        "old archive files library",
+        "dark foggy alley night",
+        "vintage detective desk lamp",
+        "newspaper archive vintage",
+    ],
+    "epic_history": [
+        "ancient roman ruins colosseum",
+        "medieval stone castle europe",
+        "gothic cathedral interior candle",
+        "old parchment manuscript book",
+        "ancient marble statue museum",
+        "historic european architecture",
+    ],
+    "corporate_thriller": list(CURATED_DOC_PHOTO_QUERIES),
+}
+
+GEMINI_IMAGE_MODELS: Tuple[str, ...] = (
+    "gemini-2.5-flash-image",
+    "gemini-3.1-flash-image",
+    "gemini-3.1-flash-lite-image",
+)
+
+_BESPOKE_HISTORY_FOLKLORE_RE = re.compile(
+    r"\b("
+    r"krampus|saturnalia|pagan|ritual|folklore|demon|devil|witch|macabre|"
+    r"solstice|yule|inquisition|plague|pharaoh|viking|sacrifice|occult|"
+    r"monster|haunted|ghost|cursed|gryla|perchta|vampire|nosferatu|"
+    r"exorcism|catacomb|alchemist|myth|ancient\s+rome|medieval\s+demon|"
+    r"dark\s+christmas|winter\s+demon|horned\s+creature|secret\s+society"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_DARK_HORROR_HINT_RE = re.compile(
+    r"\b("
+    r"krampus|saturnalia|christmas|natal|horror|macabre|macabr|dark|snow|winter|"
+    r"candle|gothic|cathedral|fog|ghost|witch|demon|ritual|pagan|folklore|"
+    r"creepy|haunted|skull|cemetery|fireplace|shadow|curse|vampire|nightmare|"
+    r"medieval|forest|dungeon|crypt|tomb"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_HISTORY_HINT_RE = re.compile(
+    r"\b("
+    r"ancient|roman|rome|egypt|greek|medieval|castle|empire|war|battle|"
+    r"century|parchment|manuscript|temple|ruins|historic|museum|painting|"
+    r"engraving|artifact|viking|samurai|pharaoh"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_CRIME_HINT_RE = re.compile(
+    r"\b("
+    r"crime|murder|killer|detective|police|fbi|prison|trial|courthouse|"
+    r"forensic|mystery|conspiracy|mafia|cartel|heist|suspect|evidence"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_GEMINI_IMAGE_QUOTA_EXHAUSTED: bool = False
 _U2NETP_SESSION = None
 
 
@@ -136,6 +238,20 @@ def _shorten_query(query: str, max_words: int = 3) -> str:
     return " ".join(informative[:max_words]).strip()
 
 
+def _infer_media_mood(query: str, explicit_mood: str = "") -> str:
+    m = str(explicit_mood or "").strip().lower()
+    if m in MOOD_DOC_PHOTO_QUERIES:
+        return m
+    q = str(query or "")
+    if _DARK_HORROR_HINT_RE.search(q):
+        return "dark_horror"
+    if _CRIME_HINT_RE.search(q):
+        return "investigative_crime"
+    if _HISTORY_HINT_RE.search(q):
+        return "epic_history"
+    return "corporate_thriller"
+
+
 def _read_api_keys() -> Tuple[str, str]:
     try:
         settings = get_settings() or {}
@@ -145,6 +261,14 @@ def _read_api_keys() -> Tuple[str, str]:
         )
     except Exception:
         return "", ""
+
+
+def _read_gemini_api_key() -> str:
+    try:
+        settings = get_settings() or {}
+        return str(settings.get("gemini_api_key") or "").strip()
+    except Exception:
+        return ""
 
 
 def _center_crop_resize_bgr(
@@ -468,17 +592,191 @@ def _download_and_validate_photo(
         return None
 
 
+def _build_gemini_cinema_prompt(prompt_en: str, mood: str = "dark_horror") -> str:
+    """Wrap a documentary scene prompt in strict zero-text photographic dark-cinema art direction."""
+    mood_style = {
+        "dark_horror": (
+            "dark cinematic documentary film still, moody chiaroscuro candlelight and cold moonlight, "
+            "atmospheric winter mist, photorealistic 35mm cinema photography, shallow depth of field, "
+            "A24 and Netflix dark history documentary aesthetic"
+        ),
+        "investigative_crime": (
+            "gritty investigative documentary film still, nocturnal noir lighting, rainy reflections, "
+            "photorealistic 35mm editorial photography, tense true-crime cinema mood"
+        ),
+        "epic_history": (
+            "authentic historical documentary archival photograph or museum-grade dramatic chiaroscuro scene, "
+            "35mm cinema lens, rich natural textures, historical realism"
+        ),
+        "corporate_thriller": (
+            "sleek high-contrast financial thriller documentary still, obsidian architectural lighting, "
+            "35mm cinema lens, sharp editorial photorealism"
+        ),
+    }.get(mood, "photorealistic 35mm dark cinema documentary still, dramatic chiaroscuro lighting")
+    return (
+        f"{prompt_en.strip()}. {mood_style}. "
+        "CRITICAL: Absolutely ZERO text, ZERO words, ZERO letters, ZERO captions, ZERO watermarks, "
+        "ZERO logos, ZERO borders or picture frames. Full-bleed edge-to-edge photographic frame."
+    )
+
+
+def generate_doc_gemini_image(
+    prompt_en: str,
+    work_dir: Optional[Union[Path, str]] = None,
+    tag: str = "gemini_doc",
+    mood: str = "dark_horror",
+    aspect_ratio: str = "16:9",
+    min_width: int = 640,
+    used_urls: Optional[Set[str]] = None,
+) -> Optional[Path]:
+    """Generate a bespoke, zero-text dark-cinema documentary photograph via Google Gemini Native Image API.
+
+    Uses the user's LIVE `gemini_api_key` (`AQ.` or `AIza...` via `headers={"x-goog-api-key": key}`)
+    targeting `gemini-2.5-flash-image` / `gemini-3.1-flash-image` with persistent disk caching in
+    `data/doc_photo_cache/`. Returns None cleanly (without crashing) if key is missing or quota-limited.
+    """
+    global _GEMINI_IMAGE_QUOTA_EXHAUSTED
+    clean_prompt = _normalize_query(prompt_en, "")
+    if not clean_prompt:
+        return None
+
+    resolved_mood = _infer_media_mood(clean_prompt, mood)
+    ar_clean = "9:16" if str(aspect_ratio or "16:9").strip() == "9:16" else "16:9"
+    p_key = f"gemini://{resolved_mood}/{ar_clean}/{clean_prompt.lower()}"
+    p_hash = hashlib.sha256(p_key.encode("utf-8")).hexdigest()[:16]
+    cached_jpg = DOC_PHOTO_CACHE_DIR / f"gemini_{p_hash}.jpg"
+    used = used_urls if used_urls is not None else set()
+
+    # 1. Persistent cache hit (zero API calls, works even if quota is temporarily throttled!)
+    if cached_jpg.exists() and p_key not in used:
+        ok, _, _ = _validate_photo_file(cached_jpg, min_width=min(min_width, 320))
+        if ok:
+            used.add(p_key)
+            return _materialize_photo_in_work_dir(cached_jpg, work_dir, tag, p_hash)
+        cached_jpg.unlink(missing_ok=True)
+
+    if _GEMINI_IMAGE_QUOTA_EXHAUSTED:
+        return None
+
+    gkey = _read_gemini_api_key()
+    if not gkey:
+        return None
+
+    full_prompt = _build_gemini_cinema_prompt(clean_prompt, mood=resolved_mood)
+    headers = {"Content-Type": "application/json", "x-goog-api-key": gkey}
+    quota_hits = 0
+
+    with httpx.Client(follow_redirects=True, timeout=36.0) as client:
+        for model_id in GEMINI_IMAGE_MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+            payloads = [
+                {
+                    "contents": [{"parts": [{"text": full_prompt}]}],
+                    "generationConfig": {
+                        "responseModalities": ["IMAGE"],
+                        "imageConfig": {"aspectRatio": ar_clean},
+                    },
+                },
+                {
+                    "contents": [{"parts": [{"text": full_prompt}]}],
+                    "generationConfig": {"responseModalities": ["IMAGE"]},
+                },
+            ]
+            for p_idx, payload in enumerate(payloads):
+                try:
+                    resp = client.post(url, json=payload, headers=headers, timeout=36.0)
+                    if resp.status_code == 429:
+                        quota_hits += 1
+                        break
+                    if resp.status_code == 400 and p_idx == 0:
+                        continue
+                    if resp.status_code != 200:
+                        break
+
+                    j = resp.json()
+                    parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    img_b64 = ""
+                    for part in parts:
+                        idata = part.get("inlineData") or part.get("inline_data")
+                        if idata and idata.get("data"):
+                            img_b64 = str(idata["data"])
+                            break
+                    if not img_b64:
+                        break
+
+                    raw_bytes = base64.b64decode(img_b64)
+                    arr = np.frombuffer(raw_bytes, dtype=np.uint8)
+                    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if not _validate_photo_bgr(bgr, min_width=min(min_width, 320), min_height=200):
+                        break
+
+                    if bgr.shape[1] > 1920:
+                        scale = 1920.0 / float(bgr.shape[1])
+                        bgr = cv2.resize(
+                            bgr,
+                            (1920, max(200, int(round(bgr.shape[0] * scale)))),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                    cv2.imwrite(str(cached_jpg), bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                    ok, w, h = _validate_photo_file(cached_jpg, min_width=min(min_width, 320))
+                    if not ok:
+                        cached_jpg.unlink(missing_ok=True)
+                        break
+
+                    try:
+                        meta = j.get("usageMetadata", {})
+                        pt = int(meta.get("promptTokenCount", 80))
+                        ct = int(meta.get("candidatesTokenCount", 256))
+                        record_token_usage("gemini-image", model_id, pt, ct, 0, 0.002)
+                    except Exception:
+                        pass
+
+                    used.add(p_key)
+                    q_hash = hashlib.sha256(clean_prompt.lower().encode("utf-8")).hexdigest()[:16]
+                    entries = _load_photo_query_index(q_hash)
+                    if not any(e.get("url") == p_key for e in entries):
+                        entries.insert(0, {
+                            "url": p_key,
+                            "file": cached_jpg.name,
+                            "source": f"gemini_image:{model_id}",
+                            "width": w,
+                            "height": h,
+                            "query": clean_prompt,
+                            "mood": resolved_mood,
+                        })
+                        _save_photo_query_index(q_hash, entries)
+
+                    print(
+                        f"[DocMedia] Bespoke Gemini photo ready ({model_id}): {cached_jpg.name} ({w}x{h}) | q='{clean_prompt[:55]}'",
+                        flush=True,
+                    )
+                    return _materialize_photo_in_work_dir(cached_jpg, work_dir, tag, p_hash)
+                except Exception:
+                    break
+
+    if quota_hits >= len(GEMINI_IMAGE_MODELS):
+        _GEMINI_IMAGE_QUOTA_EXHAUSTED = True
+        print("[DocMedia] Gemini Image API quota currently throttled (429) — seamlessly blending Pixabay & Wikimedia archival photos.", flush=True)
+    return None
+
+
 def _fetch_pollinations_photo(
     client: httpx.Client,
     query: str,
     q_hash: str,
     used_urls: Set[str],
     min_width: int = 640,
+    mood: str = "",
 ) -> Optional[Tuple[Path, str, int, int]]:
     seed = int(q_hash[:8], 16) % 99999
     if used_urls:
         seed = (seed + len(used_urls) * 37) % 99999
-    prompt = f"{query}, editorial documentary photograph, 35mm film photography, realistic natural lighting, sharp focus, no text"
+    style_hint = {
+        "dark_horror": "dark atmospheric 35mm cinema still, chiaroscuro candlelight, moody horror history documentary, no text",
+        "epic_history": "authentic historical documentary photograph, archival 35mm film grain, museum lighting, no text",
+        "investigative_crime": "gritty nocturnal investigative documentary photograph, 35mm noir cinema lighting, no text",
+    }.get(mood, "editorial documentary photograph, 35mm film photography, realistic natural lighting, sharp focus, no text")
+    prompt = f"{query}, {style_hint}"
     url = (
         f"https://image.pollinations.ai/prompt/{quote(prompt)}"
         f"?width=1280&height=720&model=flux&nologo=true&seed={seed}"
@@ -491,12 +789,46 @@ def _fetch_pollinations_photo(
         source="pollinations_flux",
         q_hash=q_hash,
         min_width=min(min_width, 640),
-        timeout=24.0,
+        timeout=18.0,
     )
     if dl is None:
         return None
     path, w, h = dl
     return path, url, w, h
+
+
+def fetch_doc_hero_or_archival_photo(
+    query: str,
+    work_dir: Path,
+    tag: str,
+    min_width: int = 640,
+    used_urls: Optional[Set[str]] = None,
+    mood: str = "",
+    prefer_gemini: bool = False,
+    aspect_ratio: str = "16:9",
+    bespoke_prompt_en: str = "",
+) -> Optional[Path]:
+    """Fetch a bespoke Gemini dark-cinema hero photo OR real archival Pixabay / Wikimedia photograph.
+
+    Designed for open-topic documentaries (macabre folklore, ancient history, true crime, finance):
+      - When `prefer_gemini=True` or historical/folklore/macabre cues are present (e.g. Krampus,
+        Saturnalia, ancient winter rituals), tries the LIVE Gemini Native Image API first (cached in
+        `data/doc_photo_cache/`), then seamlessly blends real Wikimedia Commons archival artworks/photos
+        and Pixabay HD photography!
+      - Never falls back to unrelated financial stock photos when mood is `dark_horror`, `epic_history`,
+        or `investigative_crime`.
+    """
+    return fetch_doc_real_photo(
+        query=query,
+        work_dir=work_dir,
+        tag=tag,
+        min_width=min_width,
+        used_urls=used_urls,
+        mood=mood,
+        prefer_gemini=prefer_gemini,
+        aspect_ratio=aspect_ratio,
+        bespoke_prompt_en=bespoke_prompt_en,
+    )
 
 
 def fetch_doc_real_photo(
@@ -505,22 +837,35 @@ def fetch_doc_real_photo(
     tag: str,
     min_width: int = 640,
     used_urls: Optional[Set[str]] = None,
+    mood: str = "",
+    prefer_gemini: bool = False,
+    aspect_ratio: str = "16:9",
+    bespoke_prompt_en: str = "",
 ) -> Optional[Path]:
-    """Fetch a REAL documentary / editorial photograph with persistent disk caching.
+    """Fetch a REAL documentary / editorial photograph (or bespoke Gemini dark-cinema plate) with disk caching.
 
     Priority order:
-      a) Pixabay Photo API (live `pixabay_api_key` from `database.get_settings()`)
-      b) Wikimedia Commons Search API (`User-Agent: FrimeRiseDocEngine/2.0`)
-      c) Pollinations Flux fallback (`https://image.pollinations.ai/prompt/...`)
-      d) Curated real documentary query fallback + validated local cache
+      - If `prefer_gemini` or folklore/macabre/ancient-ritual cues detected:
+          Gemini Native Image (`gemini-2.5-flash-image` / `gemini-3.1-flash-image`) ->
+          Wikimedia Commons Archival / Pixabay HD Photo -> Pollinations Flux -> Mood-curated stock
+      - Standard real-world photography:
+          Pixabay Photo API -> Wikimedia Commons Search API -> Gemini Native Image (on stock miss) ->
+          Pollinations Flux -> Mood-curated real documentary query fallback + validated local cache
 
     Every image is validated via `cv2.imread` (non-None, width >= 320, height >= 200,
     not chroma-key green) and cached in `data/doc_photo_cache/`.
     """
-    norm_q = _normalize_query(query, "london financial district skyline")
+    resolved_mood = _infer_media_mood(f"{query} {bespoke_prompt_en}", mood)
+    mood_defaults = MOOD_DOC_PHOTO_QUERIES.get(resolved_mood, CURATED_DOC_PHOTO_QUERIES)
+    norm_q = _normalize_query(query, mood_defaults[0])
     used = used_urls if used_urls is not None else set()
     q_hash = hashlib.sha256(norm_q.lower().encode("utf-8")).hexdigest()[:16]
     eff_min_w = max(320, int(min_width))
+    is_bespoke_folklore = bool(
+        prefer_gemini
+        or _BESPOKE_HISTORY_FOLKLORE_RE.search(norm_q)
+        or (bespoke_prompt_en and _BESPOKE_HISTORY_FOLKLORE_RE.search(bespoke_prompt_en))
+    )
 
     # 0. Fast persistent cache lookup by query hash (respecting used_urls uniqueness)
     cached_entries = _load_photo_query_index(q_hash)
@@ -535,6 +880,23 @@ def fetch_doc_real_photo(
             url_hash = hashlib.sha256(c_url.encode("utf-8")).hexdigest()[:16]
             return _materialize_photo_in_work_dir(c_file, work_dir, tag, url_hash)
 
+    # 1. Bespoke Gemini Native Image Generation for folklore / ancient / macabre hero plates
+    gemini_tried = False
+    if is_bespoke_folklore:
+        gemini_tried = True
+        gem_prompt = bespoke_prompt_en.strip() if bespoke_prompt_en.strip() else norm_q
+        gem_path = generate_doc_gemini_image(
+            prompt_en=gem_prompt,
+            work_dir=work_dir,
+            tag=tag,
+            mood=resolved_mood,
+            aspect_ratio=aspect_ratio,
+            min_width=eff_min_w,
+            used_urls=used,
+        )
+        if gem_path is not None:
+            return gem_path
+
     pixabay_key, _ = _read_api_keys()
 
     def _record_and_return(cached_path: Path, src_url: str, src_name: str, w: int, h: int) -> Path:
@@ -548,6 +910,7 @@ def fetch_doc_real_photo(
                 "width": w,
                 "height": h,
                 "query": norm_q,
+                "mood": resolved_mood,
             })
             _save_photo_query_index(q_hash, entries)
         url_hash = hashlib.sha256(src_url.encode("utf-8")).hexdigest()[:16]
@@ -557,9 +920,15 @@ def fetch_doc_real_photo(
         )
         return _materialize_photo_in_work_dir(cached_path, work_dir, tag, url_hash)
 
+    # For specific museum/historical terms (e.g. Saturnalia, medieval engraving), prefer Wikimedia archival plates first
+    prefer_wiki_first = bool(
+        re.search(r"\b(saturnalia|painting|engraving|manuscript|roman|medieval|victorian|historical|museum|myth|pagan|ritual|folklore)\b", norm_q, re.IGNORECASE)
+    )
+
     with httpx.Client(follow_redirects=True, timeout=16.0) as client:
-        # a) Pixabay Photo API (primary — crisp 1280px+ real photography)
-        if pixabay_key:
+        def _try_pixabay() -> Optional[Path]:
+            if not pixabay_key:
+                return None
             for item in _search_pixabay_photos(client, norm_q, pixabay_key, min_width=eff_min_w):
                 url = item["url"]
                 if url in used:
@@ -568,32 +937,51 @@ def fetch_doc_real_photo(
                 if dl is not None:
                     p, w, h = dl
                     return _record_and_return(p, url, item["source"], w, h)
+            return None
 
-        # b) Wikimedia Commons Search API (historical / archival / editorial photography)
-        wiki_candidates = _search_wikimedia_photos(client, norm_q, min_width=eff_min_w)
-        # First pass enforces requested min_width; second pass relaxes to hard 320px floor for rare historical scans
-        for req_w in (eff_min_w, 320):
-            for item in wiki_candidates:
-                url = item["url"]
-                if url in used:
-                    continue
-                dl = _download_and_validate_photo(client, url, item["source"], q_hash, min_width=req_w)
-                if dl is not None:
-                    p, w, h = dl
-                    return _record_and_return(p, url, item["source"], w, h)
-            if req_w == 320:
-                break
+        def _try_wikimedia() -> Optional[Path]:
+            wiki_candidates = _search_wikimedia_photos(client, norm_q, min_width=eff_min_w)
+            for req_w in (eff_min_w, 320):
+                for item in wiki_candidates:
+                    url = item["url"]
+                    if url in used:
+                        continue
+                    dl = _download_and_validate_photo(client, url, item["source"], q_hash, min_width=req_w)
+                    if dl is not None:
+                        p, w, h = dl
+                        return _record_and_return(p, url, item["source"], w, h)
+                if req_w == 320:
+                    break
+            return None
 
-        # c) Pollinations Flux fallback
-        pol = _fetch_pollinations_photo(client, norm_q, q_hash, used, min_width=eff_min_w)
-        if pol is not None:
-            p, url, w, h = pol
-            return _record_and_return(p, url, "pollinations_flux", w, h)
+        # a/b) Pixabay & Wikimedia Commons real archival photography
+        if prefer_wiki_first:
+            hit = _try_wikimedia() or _try_pixabay()
+        else:
+            hit = _try_pixabay() or _try_wikimedia()
+        if hit is not None:
+            return hit
 
-        # d) Curated documentary photo queries fallback (guarantees a real photograph even on obscure queries)
-        start_idx = int(q_hash[:4], 16) % len(CURATED_DOC_PHOTO_QUERIES)
-        for offset in range(len(CURATED_DOC_PHOTO_QUERIES)):
-            fb_q = CURATED_DOC_PHOTO_QUERIES[(start_idx + offset) % len(CURATED_DOC_PHOTO_QUERIES)]
+        # c) Bespoke Gemini Native Image Generation if real stock missed
+        if not gemini_tried:
+            gem_prompt = bespoke_prompt_en.strip() if bespoke_prompt_en.strip() else norm_q
+            gem_path = generate_doc_gemini_image(
+                prompt_en=gem_prompt,
+                work_dir=work_dir,
+                tag=tag,
+                mood=resolved_mood,
+                aspect_ratio=aspect_ratio,
+                min_width=eff_min_w,
+                used_urls=used,
+            )
+            if gem_path is not None:
+                return gem_path
+
+        # d) Mood-curated real documentary photo queries fallback (NEVER financial banks for dark_horror/history!)
+        fb_pool = list(mood_defaults)
+        start_idx = int(q_hash[:4], 16) % len(fb_pool)
+        for offset in range(len(fb_pool)):
+            fb_q = fb_pool[(start_idx + offset) % len(fb_pool)]
             fb_candidates: List[Dict[str, str]] = []
             if pixabay_key:
                 fb_candidates.extend(_search_pixabay_photos(client, fb_q, pixabay_key, min_width=eff_min_w))
@@ -608,13 +996,34 @@ def fetch_doc_real_photo(
                     p, w, h = dl
                     return _record_and_return(p, url, f"{item['source']}_fallback", w, h)
 
-    # e) Offline safety net: reuse any validated cached real photo on disk
-    cached_files = sorted(
-        [p for p in DOC_PHOTO_CACHE_DIR.glob("photo_*.jpg") if p.is_file()],
+        # e) Pollinations Flux fallback (only if Pixabay, Wikimedia & Gemini all missed)
+        pol = _fetch_pollinations_photo(client, norm_q, q_hash, used, min_width=eff_min_w, mood=resolved_mood)
+        if pol is not None:
+            p, url, w, h = pol
+            return _record_and_return(p, url, "pollinations_flux", w, h)
+
+    # f) Offline safety net: prefer cached photos matching the same mood first!
+    mood_matched_files: List[Path] = []
+    for idx_file in DOC_PHOTO_CACHE_DIR.glob("idx_*.json"):
+        try:
+            items = json.loads(idx_file.read_text(encoding="utf-8"))
+            if isinstance(items, list):
+                for it in items:
+                    if str(it.get("mood") or "") == resolved_mood and it.get("file"):
+                        cp = DOC_PHOTO_CACHE_DIR / str(it["file"])
+                        if cp.exists() and cp not in mood_matched_files:
+                            mood_matched_files.append(cp)
+        except Exception:
+            continue
+
+    all_cached = sorted(
+        [p for p in DOC_PHOTO_CACHE_DIR.glob("*.jpg") if p.is_file() and (p.name.startswith("photo_") or p.name.startswith("gemini_"))],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    for p in cached_files:
+    ordered_cache = mood_matched_files + [p for p in all_cached if p not in mood_matched_files]
+
+    for p in ordered_cache:
         key = f"cache://{p.name}"
         if key in used:
             continue
@@ -622,7 +1031,7 @@ def fetch_doc_real_photo(
         if ok:
             used.add(key)
             return _materialize_photo_in_work_dir(p, work_dir, tag, p.stem[-8:])
-    for p in cached_files:
+    for p in ordered_cache:
         ok, _, _ = _validate_photo_file(p, min_width=320)
         if ok:
             return _materialize_photo_in_work_dir(p, work_dir, tag, p.stem[-8:])
@@ -910,31 +1319,40 @@ def fetch_doc_broll_clip(
     tag: str,
     used_hashes: Set[str],
     aspect_ratio: str = "16:9",
+    mood: str = "",
 ) -> Optional[Path]:
     """Fetch a REAL, valid, non-chroma-key HD `.mp4` B-roll clip for documentary compositing.
 
     Uses fast HD-optimized Pixabay search + `engine.smart_vision.fetch_unique_real_clip`
     (Pixabay -> Pexels -> yt-dlp -> Wikimedia -> Internet Archive + >30% chroma-key green filter).
-    Automatically retries curated broad cinematic documentary queries on miss so EVERY scene
-    receives genuine moving HD video footage!
+    Automatically retries mood-matched cinematic documentary queries on miss so EVERY scene
+    receives genuine moving HD video footage matching the documentary's atmosphere!
     """
-    norm_q = _normalize_query(query, "city skyline night aerial")
+    resolved_mood = _infer_media_mood(query, mood)
+    curated_pool = MOOD_DOC_BROLL_QUERIES.get(resolved_mood, CURATED_DOC_BROLL_QUERIES)
+    norm_q = _normalize_query(query, curated_pool[0])
     used = used_hashes if used_hashes is not None else set()
     pixabay_key, pexels_key = _read_api_keys()
     want_landscape = str(aspect_ratio or "16:9").strip() != "9:16"
 
-    # Build ordered query cascade: specific query + rotated curated documentary queries
+    # Build ordered query cascade: specific query -> shortened 3-word core -> mood-matched curated queries
     tag_seed = int(hashlib.sha256(f"{tag}:{norm_q}".encode("utf-8")).hexdigest()[:6], 16)
     rotated_curated = [
-        CURATED_DOC_BROLL_QUERIES[(tag_seed + i) % len(CURATED_DOC_BROLL_QUERIES)]
-        for i in range(len(CURATED_DOC_BROLL_QUERIES))
+        curated_pool[(tag_seed + i) % len(curated_pool)]
+        for i in range(len(curated_pool))
     ]
-    all_queries = [norm_q] + [q for q in rotated_curated if q.lower() != norm_q.lower()]
+    all_queries: List[str] = [norm_q]
+    short_q = _shorten_query(norm_q, max_words=3)
+    if short_q and short_q.lower() != norm_q.lower():
+        all_queries.append(short_q)
+    for q in rotated_curated:
+        if q.lower() not in {x.lower() for x in all_queries}:
+            all_queries.append(q)
 
     # 1. Fast HD 1080p/720p Pixabay B-roll pass (avoids downloading 100MB 4K clips on Core i5)
     if pixabay_key:
         with httpx.Client(follow_redirects=True, timeout=22.0) as client:
-            for q in all_queries[:4]:
+            for q in all_queries[:5]:
                 res = _fetch_pixabay_doc_broll(
                     client,
                     q,
@@ -955,7 +1373,7 @@ def fetch_doc_broll_clip(
                 pixabay_key=pixabay_key,
                 pexels_key=pexels_key,
                 exclude_hashes=used,
-                scene_index=(tag_seed + idx) % len(CURATED_DOC_BROLL_QUERIES),
+                scene_index=(tag_seed + idx) % len(curated_pool),
             )
             if clip and _validate_video_file(clip):
                 hsh = clip.stem.split("_")[-1][:16]
@@ -1187,9 +1605,14 @@ __all__ = [
     "CURATED_DOC_PHOTO_QUERIES",
     "DOC_BROLL_CACHE_DIR",
     "DOC_PHOTO_CACHE_DIR",
+    "GEMINI_IMAGE_MODELS",
+    "MOOD_DOC_BROLL_QUERIES",
+    "MOOD_DOC_PHOTO_QUERIES",
     "VideoLayerReader",
     "fetch_doc_broll_clip",
+    "fetch_doc_hero_or_archival_photo",
     "fetch_doc_real_photo",
+    "generate_doc_gemini_image",
     "load_skia_image_cover",
     "separate_photo_25d_u2netp",
 ]

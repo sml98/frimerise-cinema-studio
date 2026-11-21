@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import subprocess
 import wave
 from pathlib import Path
@@ -29,12 +30,108 @@ MODELS_DIR = BASE_DIR / "data" / "models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 PT_BR_EDGE_VOICES = [
-    {"id": "pt-BR-AntonioNeural", "name": "Antônio (Masculino • Autoridade)", "gender": "M"},
-    {"id": "pt-BR-FranciscaNeural", "name": "Francisca (Feminino • Premium)", "gender": "F"},
-    {"id": "pt-BR-ThalitaMultilingualNeural", "name": "Thalita (Feminino • Comercial UGC)", "gender": "F"},
+    {"id": "pt-BR-AntonioNeural", "name": "Antônio (Masculino • Autoridade)", "gender": "M", "lang": "pt_br"},
+    {"id": "pt-BR-FranciscaNeural", "name": "Francisca (Feminino • Premium)", "gender": "F", "lang": "pt_br"},
+    {"id": "pt-BR-ThalitaMultilingualNeural", "name": "Thalita (Feminino • Comercial UGC)", "gender": "F", "lang": "pt_br"},
+]
+
+ALL_EDGE_VOICES = [
+    {"id": "pt-BR-AntonioNeural", "name": "🇧🇷 Antônio (PT-BR • Masculino Autoridade)", "gender": "M", "lang": "pt_br"},
+    {"id": "pt-BR-FranciscaNeural", "name": "🇧🇷 Francisca (PT-BR • Feminino Premium)", "gender": "F", "lang": "pt_br"},
+    {"id": "pt-BR-ThalitaMultilingualNeural", "name": "🇧🇷 Thalita (PT-BR • Feminino Comercial UGC)", "gender": "F", "lang": "pt_br"},
+    {"id": "en-US-AndrewMultilingualNeural", "name": "🇺🇸 Andrew (EN-US • Male Documentary/Narrator)", "gender": "M", "lang": "en_us"},
+    {"id": "en-US-AvaMultilingualNeural", "name": "🇺🇸 Ava (EN-US • Female Warm/Viral)", "gender": "F", "lang": "en_us"},
+    {"id": "en-US-GuyNeural", "name": "🇺🇸 Guy (EN-US • Male Energetic/News)", "gender": "M", "lang": "en_us"},
+    {"id": "es-MX-JorgeNeural", "name": "🇪🇸 Jorge (ES • Masculino Firme/Impacto)", "gender": "M", "lang": "es"},
+    {"id": "es-MX-DaliaNeural", "name": "🇪🇸 Dalia (ES • Femenino Dinámica)", "gender": "F", "lang": "es"},
 ]
 
 KOKORO_PT_VOICES = ["pf_dora", "pm_alex", "pm_santa"]
+KOKORO_VOICES = ["pm_alex", "pf_dora", "pm_santa", "af_heart", "am_adam"]
+
+
+def normalize_edge_rate(rate: Optional[str]) -> str:
+    """Sanitize Edge-TTS rate string (e.g. '-6%', '+0%', '+8%', '+15%') within safe bounds."""
+    raw = str(rate if rate is not None else "+8%").strip().replace(" ", "")
+    m = re.match(r"^([+-]?\d+(?:\.\d+)?)%?$", raw)
+    if not m:
+        return "+8%"
+    val = int(round(max(-50.0, min(100.0, float(m.group(1))))))
+    return f"+{val}%" if val >= 0 else f"{val}%"
+
+
+def normalize_edge_pitch(pitch: Optional[str]) -> str:
+    """Sanitize Edge-TTS pitch string (e.g. '-8Hz', '+0Hz', '+8Hz') within safe bounds."""
+    raw = str(pitch if pitch is not None else "+0Hz").strip().replace(" ", "")
+    m = re.match(r"^([+-]?\d+(?:\.\d+)?)(?:hz)?$", raw, re.IGNORECASE)
+    if not m:
+        return "+0Hz"
+    val = int(round(max(-50.0, min(50.0, float(m.group(1))))))
+    return f"+{val}Hz" if val >= 0 else f"{val}Hz"
+
+
+def _parse_signed_int(val_str: str, default: int = 0) -> int:
+    m = re.search(r"([+-]?\d+)", str(val_str or ""))
+    return int(m.group(1)) if m else default
+
+
+def _rate_to_kokoro_speed(rate: str) -> float:
+    pct = _parse_signed_int(rate, 8)
+    return round(max(0.65, min(1.55, 1.0 + pct / 100.0)), 2)
+
+
+def _infer_lang_from_voice_id(voice_id: str, fallback: str = "pt_br") -> str:
+    vid = str(voice_id or "").strip().lower()
+    if vid.startswith("en-") or vid.startswith("af_") or vid.startswith("am_"):
+        return "en_us"
+    if vid.startswith("es-"):
+        return "es"
+    if vid.startswith("pt-") or vid.startswith("pf_") or vid.startswith("pm_"):
+        return "pt_br"
+    fb = str(fallback or "pt_br").strip().lower().replace("-", "_")
+    if fb.startswith("en"):
+        return "en_us"
+    if fb.startswith("es"):
+        return "es"
+    return "pt_br"
+
+
+def _default_edge_voice_for_lang(language: str, female: bool = False) -> str:
+    lang = str(language or "pt_br").strip().lower().replace("-", "_")
+    if lang.startswith("en"):
+        return "en-US-AvaMultilingualNeural" if female else "en-US-AndrewMultilingualNeural"
+    if lang.startswith("es"):
+        return "es-MX-DaliaNeural" if female else "es-MX-JorgeNeural"
+    return "pt-BR-FranciscaNeural" if female else "pt-BR-AntonioNeural"
+
+
+def _build_gemini_acting_direction(rate: str, pitch: str, language: str = "pt_br") -> str:
+    """Translate user rate/pitch settings into rich Gemini TTS acting direction cues."""
+    lang = str(language or "pt_br").strip().lower().replace("-", "_")
+    lang_desc = {
+        "en_us": "American English",
+        "es": "Neutral Latin American Spanish",
+    }.get(lang, "Brazilian Portuguese")
+
+    rate_num = _parse_signed_int(rate, 8)
+    if rate_num <= -4:
+        pace_cue = "with a slow, deliberate, cinematic documentary pace and thoughtful pauses"
+    elif rate_num <= 3:
+        pace_cue = "with a clear, natural, conversational broadcast pace"
+    elif rate_num <= 11:
+        pace_cue = "with a dynamic, engaging, viral storytelling rhythm"
+    else:
+        pace_cue = "with a fast, punchy, high-energy short-form viral delivery"
+
+    pitch_num = _parse_signed_int(pitch, 0)
+    if pitch_num <= -4:
+        pitch_cue = "and a deep, resonant, authoritative lower vocal pitch"
+    elif pitch_num >= 4:
+        pitch_cue = "and a bright, expressive, upbeat higher vocal pitch"
+    else:
+        pitch_cue = "and a balanced, crisp studio vocal tone"
+
+    return f"Read aloud in {lang_desc} {pace_cue}, {pitch_cue}."
 
 
 def _get_wav_duration(path: Path) -> float:
@@ -90,16 +187,22 @@ def synthesize_kokoro_blended(
     from kokoro_onnx import Kokoro
 
     kokoro = Kokoro(str(model_path), str(voices_path))
-    # Voice Blender: linear interpolation of speaker embedding vectors
+    # Voice Blender: linear interpolation of speaker embedding vectors across all supported Kokoro voices
     vectors = []
     weights = []
-    for vname in KOKORO_PT_VOICES:
+    dominant_voice = "pm_alex"
+    max_w = -1.0
+    candidate_voices = list(dict.fromkeys([*KOKORO_VOICES, *list(blend_weights.keys())]))
+    for vname in candidate_voices:
         w = float(blend_weights.get(vname, 0.0))
         if w > 0.0:
             try:
                 vec = kokoro.get_voice_style(vname)
                 vectors.append(vec)
                 weights.append(w)
+                if w > max_w:
+                    max_w = w
+                    dominant_voice = vname
             except Exception:
                 continue
 
@@ -109,7 +212,8 @@ def synthesize_kokoro_blended(
         total_w = sum(weights)
         blended_style = sum(v * (w / total_w) for v, w in zip(vectors, weights))
 
-    samples, sr = kokoro.create(text, voice=blended_style, speed=speed, lang="pt-br")
+    kokoro_lang = "en-us" if dominant_voice.startswith(("af_", "am_")) else "pt-br"
+    samples, sr = kokoro.create(text, voice=blended_style, speed=speed, lang=kokoro_lang)
     pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
     with wave.open(str(out_wav), "wb") as wf:
         wf.setnchannels(1)
@@ -129,12 +233,16 @@ async def synthesize_edge_tts(
     out_mp3: Path,
     voice: str = "pt-BR-AntonioNeural",
     rate: str = "+8%",
+    pitch: str = "+0Hz",
 ) -> Tuple[Path, List[Dict[str, Any]]]:
-    """Instant cloud PT-BR TTS with native WordBoundary timestamps (0.1s precision)."""
+    """Instant cloud TTS (PT-BR / EN-US / ES) with custom speed/pitch & native WordBoundary timestamps."""
+    clean_rate = normalize_edge_rate(rate)
+    clean_pitch = normalize_edge_pitch(pitch)
     communicate = edge_tts.Communicate(
         text=text,
         voice=voice,
-        rate=rate,
+        rate=clean_rate,
+        pitch=clean_pitch,
         boundary="WordBoundary",
     )
     words: List[Dict[str, Any]] = []
@@ -165,10 +273,11 @@ async def synthesize_edge_tts(
     return out_mp3, words
 
 
-def _synthesize_espeak_fallback(text: str, out_wav: Path) -> Tuple[Path, List[Dict[str, Any]]]:
-    """100% offline PT-BR fallback via espeak-ng if internet is offline."""
+def _synthesize_espeak_fallback(text: str, out_wav: Path, language: str = "pt_br") -> Tuple[Path, List[Dict[str, Any]]]:
+    """100% offline TTS fallback via espeak-ng (PT-BR / EN-US / ES) if internet is offline."""
+    espeak_lang = {"en_us": "en-us", "es": "es"}.get(str(language or "pt_br").lower(), "pt-br")
     subprocess.run(
-        ["espeak-ng", "-v", "pt-br", "-s", "165", "-w", str(out_wav), text],
+        ["espeak-ng", "-v", espeak_lang, "-s", "165", "-w", str(out_wav), text],
         check=True,
         capture_output=True,
     )
@@ -349,7 +458,7 @@ def master_broadcast_audio(
     mix_labels = ["[v_main]"]
     next_idx = 1
 
-    if music_mp3 and music_mp3.exists():
+    if music_mp3 and music_mp3.exists() and music_volume > 0.001:
         inputs.extend(["-stream_loop", "-1", "-i", str(music_mp3)])
         fade_out_d = min(0.85, max(0.35, final_dur * 0.12))
         fade_out_start = max(0.0, final_dur - fade_out_d)
@@ -421,13 +530,31 @@ async def generate_narration(
     voice_id: str = "pt-BR-AntonioNeural",
     voice_blend: Optional[Dict[str, float]] = None,
     prefix: str = "narr",
+    rate: str = "+8%",
+    pitch: str = "+0Hz",
     thermal_limit_c: float = 85.0,
+    language: str = "pt_br",
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
-    """Unified narration entry point (Kokoro OpenVINO Blend -> Edge-TTS -> espeak-ng) + VAD trim."""
+    """Unified narration entry point (Gemini Expressive TTS / Kokoro Blend / Edge-TTS -> espeak-ng) + VAD trim.
+    Supports custom speed (`rate`, e.g. '+8%', '-6%') and pitch (`pitch`, e.g. '+0Hz', '-8Hz', '+8Hz')
+    across Edge-TTS, Gemini TTS (via acting_direction pace/pitch cues), and Kokoro-ONNX!
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
     raw_mp3 = work_dir / f"{prefix}_raw.mp3"
     raw_wav = work_dir / f"{prefix}_raw.wav"
     trimmed_wav = work_dir / f"{prefix}_vad.wav"
+
+    clean_rate = normalize_edge_rate(rate)
+    clean_pitch = normalize_edge_pitch(pitch)
+    eff_lang = _infer_lang_from_voice_id(voice_id, fallback=language)
+    known_edge_ids = {v["id"] for v in ALL_EDGE_VOICES}
+
+    def _safe_edge_voice(raw_vid: str) -> str:
+        vid = str(raw_vid or "").strip()
+        if vid in known_edge_ids or ("Neural" in vid and "-" in vid):
+            return vid
+        female_hint = vid.lower() in ("kore", "aoede", "zephyr", "leda", "pf_dora", "af_heart")
+        return _default_edge_voice_for_lang(eff_lang, female=female_hint)
 
     words: List[Dict[str, Any]] = []
     source_audio: Path
@@ -438,34 +565,50 @@ async def generate_narration(
 
             valid_ids = {v["id"] for v in GEMINI_EXPRESSIVE_VOICES}
             g_voice = voice_id if voice_id in valid_ids else "Puck"
+            acting_dir = _build_gemini_acting_direction(clean_rate, clean_pitch, language=eff_lang)
             source_audio, g_dur = await asyncio.to_thread(
                 synthesize_gemini_tts_line,
                 text,
                 raw_wav,
                 g_voice,
+                acting_dir,
             )
             words = _estimate_word_timestamps(text, g_dur)
         except Exception:
             try:
-                fallback_v = voice_id if voice_id.startswith("pt-BR-") else "pt-BR-AntonioNeural"
-                source_audio, words = await synthesize_edge_tts(text, raw_mp3, voice=fallback_v)
+                fallback_v = _safe_edge_voice(voice_id)
+                source_audio, words = await synthesize_edge_tts(
+                    text, raw_mp3, voice=fallback_v, rate=clean_rate, pitch=clean_pitch
+                )
             except Exception:
-                source_audio, words = _synthesize_espeak_fallback(text, raw_wav)
+                source_audio, words = _synthesize_espeak_fallback(text, raw_wav, language=eff_lang)
     elif voice_engine == "kokoro":
         try:
+            if voice_blend:
+                eff_blend = voice_blend
+            elif voice_id in KOKORO_VOICES:
+                eff_blend = {voice_id: 1.0}
+            else:
+                eff_blend = {"pf_dora": 0.35, "pm_alex": 0.65, "pm_santa": 0.0}
             source_audio, words = synthesize_kokoro_blended(
-                text, raw_wav, voice_blend or {"pf_dora": 0.35, "pm_alex": 0.65, "pm_santa": 0.0}
+                text, raw_wav, eff_blend, speed=_rate_to_kokoro_speed(clean_rate)
             )
         except Exception:
             # Automatic transparent fallback to Edge-TTS if local Kokoro weights not yet fetched
             try:
-                source_audio, words = await synthesize_edge_tts(text, raw_mp3, voice=voice_id)
+                fallback_v = _safe_edge_voice(voice_id)
+                source_audio, words = await synthesize_edge_tts(
+                    text, raw_mp3, voice=fallback_v, rate=clean_rate, pitch=clean_pitch
+                )
             except Exception:
-                source_audio, words = _synthesize_espeak_fallback(text, raw_wav)
+                source_audio, words = _synthesize_espeak_fallback(text, raw_wav, language=eff_lang)
     else:
         try:
-            source_audio, words = await synthesize_edge_tts(text, raw_mp3, voice=voice_id)
+            edge_v = _safe_edge_voice(voice_id)
+            source_audio, words = await synthesize_edge_tts(
+                text, raw_mp3, voice=edge_v, rate=clean_rate, pitch=clean_pitch
+            )
         except Exception:
-            source_audio, words = _synthesize_espeak_fallback(text, raw_wav)
+            source_audio, words = _synthesize_espeak_fallback(text, raw_wav, language=eff_lang)
 
     return trim_silence_vad(source_audio, trimmed_wav, words, thermal_limit_c=thermal_limit_c)

@@ -27,6 +27,7 @@ import cv2
 import edge_tts
 import httpx
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 import skia
 
 from agents.llm_router import _extract_json, get_settings, record_token_usage
@@ -54,6 +55,7 @@ from engine.intel_vaapi import (
     run_ffmpeg_safe,
     thermal_guard_wait,
 )
+from engine.pro_sfx_studio import ensure_pro_cinema_sfx
 from engine.skia_compositor import (
     ACTIVE_PILL_PALETTE,
     SkiaMotionCompositor,
@@ -61,6 +63,11 @@ from engine.skia_compositor import (
     group_words_into_chunks,
     hex_to_skia,
 )
+
+try:
+    from engine.kinetic_captions import draw_kinetic_captions as _draw_kinetic_captions
+except Exception:
+    _draw_kinetic_captions = None
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ASSETS_DIR = BASE_DIR / "assets"
@@ -73,7 +80,7 @@ LANG_VOICE_PROFILES: Dict[str, Dict[str, Any]] = {
         "female_edge": "pt-BR-FranciscaNeural",
         "kokoro_voices": ("pm_alex", "pf_dora"),
         "kokoro_lang": "pt-br",
-        "cta_tag": "▶ VÍDEO COMPLETO NO CANAL",
+        "cta_tag": "▶ ASSISTA COMPLETO NO CANAL",
     },
     "en_us": {
         "label": "Inglês (US)",
@@ -378,6 +385,7 @@ async def _synthesize_multilang_narration(
     work_dir: Path,
     tag: str,
     gender: str = "M",
+    thermal_limit_c: float = 85.0,
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
     """Synthesize native PT-BR, EN-US (Kokoro am_adam/af_heart or Edge en-US-AndrewMultilingualNeural),
     or ES (es-MX-DaliaNeural / es-MX-JorgeNeural) narration with exact WordBoundary timing.
@@ -409,7 +417,7 @@ async def _synthesize_multilang_narration(
                     wf.writeframes(pcm.tobytes())
                 dur = _get_wav_duration(raw_wav)
                 words = _estimate_word_timestamps(text, dur)
-                return trim_silence_vad(raw_wav, vad_wav, words)
+                return trim_silence_vad(raw_wav, vad_wav, words, thermal_limit_c=thermal_limit_c)
             except Exception:
                 pass
 
@@ -430,7 +438,7 @@ async def _synthesize_multilang_narration(
                     words.append({"word": str(ch["text"]).strip(), "start": round(st, 3), "end": round(st + max(0.06, dur), 3)})
             if chunks:
                 raw_mp3.write_bytes(bytes(chunks))
-                return trim_silence_vad(raw_mp3, vad_wav, words)
+                return trim_silence_vad(raw_mp3, vad_wav, words, thermal_limit_c=thermal_limit_c)
         except Exception:
             continue
 
@@ -459,6 +467,118 @@ def _probe_video_dimensions(video_path: Path) -> Tuple[int, int]:
     return w, h
 
 
+def _draw_fallback_hormozi_captions(
+    canvas: skia.Canvas,
+    chunks: List[Dict[str, Any]],
+    t: float,
+    w: int,
+    h: int,
+    typeface: skia.Typeface,
+    y_ratio: float = 0.79,
+    font_size: float = 74.0,
+) -> None:
+    """Clean drop-shadow single-active-pill Hormozi caption fallback if kinetic_captions is absent."""
+    cap_font = skia.Font(typeface, float(font_size))
+    space_w = max(22.0, float(cap_font.measureText(" ")) * 1.40)
+    fm = cap_font.getMetrics()
+    ascent = abs(float(fm.fAscent))
+    descent = abs(float(fm.fDescent))
+    shadow_filter = skia.ImageFilters.DropShadow(0.0, 6.0, 9.0, 9.0, skia.ColorSetARGB(195, 0, 0, 0))
+
+    for ch in chunks:
+        if ch["start"] <= t <= ch["end"]:
+            w_list = ch["words"]
+            active_wd = next((wd for wd in reversed(w_list) if wd["start"] <= t <= (wd["end"] + 0.04)), None)
+            pad_x, pad_y = 24.0, 12.0
+            toks = []
+            tot_w = 0.0
+            for wd in w_list:
+                txt = str(wd["word"]).strip().upper()
+                if not txt:
+                    continue
+                is_act = wd is active_wd
+                sc = 1.12 if is_act else 1.0
+                tw = float(cap_font.measureText(txt))
+                sw = (tw + pad_x * 2.0) * sc if is_act else tw
+                toks.append({"txt": txt, "w": tw, "sw": sw, "act": is_act, "sc": sc, "pidx": int(wd.get("g_idx", 0))})
+                tot_w += sw
+            if toks:
+                tot_w += space_w * (len(toks) - 1)
+                lscale = min(1.0, (w * 0.86) / max(1.0, tot_w))
+                canvas.save()
+                canvas.translate(w * 0.5, h * y_ratio)
+                canvas.scale(lscale, lscale)
+                cx_p = -tot_w * 0.5
+                pmap = {}
+                for tk in toks:
+                    pmap[id(tk)] = cx_p + tk["sw"] * 0.5
+                    cx_p += tk["sw"] + space_w
+                for tk in [x for x in toks if not x["act"]] + [x for x in toks if x["act"]]:
+                    canvas.save()
+                    canvas.translate(pmap[id(tk)], 0.0)
+                    if tk["act"]:
+                        canvas.scale(tk["sc"], tk["sc"])
+                        pbg, ptx, _ = ACTIVE_PILL_PALETTE[tk["pidx"] % len(ACTIVE_PILL_PALETTE)]
+                        pr = skia.Rect.MakeXYWH(
+                            -tk["w"] * 0.5 - pad_x,
+                            -ascent - pad_y,
+                            tk["w"] + pad_x * 2.0,
+                            ascent + descent + pad_y * 2.0,
+                        )
+                        pill_paint = skia.Paint(AntiAlias=True, Color=hex_to_skia(pbg))
+                        pill_paint.setImageFilter(shadow_filter)
+                        canvas.drawRoundRect(pr, 18, 18, pill_paint)
+                        canvas.drawString(tk["txt"], -tk["w"] * 0.5, 0.0, cap_font, skia.Paint(AntiAlias=True, Color=hex_to_skia(ptx)))
+                    else:
+                        stp = skia.Paint(
+                            AntiAlias=True,
+                            Style=skia.Paint.kStroke_Style,
+                            StrokeWidth=11.0,
+                            StrokeJoin=skia.Paint.kRound_Join,
+                            Color=skia.ColorBLACK,
+                        )
+                        stp.setImageFilter(shadow_filter)
+                        canvas.drawString(tk["txt"], -tk["w"] * 0.5, 0.0, cap_font, stp)
+                        canvas.drawString(tk["txt"], -tk["w"] * 0.5, 0.0, cap_font, skia.Paint(AntiAlias=True, Color=skia.ColorWHITE))
+                    canvas.restore()
+                canvas.restore()
+            break
+
+
+def _draw_captions_pro(
+    canvas: skia.Canvas,
+    chunks: List[Dict[str, Any]],
+    t: float,
+    w: int,
+    h: int,
+    typeface: skia.Typeface,
+    style: str = "hormozi_neon",
+    y_ratio: float = 0.79,
+    font_size: float = 74.0,
+) -> None:
+    """Render kinetic captions via engine.kinetic_captions with clean Hormozi fallback."""
+    if str(style or "").strip().lower() == "none":
+        return
+    if _draw_kinetic_captions is not None:
+        try:
+            _draw_kinetic_captions(
+                canvas=canvas,
+                chunks=chunks,
+                t=t,
+                w=w,
+                h=h,
+                typeface=typeface,
+                style=style,
+                y_ratio=y_ratio,
+                font_size=font_size,
+                palette=ACTIVE_PILL_PALETTE,
+            )
+            return
+        except Exception:
+            pass
+    _draw_fallback_hormozi_captions(canvas, chunks, t, w, h, typeface, y_ratio=y_ratio, font_size=font_size)
+
+
 def _composite_hormozi_captions_any_aspect(
     bg_video: Path,
     audio_m4a: Path,
@@ -468,33 +588,45 @@ def _composite_hormozi_captions_any_aspect(
     preset: Dict[str, Any],
     fps: int = 30,
     thermal_limit_c: float = 85.0,
+    caption_style: str = "hormozi_neon",
 ) -> Path:
-    """Composite Hormozi active-word pill captions onto either 9:16 (1080x1920) or 16:9 (1920x1080) video."""
+    """Composite kinetic Hormozi captions onto either 9:16 (1080x1920) or 16:9 (1920x1080) video."""
     vid_w, vid_h = _probe_video_dimensions(bg_video)
+    resolved_style = str(caption_style or preset.get("caption_style") or "hormozi_neon")
     if vid_w <= vid_h:
         compositor = SkiaMotionCompositor(preset=preset, width=vid_w, height=vid_h)
-        return compositor.composite_onto_video(
-            bg_video=bg_video,
-            audio_m4a=audio_m4a,
-            output_mp4=out_mp4,
-            duration_s=duration_s,
-            words=words,
-            motion_cards=[],
-            fps=fps,
-            show_motion_cards=False,
-            thermal_limit_c=thermal_limit_c,
-        )
+        try:
+            return compositor.composite_onto_video(
+                bg_video=bg_video,
+                audio_m4a=audio_m4a,
+                output_mp4=out_mp4,
+                duration_s=duration_s,
+                words=words,
+                motion_cards=[],
+                fps=fps,
+                show_motion_cards=False,
+                thermal_limit_c=thermal_limit_c,
+                caption_style=resolved_style,
+            )
+        except TypeError:
+            return compositor.composite_onto_video(
+                bg_video=bg_video,
+                audio_m4a=audio_m4a,
+                output_mp4=out_mp4,
+                duration_s=duration_s,
+                words=words,
+                motion_cards=[],
+                fps=fps,
+                show_motion_cards=False,
+                thermal_limit_c=thermal_limit_c,
+            )
 
-    # 16:9 Widescreen Hormozi Compositor (captions positioned cleanly at y = vid_h * 0.83)
+    # 16:9 Widescreen Kinetic Caption Compositor (positioned cleanly at y = vid_h * 0.84)
     thermal_guard_wait(limit_c=thermal_limit_c)
     chunks = group_words_into_chunks(words, max_words=3)
     total_frames = max(1, int(math.ceil(duration_s * fps)))
     tf, _ = _load_verified_typeface(preset.get("font_file", "Montserrat-Black.ttf"), role="dub_16x9_caption")
-    font = skia.Font(tf, 64.0 if vid_w >= 1920 else 44.0)
-    space_w = max(24.0, float(font.measureText(" ")) * 1.40)
-    fm = font.getMetrics()
-    ascent = abs(float(fm.fAscent))
-    descent = abs(float(fm.fDescent))
+    f_size = 64.0 if vid_w >= 1920 else 44.0
 
     surf = skia.Surface(vid_w, vid_h)
     pre_args, enc_args, hw_suffix = build_video_encode_args(qp=19)
@@ -519,50 +651,17 @@ def _composite_hormozi_captions_any_aspect(
             t = f_idx / float(fps)
             c = surf.getCanvas()
             c.clear(skia.Color4f(0, 0, 0, 0))
-            for ch in chunks:
-                if ch["start"] <= t <= ch["end"]:
-                    w_list = ch["words"]
-                    active_wd = next((wd for wd in reversed(w_list) if wd["start"] <= t <= (wd["end"] + 0.04)), None)
-                    pad_x, pad_y = 22.0, 10.0
-                    toks = []
-                    tot_w = 0.0
-                    for wd in w_list:
-                        txt = str(wd["word"]).strip().upper()
-                        if not txt:
-                            continue
-                        is_act = wd is active_wd
-                        sc = 1.12 if is_act else 1.0
-                        tw = float(font.measureText(txt))
-                        sw = (tw + pad_x * 2.0) * sc if is_act else tw
-                        toks.append({"txt": txt, "w": tw, "sw": sw, "act": is_act, "sc": sc, "pidx": int(wd.get("g_idx", 0))})
-                        tot_w += sw
-                    if toks:
-                        tot_w += space_w * (len(toks) - 1)
-                        lscale = min(1.0, (vid_w * 0.84) / max(1.0, tot_w))
-                        c.save()
-                        c.translate(vid_w * 0.5, vid_h * 0.83)
-                        c.scale(lscale, lscale)
-                        cx_p = -tot_w * 0.5
-                        pmap = {}
-                        for tk in toks:
-                            pmap[id(tk)] = cx_p + tk["sw"] * 0.5
-                            cx_p += tk["sw"] + space_w
-                        for tk in [x for x in toks if not x["act"]] + [x for x in toks if x["act"]]:
-                            c.save()
-                            c.translate(pmap[id(tk)], 0.0)
-                            if tk["act"]:
-                                c.scale(tk["sc"], tk["sc"])
-                                pbg, ptx, _ = ACTIVE_PILL_PALETTE[tk["pidx"] % len(ACTIVE_PILL_PALETTE)]
-                                pr = skia.Rect.MakeXYWH(-tk["w"] * 0.5 - pad_x, -ascent - pad_y, tk["w"] + pad_x * 2.0, ascent + descent + pad_y * 2.0)
-                                c.drawRoundRect(pr, 16, 16, skia.Paint(AntiAlias=True, Color=hex_to_skia(pbg)))
-                                c.drawString(tk["txt"], -tk["w"] * 0.5, 0.0, font, skia.Paint(AntiAlias=True, Color=hex_to_skia(ptx)))
-                            else:
-                                stp = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=10.0, StrokeJoin=skia.Paint.kRound_Join, Color=skia.ColorBLACK)
-                                c.drawString(tk["txt"], -tk["w"] * 0.5, 0.0, font, stp)
-                                c.drawString(tk["txt"], -tk["w"] * 0.5, 0.0, font, skia.Paint(AntiAlias=True, Color=skia.ColorWHITE))
-                            c.restore()
-                        c.restore()
-                    break
+            _draw_captions_pro(
+                c,
+                chunks,
+                t,
+                vid_w,
+                vid_h,
+                tf,
+                style=resolved_style,
+                y_ratio=0.84,
+                font_size=f_size,
+            )
             proc.stdin.write(surf.makeImageSnapshot().tobytes())
     except BrokenPipeError:
         pass
@@ -741,7 +840,12 @@ async def dub_video_job_multi_language(
 
         full_narration = " ".join(t_lines)
         vad_wav, words_lang, voice_dur = await _synthesize_multilang_narration(
-            full_narration, norm_lang, lang_work, "narr", gender="M" if norm_lang in ("en_us", "pt_br") else "F"
+            full_narration,
+            norm_lang,
+            lang_work,
+            "narr",
+            gender="M" if norm_lang in ("en_us", "pt_br") else "F",
+            thermal_limit_c=thermal_limit_c,
         )
         master_m4a = lang_work / f"master_{norm_lang}.m4a"
         master_m4a, final_dur = await asyncio.to_thread(
@@ -753,6 +857,7 @@ async def dub_video_job_multi_language(
             voice_dur,
             0.18,
             0.40,
+            thermal_limit_c,
         )
 
         # Mathematically recalculate all scene cuts & Hormozi captions for the new language duration
@@ -783,6 +888,7 @@ async def dub_video_job_multi_language(
                 "-t", f"{final_dur:.3f}", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20",
                 str(retimed_base),
             ],
+            thermal_limit_c,
         )
 
         await asyncio.to_thread(
@@ -810,19 +916,35 @@ async def dub_video_job_multi_language(
 
 # ---------------------------------------------------------------------------
 # 2. Automatic 16:9 -> 9:16 Content Cascade ("1 Documentary = 1 Long + 5 Shorts")
+#    Pro Cinema Viral Cuts: Smooth 0.5s Tracking + Punch-In Zoom + Flash SFX +
+#    Wide-Graphic Cinema Bleed + Kinetic Captions + Glassmorphic CTA
 # ---------------------------------------------------------------------------
-def _detect_horizontal_center_of_interest(video_16x9: Path, start_s: float, dur_s: float) -> float:
-    """Detect the horizontal subject centroid [0.22..0.78] across sampled frames in [start_s, start_s + dur_s]
-    using MediaPipe BlazeFace / OpenCV Face Cascade first, falling back to OpenCV gradient + color saliency centroid.
-    """
-    cv2.setNumThreads(1)
-    cap = cv2.VideoCapture(str(video_16x9))
-    if not cap.isOpened():
-        return 0.50
+def _has_audio_stream(video_path: Path) -> bool:
+    try:
+        res = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return bool(res.stdout.strip())
+    except Exception:
+        return False
 
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    centers: List[float] = []
 
+def _create_face_detectors() -> Tuple[Any, Any]:
+    """Initialize MediaPipe BlazeFace (preferred) or OpenCV Haar cascade fallback."""
     mp_detector = None
     try:
         import mediapipe as mp
@@ -842,66 +964,258 @@ def _detect_horizontal_center_of_interest(video_16x9: Path, start_s: float, dur_
                 cascade = cv2.CascadeClassifier(str(xml))
         except Exception:
             cascade = None
+    return mp_detector, cascade
 
-    for frac in (0.20, 0.50, 0.80):
-        t = start_s + dur_s * frac
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * fps))
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            continue
 
-        h, w = frame.shape[:2]
-        face_cx: Optional[float] = None
+def _analyze_frame_coi_and_layout(
+    frame_bgr: np.ndarray,
+    mp_detector: Any,
+    cascade: Any,
+    prev_gray: Optional[np.ndarray] = None,
+) -> Tuple[float, float, np.ndarray]:
+    """Analyze a single 16:9 frame (downscaled internally to 480x270) and return:
+    - cx_norm in [0.20..0.80]: horizontal subject center-of-interest
+    - wide_score in {0.0, 1.0}: 1.0 when framing wide investigative graphics/boards/newspapers/timelines
+    - small_gray: 480x270 grayscale for next-frame motion energy saliency
+    """
+    small = cv2.resize(frame_bgr, (480, 270), interpolation=cv2.INTER_AREA)
+    h, w = small.shape[:2]
+    # Focus on upper 82% so bottom 16:9 subtitles never distort horizontal tracking or layout detection
+    roi_h = int(h * 0.82)
+    roi = small[:roi_h, :, :]
+    gray_full = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gray = gray_full[:roi_h, :]
 
-        if mp_detector is not None:
-            try:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                res = mp_detector.process(rgb)
-                if res and getattr(res, "detections", None):
-                    box = res.detections[0].location_data.relative_bounding_box
-                    face_cx = float(box.xmin + box.width * 0.5)
-            except Exception:
-                face_cx = None
-
-        if face_cx is None and cascade is not None:
-            try:
-                gray_f = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = cascade.detectMultiScale(gray_f, 1.2, 4)
-                if len(faces) > 0:
-                    fx, _, fw, _ = max(faces, key=lambda r: r[2] * r[3])
-                    face_cx = float((fx + fw * 0.5) / max(1, w))
-            except Exception:
-                face_cx = None
-
-        if face_cx is not None:
-            centers.append(max(0.22, min(0.78, face_cx)))
-            continue
-
-        # Fallback: OpenCV Sobel Gradient + HSV Saturation Saliency Centroid
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-        mag = cv2.magnitude(gx, gy)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        sat = hsv[:, :, 1].astype(np.float32) * 0.35
-        col_energy = np.mean(mag + sat, axis=0) + 1e-4
-        xs = np.linspace(0.0, 1.0, len(col_energy))
-        cx = float(np.sum(xs * col_energy) / np.sum(col_energy))
-        centers.append(max(0.22, min(0.78, cx)))
-
-    cap.release()
+    face_cx: Optional[float] = None
     if mp_detector is not None:
         try:
-            mp_detector.close()
+            rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+            res = mp_detector.process(rgb)
+            if res and getattr(res, "detections", None):
+                best_det = max(
+                    res.detections,
+                    key=lambda d: float(d.location_data.relative_bounding_box.width)
+                    * float(d.location_data.relative_bounding_box.height),
+                )
+                box = best_det.location_data.relative_bounding_box
+                face_cx = float(box.xmin + box.width * 0.5)
         except Exception:
-            pass
+            face_cx = None
+
+    if face_cx is None and cascade is not None:
+        try:
+            faces = cascade.detectMultiScale(gray, 1.18, 4, minSize=(26, 26))
+            if len(faces) > 0:
+                fx, _, fw, _ = max(faces, key=lambda r: int(r[2]) * int(r[3]))
+                face_cx = float((fx + fw * 0.5) / max(1, w))
+        except Exception:
+            face_cx = None
+
+    # OpenCV Sobel gradient + HSV saturation + temporal motion saliency
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1].astype(np.float32) * 0.35
+    motion = np.zeros_like(mag)
+    if prev_gray is not None and prev_gray.shape == gray_full.shape:
+        motion = cv2.absdiff(gray, prev_gray[:roi_h, :]).astype(np.float32) * 0.50
+
+    # Detect framed 16:9 documentary layouts BEFORE face short-circuit:
+    # horizontal inset border lines (e.g., parallax_25d_photo, broll_video_pip, newspaper, cards)
+    # and dark outer pillar/letterbox studio margins framing an interior graphic.
+    abs_gy = np.abs(gy)
+    row_line_cov = np.mean(abs_gy[8 : max(9, roi_h - 6), 48:432] > 42.0, axis=1)
+    max_hline = float(np.max(row_line_cov)) if row_line_cov.size else 0.0
+    outer_l = float(np.mean(gray[:, :34]))
+    outer_r = float(np.mean(gray[:, 446:]))
+    outer_t = float(np.mean(gray[:14, :]))
+    inner_mean = float(np.mean(gray[22 : min(roi_h, 180), 56:424]))
+    has_doc_frame = (
+        (max_hline >= 0.44)
+        or (max(outer_l, outer_r) < 42.0 and inner_mean > max(outer_l, outer_r) + 18.0)
+        or (outer_t < 32.0 and max_hline >= 0.36)
+    )
+
+    if face_cx is not None:
+        cx_norm = max(0.20, min(0.80, face_cx))
+        # Preserve sleek CinemaScope framing when the face lives inside a framed 16:9 documentary UI layout;
+        # only use dramatic full-bleed portrait tracking on unframed raw 16:9 camera footage.
+        return cx_norm, (1.0 if has_doc_frame else 0.0), gray_full
+
+    col_energy = np.mean(mag + sat + motion, axis=0) + 1e-4
+    xs = np.linspace(0.0, 1.0, len(col_energy))
+    # Mild center prior prevents drifting into empty dark margins
+    center_prior = 0.75 + 0.25 * np.exp(-((xs - 0.5) / 0.34) ** 2)
+    weighted = col_energy * center_prior
+    cx_norm = float(np.sum(xs * weighted) / max(1e-6, float(np.sum(weighted))))
+    cx_norm = max(0.22, min(0.78, cx_norm))
+
+    # Wide investigative graphic / archival newspaper / title card / timeline / red-string board detection
+    l_edge = float(np.mean(mag[:, 24:158] > 55.0))
+    c_edge = float(np.mean(mag[:, 158:322] > 55.0))
+    r_edge = float(np.mean(mag[:, 322:456] > 55.0))
+    lap = np.abs(cv2.Laplacian(gray, cv2.CV_32F))
+    hl = float(np.mean(lap[:, 24:158] > 35.0))
+    hr = float(np.mean(lap[:, 322:456] > 35.0))
+    side_balance = min(l_edge, r_edge) / max(1e-4, c_edge)
+    bright_lr = min(
+        float(np.mean(gray[:, 24:158] > 155)),
+        float(np.mean(gray[:, 322:456] > 155)),
+    )
+
+    is_wide_graphic = (
+        has_doc_frame
+        or (bright_lr >= 0.14)
+        or (side_balance >= 0.50 and min(l_edge, r_edge) >= 0.048 and min(hl, hr) >= 0.045)
+    )
+    return cx_norm, (1.0 if is_wide_graphic else 0.0), gray_full
+
+
+def _analyze_clip_tracking_and_framing(
+    clip_mp4: Path,
+    fps: float = 30.0,
+    sample_step_s: float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Sample horizontal center-of-interest (`cx`) and wide-graphic framing score every 0.5s
+    across `clip_mp4`, then smoothly interpolate frame-by-frame with cubic Hermite (PCHIP) +
+    fluid-head velocity damping (zero jitter, zero overshoot).
+    """
+    cv2.setNumThreads(1)
+    cap = cv2.VideoCapture(str(clip_mp4))
+    if not cap.isOpened():
+        return np.array([0.50], dtype=np.float64), np.array([0.0], dtype=np.float64), 1
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps_in = float(cap.get(cv2.CAP_PROP_FPS) or fps or 30.0)
+    step_f = max(1, int(round(fps_in * sample_step_s)))
+
+    mp_detector, cascade = _create_face_detectors()
+    sample_frames: List[int] = []
+    sample_cx: List[float] = []
+    sample_wide: List[float] = []
+    prev_gray: Optional[np.ndarray] = None
+
+    fi = 0
+    last_frame_bgr: Optional[np.ndarray] = None
+    try:
+        while True:
+            ok, frame_bgr = cap.read()
+            if not ok or frame_bgr is None:
+                break
+            last_frame_bgr = frame_bgr
+            if fi % step_f == 0:
+                cx, ws, prev_gray = _analyze_frame_coi_and_layout(frame_bgr, mp_detector, cascade, prev_gray)
+                sample_frames.append(fi)
+                sample_cx.append(cx)
+                sample_wide.append(ws)
+            fi += 1
+        actual_frames = max(1, fi)
+        if last_frame_bgr is not None and (not sample_frames or sample_frames[-1] < actual_frames - 1):
+            cx, ws, _ = _analyze_frame_coi_and_layout(last_frame_bgr, mp_detector, cascade, prev_gray)
+            sample_frames.append(actual_frames - 1)
+            sample_cx.append(cx)
+            sample_wide.append(ws)
+    finally:
+        cap.release()
+        if mp_detector is not None:
+            try:
+                mp_detector.close()
+            except Exception:
+                pass
+
+    n_frames = max(1, total_frames if total_frames > 0 else (sample_frames[-1] + 1 if sample_frames else 1))
+    if not sample_frames:
+        return np.full(n_frames, 0.50, dtype=np.float64), np.zeros(n_frames, dtype=np.float64), n_frames
+
+    if len(sample_frames) == 1:
+        return (
+            np.full(n_frames, sample_cx[0], dtype=np.float64),
+            np.full(n_frames, sample_wide[0], dtype=np.float64),
+            n_frames,
+        )
+
+    # 3-tap smoothing on raw 0.5s samples eliminates single-frame detection glitches
+    cx_arr = np.asarray(sample_cx, dtype=np.float64)
+    w_arr = np.asarray(sample_wide, dtype=np.float64)
+    if len(cx_arr) >= 3:
+        sm_cx = cx_arr.copy()
+        sm_cx[1:-1] = 0.22 * cx_arr[:-2] + 0.56 * cx_arr[1:-1] + 0.22 * cx_arr[2:]
+        cx_arr = sm_cx
+        # Suppress isolated 0.5s wide-graphic flickers
+        sm_w = w_arr.copy()
+        for i in range(1, len(w_arr) - 1):
+            if w_arr[i - 1] == w_arr[i + 1]:
+                sm_w[i] = w_arr[i - 1]
+        w_arr = sm_w
+
+    t_samples = np.asarray(sample_frames, dtype=np.float64)
+    t_all = np.arange(n_frames, dtype=np.float64)
+    cx_interp = PchipInterpolator(t_samples, cx_arr, extrapolate=True)(t_all)
+    w_interp = PchipInterpolator(t_samples, w_arr, extrapolate=True)(t_all)
+
+    # Fluid-head camera damping for silky Steadicam-like pan velocity
+    cx_smooth = np.empty_like(cx_interp)
+    cx_smooth[0] = float(np.clip(cx_interp[0], 0.20, 0.80))
+    max_step = 0.0045  # max ~13.5% frame width per second at 30fps
+    for i in range(1, n_frames):
+        target = float(np.clip(cx_interp[i], 0.20, 0.80))
+        desired = cx_smooth[i - 1] + 0.16 * (target - cx_smooth[i - 1])
+        delta = max(-max_step, min(max_step, desired - cx_smooth[i - 1]))
+        cx_smooth[i] = cx_smooth[i - 1] + delta
+
+    # Clip-level CinemaScope hysteresis: if >=35% of sampled frames in this Short contain framed 16:9
+    # documentary UI cards/borders/boards, keep sleek CinemaScope bleed consistently across the clip
+    # so transitions never jolt mid-Short and documentary cards/captions never clip or collide.
+    if float(np.mean(w_arr >= 0.5)) >= 0.35:
+        wide_smooth = np.ones(n_frames, dtype=np.float64)
+    else:
+        # Cosine-eased smooth layout blend in [0.0, 1.0]
+        w_clamped = np.clip(w_interp, 0.0, 1.0)
+        # Apply gentle 12-frame moving average (~0.4s) so layout shifts glide smoothly
+        if n_frames > 12:
+            k = np.ones(12, dtype=np.float64) / 12.0
+            w_clamped = np.convolve(np.pad(w_clamped, (6, 5), mode="edge"), k, mode="valid")[:n_frames]
+        wide_smooth = 0.5 - 0.5 * np.cos(math.pi * np.clip(w_clamped, 0.0, 1.0))
+    return cx_smooth, wide_smooth, n_frames
+
+
+def _detect_horizontal_center_of_interest(video_16x9: Path, start_s: float, dur_s: float) -> float:
+    """Backward-compatible helper returning median horizontal subject centroid [0.22..0.78]
+    sampled every 0.5s across [start_s, start_s + dur_s].
+    """
+    cv2.setNumThreads(1)
+    cap = cv2.VideoCapture(str(video_16x9))
+    if not cap.isOpened():
+        return 0.50
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    mp_detector, cascade = _create_face_detectors()
+    centers: List[float] = []
+    prev_gray: Optional[np.ndarray] = None
+    n_steps = max(3, int(round(dur_s / 0.5)) + 1)
+    try:
+        for t in np.linspace(start_s, start_s + max(0.2, dur_s), num=min(n_steps, 24)):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * fps))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            cx, _, prev_gray = _analyze_frame_coi_and_layout(frame, mp_detector, cascade, prev_gray)
+            centers.append(cx)
+    finally:
+        cap.release()
+        if mp_detector is not None:
+            try:
+                mp_detector.close()
+            except Exception:
+                pass
     return float(np.median(centers)) if centers else 0.50
 
 
 def _score_window_impact(words: List[Dict[str, Any]], st_s: float, en_s: float) -> float:
     """Zero-token impact scorer for a candidate Short window [st_s, en_s]:
-    Rewards financial figures ($, %, digits), cliffhanger questions (?), exclamations (!),
-    and high speaking cadence.
+    Rewards high-retention figures ($, %, digits), cliffhanger questions (?), exclamations (!),
+    high-tension mystery/finance/history hook keywords, and brisk speaking cadence.
     """
     score = 1.0
     win_words = [
@@ -912,6 +1226,15 @@ def _score_window_impact(words: List[Dict[str, Any]], st_s: float, en_s: float) 
     if not win_words:
         return score
     score += len(win_words) * 0.35
+    impact_keywords = {
+        "bilhão", "bilhões", "milhões", "billion", "billions", "millions",
+        "segredo", "secret", "fraude", "fraud", "colapso", "collapse",
+        "macabra", "macabro", "sombrio", "sombria", "proibido", "proibida",
+        "ritual", "krampus", "terror", "morte", "verdade", "mistério",
+        "nunca", "crime", "maldição", "oculto", "oculta", "história",
+        "dark", "forbidden", "banned", "truth", "never", "hidden", "mystery",
+        "curse", "death", "horror", "ritual", "sinister",
+    }
     for wd in win_words:
         if "?" in wd:
             score += 3.5
@@ -919,8 +1242,8 @@ def _score_window_impact(words: List[Dict[str, Any]], st_s: float, en_s: float) 
             score += 2.0
         if any(c.isdigit() for c in wd) or "$" in wd or "%" in wd:
             score += 4.0
-        low = wd.lower().strip(".,!?")
-        if low in ("bilhão", "bilhões", "milhões", "billion", "billions", "millions", "segredo", "secret", "fraude", "fraud", "colapso", "collapse"):
+        low = wd.lower().strip(".,!?;:\"'()[]")
+        if low in impact_keywords:
             score += 3.0
     return round(score, 2)
 
@@ -945,7 +1268,6 @@ def _select_5_highest_impact_windows(
     for idx in range(n_clips):
         z_start = idx * zone_span
         z_end = min(max_start, (idx + 1) * zone_span)
-        # Evaluate 5 candidate offsets inside each act zone and pick the highest-impact peak
         candidates = np.linspace(z_start, z_end, num=5) if z_end > z_start + 0.2 else [z_start]
         best_st = float(candidates[0])
         best_score = -1.0
@@ -961,22 +1283,280 @@ def _select_5_highest_impact_windows(
     return selected
 
 
+def _build_cinema_vignette_image(out_w: int, out_h: int) -> skia.Image:
+    """Pre-render a smooth radial cinema vignette overlay for instant per-frame compositing."""
+    vs = skia.Surface(out_w, out_h)
+    vc = vs.getCanvas()
+    vc.clear(skia.Color4f(0, 0, 0, 0))
+    rad = math.hypot(out_w * 0.5, out_h * 0.5) * 1.06
+    vp = skia.Paint(AntiAlias=True)
+    vp.setShader(
+        skia.GradientShader.MakeRadial(
+            (out_w * 0.5, out_h * 0.45),
+            rad,
+            [
+                skia.ColorSetARGB(0, 6, 7, 12),
+                skia.ColorSetARGB(0, 6, 7, 12),
+                skia.ColorSetARGB(62, 6, 7, 12),
+                skia.ColorSetARGB(148, 4, 5, 10),
+            ],
+            [0.0, 0.46, 0.78, 1.0],
+        )
+    )
+    vc.drawRect(skia.Rect.MakeWH(out_w, out_h), vp)
+    return vs.makeImageSnapshot()
+
+
+def _warp_subpixel_crop(
+    frame_bgr: np.ndarray,
+    cx_norm: float,
+    zoom: float,
+    dst_w: int,
+    dst_h: int,
+    src_y_crop_ratio: float = 1.0,
+) -> np.ndarray:
+    """Subpixel-accurate smooth pan & zoom warp from 16:9 source into (dst_w, dst_h)."""
+    src_h_full, src_w = frame_bgr.shape[:2]
+    src_h = max(64, int(round(src_h_full * max(0.5, min(1.0, src_y_crop_ratio)))))
+    base_scale = max(dst_w / float(src_w), dst_h / float(src_h))
+    scale = base_scale * max(1.0, float(zoom))
+
+    vis_w = dst_w / scale
+    vis_h = dst_h / scale
+    cx_px = float(np.clip(cx_norm * src_w, vis_w * 0.5, max(vis_w * 0.5, src_w - vis_w * 0.5)))
+    cy_px = float(np.clip(src_h * 0.5, vis_h * 0.5, max(vis_h * 0.5, src_h - vis_h * 0.5)))
+
+    tx = dst_w * 0.5 - cx_px * scale
+    ty = dst_h * 0.5 - cy_px * scale
+    mat = np.array([[scale, 0.0, tx], [0.0, scale, ty]], dtype=np.float32)
+    return cv2.warpAffine(
+        frame_bgr,
+        mat,
+        (dst_w, dst_h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
+def _render_blurred_cinema_bleed(frame_bgr: np.ndarray, cx_norm: float, out_w: int, out_h: int) -> np.ndarray:
+    """Fast silky-bokeh darkened vertical background bleed for wide investigative graphic framing."""
+    small_w, small_h = 135, 240
+    cropped_sm = _warp_subpixel_crop(frame_bgr, cx_norm, zoom=1.18, dst_w=small_w, dst_h=small_h)
+    blurred = cv2.GaussianBlur(cropped_sm, (23, 23), 0)
+    # Atmospheric dark-cinema grade so foreground wide board pops with zero clutter
+    dark = np.clip(blurred.astype(np.float32) * 0.36, 0, 255).astype(np.uint8)
+    return cv2.resize(dark, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+
+def _draw_glassmorphic_cta(
+    canvas: skia.Canvas,
+    out_w: int,
+    out_h: int,
+    cta_label: str,
+    cta_font: skia.Font,
+    alpha_mul: float = 1.0,
+) -> None:
+    """Render a subtle frosted-glass cinema CTA strip near the bottom of the 9:16 Short."""
+    if alpha_mul <= 0.01:
+        return
+    clean_txt = str(cta_label or "ASSISTA COMPLETO NO CANAL").lstrip("▶► ").strip().upper()
+    tw = float(cta_font.measureText(clean_txt))
+    badge_d = 26.0
+    gap = 12.0
+    pad_x = 22.0
+    inner_w = badge_d + gap + tw
+    pill_w = inner_w + pad_x * 2.0
+    pill_h = 52.0
+    max_pill_w = out_w * 0.84
+    scale = min(1.0, max_pill_w / max(1.0, pill_w))
+
+    cx = out_w * 0.5
+    cy = out_h - 118.0
+    a_bg_top = int(round(176 * alpha_mul))
+    a_bg_bot = int(round(212 * alpha_mul))
+    a_border_top = int(round(92 * alpha_mul))
+    a_border_bot = int(round(28 * alpha_mul))
+    a_shadow = int(round(135 * alpha_mul))
+    a_text = int(round(240 * alpha_mul))
+    a_accent = int(round(235 * alpha_mul))
+
+    canvas.save()
+    canvas.translate(cx, cy)
+    canvas.scale(scale, scale)
+
+    rect = skia.Rect.MakeXYWH(-pill_w * 0.5, -pill_h * 0.5, pill_w, pill_h)
+    r_rad = pill_h * 0.5
+
+    # Frosted dark smoked-glass body + subtle drop shadow
+    bg_paint = skia.Paint(AntiAlias=True)
+    bg_paint.setShader(
+        skia.GradientShader.MakeLinear(
+            [(0.0, -pill_h * 0.5), (0.0, pill_h * 0.5)],
+            [skia.ColorSetARGB(a_bg_top, 24, 27, 40), skia.ColorSetARGB(a_bg_bot, 10, 12, 20)],
+        )
+    )
+    bg_paint.setImageFilter(
+        skia.ImageFilters.DropShadow(0.0, 6.0, 14.0, 14.0, skia.ColorSetARGB(a_shadow, 0, 0, 0))
+    )
+    canvas.drawRoundRect(rect, r_rad, r_rad, bg_paint)
+
+    # Fine specular glass rim highlight
+    border_paint = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=1.5)
+    border_paint.setShader(
+        skia.GradientShader.MakeLinear(
+            [(0.0, -pill_h * 0.5), (0.0, pill_h * 0.5)],
+            [skia.ColorSetARGB(a_border_top, 255, 255, 255), skia.ColorSetARGB(a_border_bot, 255, 255, 255)],
+        )
+    )
+    canvas.drawRoundRect(rect, r_rad, r_rad, border_paint)
+
+    # Crisp vector play badge (guaranteed zero tofu/missing-glyph box)
+    left_x = -inner_w * 0.5
+    play_cx = left_x + badge_d * 0.5
+    canvas.drawCircle(
+        play_cx,
+        0.0,
+        badge_d * 0.5,
+        skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(a_accent, 255, 209, 102)),
+    )
+    tri = skia.Path()
+    tri.moveTo(play_cx - 3.5, -5.5)
+    tri.lineTo(play_cx + 6.0, 0.0)
+    tri.lineTo(play_cx - 3.5, 5.5)
+    tri.close()
+    canvas.drawPath(tri, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(a_text, 12, 13, 20)))
+
+    # Crisp ivory uppercase CTA label
+    fm = cta_font.getMetrics()
+    baseline_y = (abs(float(fm.fAscent)) - abs(float(fm.fDescent))) * 0.5
+    txt_x = left_x + badge_d + gap
+    canvas.drawString(
+        clean_txt,
+        txt_x,
+        baseline_y,
+        cta_font,
+        skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(a_text, 244, 246, 252)),
+    )
+    canvas.restore()
+
+
+def _mix_pro_short_audio(
+    master_16x9_mp4: Path,
+    st_s: float,
+    seg_dur: float,
+    out_audio_m4a: Path,
+    thermal_limit_c: float = 85.0,
+) -> Path:
+    """Extract Short audio slice with smooth 0.25s fade-in/out and mix Hollywood
+    `flash_impact.wav` + `whoosh_fast.wav` directly onto the Short's audio track (zero pops/clipping).
+    """
+    sfx_dir = ASSETS_DIR / "sfx"
+    flash_wav = sfx_dir / "flash_impact.wav"
+    whoosh_wav = sfx_dir / "whoosh_fast.wav"
+    has_src_audio = _has_audio_stream(master_16x9_mp4)
+    fade_out_st = max(0.0, seg_dur - 0.25)
+
+    inputs: List[str] = []
+    filter_parts: List[str] = []
+    mix_labels: List[str] = []
+    next_idx = 0
+
+    if has_src_audio:
+        inputs.extend(["-ss", f"{st_s:.3f}", "-t", f"{seg_dur:.3f}", "-i", str(master_16x9_mp4)])
+        filter_parts.append(
+            f"[{next_idx}:a]aresample=48000,aformat=channel_layouts=stereo,"
+            f"afade=t=in:st=0:d=0.25,apad=whole_dur={seg_dur:.3f},atrim=0:{seg_dur:.3f},asetpts=PTS-STARTPTS[base]"
+        )
+    else:
+        inputs.extend(["-f", "lavfi", "-t", f"{seg_dur:.3f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000"])
+        filter_parts.append(f"[{next_idx}:a]atrim=0:{seg_dur:.3f},asetpts=PTS-STARTPTS[base]")
+    mix_labels.append("[base]")
+    next_idx += 1
+
+    if flash_wav.exists():
+        inputs.extend(["-i", str(flash_wav)])
+        filter_parts.append(
+            f"[{next_idx}:a]aresample=48000,aformat=channel_layouts=stereo,"
+            f"volume=0.52,adelay=15|15,apad=whole_dur={seg_dur:.3f},atrim=0:{seg_dur:.3f}[sfx_flash]"
+        )
+        mix_labels.append("[sfx_flash]")
+        next_idx += 1
+
+    if whoosh_wav.exists():
+        inputs.extend(["-i", str(whoosh_wav)])
+        filter_parts.append(
+            f"[{next_idx}:a]aresample=48000,aformat=channel_layouts=stereo,"
+            f"volume=0.42,adelay=0|0,apad=whole_dur={seg_dur:.3f},atrim=0:{seg_dur:.3f}[sfx_whoosh]"
+        )
+        mix_labels.append("[sfx_whoosh]")
+        next_idx += 1
+
+    if len(mix_labels) == 1:
+        filter_parts.append(
+            f"[base]afade=t=out:st={fade_out_st:.3f}:d=0.25,alimiter=limit=0.95[aout]"
+        )
+    else:
+        joined = "".join(mix_labels)
+        filter_parts.append(
+            f"{joined}amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0:normalize=0,"
+            f"afade=t=out:st={fade_out_st:.3f}:d=0.25,alimiter=limit=0.95[aout]"
+        )
+
+    run_ffmpeg_safe(
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            *inputs,
+            "-filter_complex",
+            ";".join(filter_parts),
+            "-map",
+            "[aout]",
+            "-t",
+            f"{seg_dur:.3f}",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            str(out_audio_m4a),
+        ],
+        thermal_limit_c=thermal_limit_c,
+    )
+    return out_audio_m4a
+
+
 def extract_5_viral_shorts_from_16x9(
     master_16x9_mp4: Union[str, Path],
     words: List[Dict[str, Any]],
     output_dir: Union[str, Path],
     max_shorts: int = 5,
     thermal_limit_c: float = 85.0,
+    caption_style: str = "hormozi_neon",
 ) -> List[Dict[str, Any]]:
-    """Extract 5 high-retention vertical 9:16 (1080x1920) Shorts from a 16:9 horizontal video.
-    Zero LLM tokens: uses highest-impact moment scoring + smart MediaPipe/Saliency 16:9->9:16 reframing
-    + Skia vertical Hormozi captions + Traffic CTA pill pointing to the full video.
+    """Extract up to 5 Pro Cinema vertical 9:16 (1080x1920) Shorts from a 16:9 master video.
+    Zero LLM tokens:
+    - Dynamic 0.5s active-subject tracking (MediaPipe/OpenCV saliency) with cubic Hermite (PCHIP) smoothing
+    - Hook punch-in zoom (1.00x -> 1.10x over 1.4s) + 3-frame cinema flash transition + radial vignette
+    - Sleek blur-framed upper/lower cinema bleed when framing wide investigative graphics/newspapers/boards
+    - Mixes Hollywood `flash_impact.wav` + `whoosh_fast.wav` with 0.25s smooth fade-in/fade-out
+    - Kinetic vertical Hormozi captions (`draw_kinetic_captions`) + subtle glassmorphic CTA strip
     """
     master_16x9_mp4 = Path(master_16x9_mp4)
     output_dir = Path(output_dir)
     shorts_dir = output_dir / "shorts_cascade"
     shorts_dir.mkdir(parents=True, exist_ok=True)
     total_dur = max(4.0, _get_wav_duration(master_16x9_mp4))
+
+    # Guarantee Hollywood cinema transition SFX are synthesized and up to date
+    try:
+        ensure_pro_cinema_sfx(force=False, thermal_limit_c=thermal_limit_c)
+    except Exception:
+        pass
 
     # Auto-recover words from output_dir/words.json or synthesize fallback word timestamps if empty
     if not words:
@@ -987,7 +1567,7 @@ def extract_5_viral_shorts_from_16x9(
             except Exception:
                 words = []
     if not words:
-        fallback_line = "VEJA O DOCUMENTÁRIO COMPLETO NO CANAL AGORA MESMO " * max(2, int(total_dur // 4))
+        fallback_line = "ASSISTA AO DOCUMENTÁRIO COMPLETO NO CANAL AGORA MESMO " * max(2, int(total_dur // 4))
         words = _estimate_word_timestamps(fallback_line.strip(), total_dur)
 
     sample_text = " ".join(str(w.get("word", "")) for w in words[:40])
@@ -998,49 +1578,61 @@ def extract_5_viral_shorts_from_16x9(
     windows = _select_5_highest_impact_windows(total_dur, words, n_clips=n_clips)
 
     caption_tf, _ = _load_verified_typeface("Montserrat-Black.ttf", role="cascade_short_caption")
-    cap_font = skia.Font(caption_tf, 74.0)
-    cta_font = skia.Font(caption_tf, 28.0)
-    space_w = max(26.0, float(cap_font.measureText(" ")) * 1.42)
-    fm = cap_font.getMetrics()
-    ascent = abs(float(fm.fAscent))
-    descent = abs(float(fm.fDescent))
+    cta_tf, _ = _load_verified_typeface("PlusJakartaSans-ExtraBold.ttf", role="cascade_short_cta")
+    cta_font = skia.Font(cta_tf, 24.0)
 
     extracted: List[Dict[str, Any]] = []
     out_w, out_h = 1080, 1920
     fps = 30
+    vignette_img = _build_cinema_vignette_image(out_w, out_h)
 
     for idx, (st_s, en_s, impact_score) in enumerate(windows):
         seg_dur = max(3.0, round(en_s - st_s, 2))
+        raw_src_mp4 = shorts_dir / f"_raw_src_16x9_{idx + 1:02d}.mp4"
+        mixed_audio_m4a = shorts_dir / f"_raw_short_audio_{idx + 1:02d}.m4a"
 
-        # 1. Detect horizontal center of interest via MediaPipe BlazeFace / OpenCV Saliency
-        norm_cx = _detect_horizontal_center_of_interest(master_16x9_mp4, st_s, seg_dur)
-
-        # 2. Extract reframed 1080x1920 video + audio slice via FFmpeg smart crop
-        raw_crop_mp4 = shorts_dir / f"_raw_short_{idx + 1:02d}.mp4"
-        raw_audio_m4a = shorts_dir / f"_raw_short_{idx + 1:02d}.m4a"
-        scaled_w = 3414
-        crop_x = int(max(0, min(scaled_w - out_w, round(norm_cx * scaled_w - out_w * 0.5))))
+        # 1. Extract frame-accurate 16:9 30fps video slice (full width preserved for dynamic tracking & bleed framing)
         run_ffmpeg_safe(
             [
-                "ffmpeg", "-y", "-v", "error",
-                "-ss", f"{st_s:.2f}", "-t", f"{seg_dur:.2f}",
-                "-i", str(master_16x9_mp4),
-                "-vf", f"scale={scaled_w}:{out_h},crop={out_w}:{out_h}:{crop_x}:0,fps={fps}",
-                "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "19",
-                str(raw_crop_mp4),
-            ]
-        )
-        run_ffmpeg_safe(
-            [
-                "ffmpeg", "-y", "-v", "error",
-                "-ss", f"{st_s:.2f}", "-t", f"{seg_dur:.2f}",
-                "-i", str(master_16x9_mp4),
-                "-vn", "-c:a", "aac", "-b:a", "192k",
-                str(raw_audio_m4a),
-            ]
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-ss",
+                f"{st_s:.3f}",
+                "-t",
+                f"{seg_dur:.3f}",
+                "-i",
+                str(master_16x9_mp4),
+                "-vf",
+                f"fps={fps}",
+                "-an",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                "18",
+                str(raw_src_mp4),
+            ],
+            thermal_limit_c=thermal_limit_c,
         )
 
-        # 3. Slice & shift word timestamps for this Short and burn vertical Hormozi captions + Traffic CTA in Skia C++
+        # 2. Mix Pro Cinema Short audio (0.25s smooth fade-in/out + flash_impact.wav + whoosh_fast.wav)
+        _mix_pro_short_audio(
+            master_16x9_mp4=master_16x9_mp4,
+            st_s=st_s,
+            seg_dur=seg_dur,
+            out_audio_m4a=mixed_audio_m4a,
+            thermal_limit_c=thermal_limit_c,
+        )
+
+        # 3. Dynamic 0.5s active-subject tracking + wide-graphic framing analysis with cubic smoothing
+        cx_curve, wide_curve, _ = _analyze_clip_tracking_and_framing(raw_src_mp4, fps=float(fps), sample_step_s=0.5)
+        median_cx = float(np.median(cx_curve)) if len(cx_curve) else 0.50
+        wide_ratio = float(np.mean(wide_curve > 0.5)) if len(wide_curve) else 0.0
+
+        # 4. Slice & shift word timestamps for this Short
         seg_words = []
         for wd in words:
             ws = float(wd.get("start", 0.0))
@@ -1057,26 +1649,53 @@ def extract_5_viral_shorts_from_16x9(
             seg_words = _estimate_word_timestamps(f"PARTE {idx + 1} DO DOCUMENTÁRIO COMPLETO", seg_dur)
         chunks = group_words_into_chunks(seg_words, max_words=3)
 
+        # 5. Composite Pro Cinema 9:16 video stream frame-by-frame in Skia C++
         final_short_mp4 = shorts_dir / f"short_{idx + 1:02d}_9x16.mp4"
-        cap = cv2.VideoCapture(str(raw_crop_mp4))
+        cap = cv2.VideoCapture(str(raw_src_mp4))
         surface = skia.Surface(out_w, out_h)
 
         pre_args, enc_args, hw_suffix = build_video_encode_args(qp=20)
         cmd = [
-            "ffmpeg", "-y", "-v", "error",
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
             *pre_args,
-            "-f", "rawvideo", "-pix_fmt", "bgra",
-            "-s", f"{out_w}x{out_h}", "-r", str(fps), "-i", "pipe:0",
-            "-i", str(raw_audio_m4a),
-            "-vf", hw_suffix,
-            "-map", "0:v", "-map", "1:a",
-            "-t", f"{seg_dur:.3f}",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgra",
+            "-s",
+            f"{out_w}x{out_h}",
+            "-r",
+            str(fps),
+            "-i",
+            "pipe:0",
+            "-i",
+            str(mixed_audio_m4a),
+            "-vf",
+            hw_suffix,
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-t",
+            f"{seg_dur:.3f}",
             *enc_args,
-            "-c:a", "copy", "-movflags", "+faststart",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
             str(final_short_mp4),
         ]
         thermal_guard_wait(limit_c=thermal_limit_c)
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE, env=get_vaapi_env())
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=get_vaapi_env(),
+            preexec_fn=nice_preexec,
+        )
         assert proc.stdin is not None
 
         fi = 0
@@ -1086,90 +1705,175 @@ def extract_5_viral_shorts_from_16x9(
                 if not ok or frame_bgr is None:
                     break
                 t = fi / float(fps)
-                fi += 1
+                c_idx = min(fi, len(cx_curve) - 1)
+                cx_t = float(cx_curve[c_idx])
+                wide_t = float(wide_curve[c_idx])
 
-                frame_bgra = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2BGRA)
-                img = skia.Image.frombytes(
-                    frame_bgra.tobytes(),
-                    (out_w, out_h),
-                    skia.kBGRA_8888_ColorType,
-                    skia.kPremul_AlphaType,
-                )
+                # Dynamic Hook Punch-In Zoom: smooth 1.00x -> 1.10x over first 1.4s, then gentle cinema life
+                if t <= 1.4:
+                    p = t / 1.4
+                    ease_out = 1.0 - (1.0 - p) ** 3
+                    zoom_t = 1.00 + 0.10 * ease_out
+                else:
+                    rest_p = min(1.0, (t - 1.4) / max(1.0, seg_dur - 1.4))
+                    zoom_t = 1.10 - 0.045 * rest_p + 0.007 * math.sin((t - 1.4) * 1.15)
 
                 c = surface.getCanvas()
-                c.drawImage(img, 0, 0)
+                c.clear(skia.ColorBLACK)
 
-                # Lower-third contrast scrim
+                if wide_t < 0.03:
+                    # Full-bleed smooth Steadicam vertical tracking (crop bottom 12% to avoid legacy 16:9 subtitle bleed)
+                    framed_bgr = _warp_subpixel_crop(frame_bgr, cx_t, zoom_t, out_w, out_h, src_y_crop_ratio=0.88)
+                    framed_bgra = cv2.cvtColor(framed_bgr, cv2.COLOR_BGR2BGRA)
+                    img = skia.Image.frombytes(
+                        framed_bgra.tobytes(),
+                        (out_w, out_h),
+                        skia.kBGRA_8888_ColorType,
+                        skia.kPremul_AlphaType,
+                    )
+                    c.drawImage(img, 0, 0)
+                else:
+                    # Sleek blur-framed upper/lower cinema bleed for wide investigative graphics/newspapers/boards
+                    bg_bleed_bgr = _render_blurred_cinema_bleed(frame_bgr, cx_t, out_w, out_h)
+                    bg_bleed_bgra = cv2.cvtColor(bg_bleed_bgr, cv2.COLOR_BGR2BGRA)
+                    bg_img = skia.Image.frombytes(
+                        bg_bleed_bgra.tobytes(),
+                        (out_w, out_h),
+                        skia.kBGRA_8888_ColorType,
+                        skia.kPremul_AlphaType,
+                    )
+                    c.drawImage(bg_img, 0, 0)
+
+                    # Smoothly interpolate foreground window from full-bleed -> sleek CinemaScope framed window
+                    # (1044x480 with y_crop=0.815 matches 1920x880 aspect = 2.18:1 -> 0% horizontal clipping
+                    # AND cleanly trims off legacy 16:9 bottom subtitles at y>=82%!)
+                    fg_x = 18.0 * wide_t
+                    fg_y = 455.0 * wide_t
+                    fg_w = max(64, int(round(out_w - 36.0 * wide_t)))
+                    fg_h = max(64, int(round(out_h - (out_h - 480.0) * wide_t)))
+                    # Blend pan center gently toward 0.50 in wide mode so full-width headlines stay perfectly centered
+                    eff_cx = cx_t * (1.0 - 0.85 * wide_t) + 0.50 * (0.85 * wide_t)
+                    eff_zoom = 1.0 + (zoom_t - 1.0) * (1.0 - 0.78 * wide_t)
+                    y_crop = 1.0 - 0.185 * wide_t
+                    fg_bgr = _warp_subpixel_crop(
+                        frame_bgr,
+                        eff_cx,
+                        zoom=eff_zoom,
+                        dst_w=fg_w,
+                        dst_h=fg_h,
+                        src_y_crop_ratio=y_crop,
+                    )
+                    fg_bgra = cv2.cvtColor(fg_bgr, cv2.COLOR_BGR2BGRA)
+                    fg_img = skia.Image.frombytes(
+                        fg_bgra.tobytes(),
+                        (fg_w, fg_h),
+                        skia.kBGRA_8888_ColorType,
+                        skia.kPremul_AlphaType,
+                    )
+
+                    fg_rect = skia.Rect.MakeXYWH(fg_x, fg_y, float(fg_w), float(fg_h))
+                    corner_r = 22.0 * wide_t
+
+                    # Soft dark elevation shadow behind wide graphic window
+                    sh_paint = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(int(195 * wide_t), 0, 0, 0))
+                    sh_paint.setImageFilter(
+                        skia.ImageFilters.DropShadowOnly(0.0, 14.0, 26.0, 26.0, skia.ColorSetARGB(int(185 * wide_t), 0, 0, 0))
+                    )
+                    c.drawRoundRect(fg_rect, corner_r, corner_r, sh_paint)
+
+                    # Clipped crisp rounded wide cinema window
+                    c.save()
+                    clip_p = skia.Path()
+                    clip_p.addRoundRect(fg_rect, corner_r, corner_r)
+                    c.clipPath(clip_p, doAntiAlias=True)
+                    c.drawImage(fg_img, fg_x, fg_y)
+                    c.restore()
+
+                    # Delicate frosty hairline cinema border
+                    rim_paint = skia.Paint(
+                        AntiAlias=True,
+                        Style=skia.Paint.kStroke_Style,
+                        StrokeWidth=1.8,
+                        Color=skia.ColorSetARGB(int(72 * wide_t), 255, 255, 255),
+                    )
+                    c.drawRoundRect(fg_rect, corner_r, corner_r, rim_paint)
+
+                # Cinema radial vignette for instant Netflix/A24 depth
+                c.drawImage(vignette_img, 0, 0)
+
+                # Lower-third contrast scrim so vertical captions & CTA always pop cleanly
                 scrim = skia.Paint()
                 scrim.setShader(
                     skia.GradientShader.MakeLinear(
-                        [(0, out_h * 0.72), (0, out_h)],
-                        [skia.ColorSetARGB(0, 11, 7, 19), skia.ColorSetARGB(205, 11, 7, 19)],
+                        [(0, out_h * 0.68), (0, out_h)],
+                        [
+                            skia.ColorSetARGB(0, 8, 7, 14),
+                            skia.ColorSetARGB(150, 8, 7, 14),
+                            skia.ColorSetARGB(232, 6, 6, 12),
+                        ],
+                        [0.0, 0.45, 1.0],
                     )
                 )
-                c.drawRect(skia.Rect.MakeXYWH(0, out_h * 0.72, out_w, out_h * 0.28), scrim)
+                c.drawRect(skia.Rect.MakeXYWH(0, out_h * 0.68, out_w, out_h * 0.32), scrim)
 
-                # Traffic funnel CTA pill at bottom pointing to the full video
-                cta_prefix = "CLIP" if detected_lang == "en_us" else "CORTE"
-                cta_txt = f"{cta_base} • {cta_prefix} #{idx + 1}"
-                cta_w = cta_font.measureText(cta_txt)
-                cta_r = skia.Rect.MakeXYWH((out_w - cta_w) * 0.5 - 24, out_h - 120, cta_w + 48, 52)
-                c.drawRoundRect(cta_r, 26, 26, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(225, 20, 14, 36)))
-                c.drawRoundRect(
-                    cta_r,
-                    26,
-                    26,
-                    skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=3.0, Color=hex_to_skia("#B8FF01")),
+                # Clean modern vertical Kinetic Hormozi Captions (strictly 1 active word pill, drop shadow)
+                _draw_captions_pro(
+                    c,
+                    chunks,
+                    t,
+                    out_w,
+                    out_h,
+                    caption_tf,
+                    style=caption_style,
+                    y_ratio=0.775,
+                    font_size=74.0,
                 )
-                c.drawString(cta_txt, (out_w - cta_w) * 0.5, out_h - 84, cta_font, skia.Paint(AntiAlias=True, Color=hex_to_skia("#B8FF01")))
 
-                # Vertical Hormozi Captions (strictly 1 active word pill, safe 0.86 width clamp)
-                for ch in chunks:
-                    if ch["start"] <= t <= ch["end"]:
-                        w_list = ch["words"]
-                        active_wd = next((wd for wd in reversed(w_list) if wd["start"] <= t <= (wd["end"] + 0.04)), None)
-                        pad_x, pad_y = 24.0, 12.0
-                        toks = []
-                        tot_w = 0.0
-                        for wd in w_list:
-                            txt = str(wd["word"]).strip().upper()
-                            if not txt:
-                                continue
-                            is_act = wd is active_wd
-                            sc = 1.12 if is_act else 1.0
-                            tw = float(cap_font.measureText(txt))
-                            sw = (tw + pad_x * 2.0) * sc if is_act else tw
-                            toks.append({"txt": txt, "w": tw, "sw": sw, "act": is_act, "sc": sc, "pidx": int(wd.get("g_idx", 0))})
-                            tot_w += sw
-                        if toks:
-                            tot_w += space_w * (len(toks) - 1)
-                            lscale = min(1.0, (out_w * 0.86) / max(1.0, tot_w))
-                            c.save()
-                            c.translate(out_w * 0.5, out_h * 0.79)
-                            c.scale(lscale, lscale)
-                            cx_p = -tot_w * 0.5
-                            pmap = {}
-                            for tk in toks:
-                                pmap[id(tk)] = cx_p + tk["sw"] * 0.5
-                                cx_p += tk["sw"] + space_w
-                            for tk in [x for x in toks if not x["act"]] + [x for x in toks if x["act"]]:
-                                c.save()
-                                c.translate(pmap[id(tk)], 0.0)
-                                if tk["act"]:
-                                    c.scale(tk["sc"], tk["sc"])
-                                    pbg, ptx, _ = ACTIVE_PILL_PALETTE[tk["pidx"] % len(ACTIVE_PILL_PALETTE)]
-                                    pr = skia.Rect.MakeXYWH(-tk["w"] * 0.5 - pad_x, -ascent - pad_y, tk["w"] + pad_x * 2.0, ascent + descent + pad_y * 2.0)
-                                    c.drawRoundRect(pr, 18, 18, skia.Paint(AntiAlias=True, Color=hex_to_skia(pbg)))
-                                    c.drawString(tk["txt"], -tk["w"] * 0.5, 0.0, cap_font, skia.Paint(AntiAlias=True, Color=hex_to_skia(ptx)))
-                                else:
-                                    stp = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=11.0, StrokeJoin=skia.Paint.kRound_Join, Color=skia.ColorBLACK)
-                                    c.drawString(tk["txt"], -tk["w"] * 0.5, 0.0, cap_font, stp)
-                                    c.drawString(tk["txt"], -tk["w"] * 0.5, 0.0, cap_font, skia.Paint(AntiAlias=True, Color=skia.ColorWHITE))
-                                c.restore()
-                            c.restore()
-                        break
+                # Subtle glassmorphic CTA strip fading in smoothly after the 3-frame flash impact
+                cta_alpha = min(1.0, max(0.0, (t - 0.18) / 0.32))
+                _draw_glassmorphic_cta(c, out_w, out_h, cta_base, cta_font, alpha_mul=cta_alpha)
+
+                # Subtle 3-frame cinema flash transition right at t=0.0 (fi in 0, 1, 2)
+                if fi < 3:
+                    flash_alphas = (165, 92, 36)
+                    fa = flash_alphas[fi]
+                    fp = skia.Paint(AntiAlias=True)
+                    fp.setShader(
+                        skia.GradientShader.MakeRadial(
+                            (out_w * 0.5, out_h * 0.44),
+                            out_h * 0.65,
+                            [
+                                skia.ColorSetARGB(fa, 255, 250, 236),
+                                skia.ColorSetARGB(int(fa * 0.55), 255, 224, 178),
+                                skia.ColorSetARGB(int(fa * 0.25), 14, 12, 20),
+                            ],
+                            [0.0, 0.45, 1.0],
+                        )
+                    )
+                    c.drawRect(skia.Rect.MakeWH(out_w, out_h), fp)
+                    if fi == 0:
+                        # Subtle anamorphic flash streak across optical center
+                        streak_p = skia.Paint(AntiAlias=True)
+                        streak_p.setShader(
+                            skia.GradientShader.MakeLinear(
+                                [(0.0, out_h * 0.44), (float(out_w), out_h * 0.44)],
+                                [
+                                    skia.ColorSetARGB(0, 255, 245, 220),
+                                    skia.ColorSetARGB(135, 255, 248, 230),
+                                    skia.ColorSetARGB(0, 255, 245, 220),
+                                ],
+                                [0.0, 0.5, 1.0],
+                            )
+                        )
+                        c.drawRect(skia.Rect.MakeXYWH(0, out_h * 0.44 - 14, out_w, 28), streak_p)
+
+                # Smooth cinema dark fade-out during the final 0.22s
+                if seg_dur - t < 0.22:
+                    fade_a = int(round(215.0 * min(1.0, max(0.0, (0.22 - (seg_dur - t)) / 0.22))))
+                    c.drawRect(skia.Rect.MakeWH(out_w, out_h), skia.Paint(Color=skia.ColorSetARGB(fade_a, 6, 6, 10)))
 
                 proc.stdin.write(surface.makeImageSnapshot().tobytes())
+                fi += 1
         except BrokenPipeError:
             pass
         finally:
@@ -1181,8 +1885,8 @@ def extract_5_viral_shorts_from_16x9(
 
         stderr = proc.stderr.read() if proc.stderr else b""
         proc.wait(timeout=180)
-        raw_crop_mp4.unlink(missing_ok=True)
-        raw_audio_m4a.unlink(missing_ok=True)
+        raw_src_mp4.unlink(missing_ok=True)
+        mixed_audio_m4a.unlink(missing_ok=True)
         if proc.returncode != 0:
             raise RuntimeError(f"Falha ao extrair corte 9:16 #{idx + 1}: {stderr.decode(errors='ignore')}")
 
@@ -1194,9 +1898,11 @@ def extract_5_viral_shorts_from_16x9(
                 "end_s": en_s,
                 "duration_s": seg_dur,
                 "impact_score": impact_score,
-                "center_x_norm": round(norm_cx, 3),
+                "center_x_norm": round(median_cx, 3),
+                "wide_bleed_ratio": round(wide_ratio, 3),
                 "cta_tag": cta_base,
                 "resolution": "1080x1920",
+                "pro_cinema_cuts": True,
             }
         )
 

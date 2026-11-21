@@ -39,3 +39,6 @@ data/profiles/
 data/flow_vault/
 
 data/doc_photo_cache/
+
+data/doc_broll_cache/
+data/thumb_hero_cache/
