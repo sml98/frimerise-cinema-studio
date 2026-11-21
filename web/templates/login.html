@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <title>Entrar — FrimeRise Studio</title>
+  <link rel="icon" type="image/png" href="/assets/brand/frimerise_logo.png" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0B0713;
+      --card: #140E24;
+      --border: rgba(179, 136, 255, 0.28);
+      --pink: #FF2E93;
+      --lime: #B8FF01;
+      --gold: #FFD166;
+      --lilac: #B388FF;
+      --text: #F8F5FF;
+      --muted: #B6A9D4;
+    }
+
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100svh;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background:
+        radial-gradient(circle at 15% 10%, rgba(255, 46, 147, 0.16), transparent 42%),
+        radial-gradient(circle at 85% 20%, rgba(179, 136, 255, 0.15), transparent 45%),
+        var(--bg);
+      color: var(--text);
+      display: flex;
+      justify-content: center;
+      align-items: flex-start;
+      padding: clamp(1rem, 5vh, 3rem) 1rem 2rem;
+      line-height: 1.45;
+    }
+
+    main {
+      width: 100%;
+      max-width: 26rem;
+    }
+
+    .card {
+      background: rgba(20, 14, 36, 0.92);
+      border: 1px solid var(--border);
+      border-radius: 1.25rem;
+      padding: 1.5rem;
+      box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(18px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-block-end: 1.25rem;
+    }
+
+    .brand img {
+      width: 2.75rem;
+      height: 2.75rem;
+      border-radius: 0.85rem;
+      border: 1px solid rgba(179, 136, 255, 0.45);
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 1.35rem;
+      font-weight: 900;
+      letter-spacing: -0.02em;
+      background: linear-gradient(90deg, var(--pink), var(--lilac), var(--lime));
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+
+    .brand p {
+      margin: 0.15rem 0 0;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    .error-banner {
+      margin-block-end: 1rem;
+      padding: 0.75rem 0.9rem;
+      border-radius: 0.75rem;
+      border: 1px solid rgba(255, 46, 147, 0.65);
+      background: rgba(255, 46, 147, 0.14);
+      color: #FFD1E8;
+      font-size: 0.875rem;
+      font-weight: 600;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      margin-block-end: 1rem;
+    }
+
+    .field-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+    }
+
+    label {
+      font-size: 0.85rem;
+      font-weight: 700;
+      color: var(--lilac);
+    }
+
+    .req {
+      color: var(--pink);
+    }
+
+    input[type="text"],
+    input[type="password"] {
+      width: 100%;
+      font: inherit;
+      font-size: max(1rem, 1em);
+      min-height: 48px;
+      padding: 0.7rem 0.9rem;
+      border-radius: 0.75rem;
+      border: 1px solid rgba(179, 136, 255, 0.35);
+      background: #0B0713;
+      color: var(--text);
+    }
+
+    input:focus-visible,
+    button:focus-visible {
+      outline: 3px solid var(--lime);
+      outline-offset: 2px;
+    }
+
+    input:user-invalid {
+      border-color: var(--pink);
+    }
+
+    .toggle-btn {
+      font: inherit;
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--gold);
+      background: transparent;
+      border: 1px solid rgba(255, 209, 102, 0.35);
+      border-radius: 0.5rem;
+      padding: 0.3rem 0.65rem;
+      min-height: 36px;
+      cursor: pointer;
+    }
+
+    .toggle-btn:hover {
+      background: rgba(255, 209, 102, 0.12);
+    }
+
+    .submit-btn {
+      width: 100%;
+      font: inherit;
+      font-size: max(1rem, 1em);
+      font-weight: 900;
+      min-height: 50px;
+      margin-block-start: 0.35rem;
+      padding: 0.8rem 1rem;
+      border: 0;
+      border-radius: 0.85rem;
+      cursor: pointer;
+      color: #0B0713;
+      background: linear-gradient(90deg, var(--lime), #D6FF6B);
+      box-shadow: 0 8px 24px rgba(184, 255, 1, 0.25);
+    }
+
+    .submit-btn:disabled {
+      opacity: 0.65;
+      cursor: wait;
+    }
+
+    .hint-footer {
+      margin-block-start: 1rem;
+      padding-block-start: 0.85rem;
+      border-top: 1px solid rgba(179, 136, 255, 0.16);
+      font-size: 0.78rem;
+      color: var(--muted);
+    }
+
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-block-start: 0.5rem;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      padding: 0.2rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 700;
+      border: 1px solid rgba(179, 136, 255, 0.3);
+      background: rgba(179, 136, 255, 0.1);
+      color: var(--lilac);
+    }
+
+    .pill-lime {
+      border-color: rgba(184, 255, 1, 0.4);
+      background: rgba(184, 255, 1, 0.1);
+      color: var(--lime);
+    }
+
+    .visually-hidden {
+      position: absolute;
+      clip-path: inset(50%);
+      overflow: hidden;
+      width: 1px;
+      height: 1px;
+      margin: -1px;
+      padding: 0;
+      border: 0;
+      white-space: nowrap;
+    }
+
+    @media (pointer: coarse) {
+      input[type="text"],
+      input[type="password"],
+      .submit-btn {
+        min-height: 52px;
+      }
+      .toggle-btn {
+        min-height: 44px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card" aria-labelledby="login-heading">
+      <div class="brand">
+        <img src="/assets/brand/frimerise_logo.png" alt="Logo FrimeRise" width="44" height="44" />
+        <div>
+          <h1 id="login-heading">FrimeRise Studio</h1>
+          <p>Acesso Privado Protegido • Tailscale</p>
+        </div>
+      </div>
+
+      {% if error_message %}
+      <div id="login-error" class="error-banner" role="alert" aria-live="assertive">
+        {{ error_message }}
+      </div>
+      {% endif %}
+
+      <form id="login-form" action="/login" method="POST" aria-labelledby="login-heading">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+        <input type="hidden" name="next" value="{{ next_url }}" />
+
+        <div class="field">
+          <label for="username">Usuário <span class="req" aria-hidden="true">*</span></label>
+          <input
+            id="username"
+            name="username"
+            type="text"
+            value="{{ username_value }}"
+            autocomplete="username"
+            autocorrect="off"
+            autocapitalize="none"
+            spellcheck="false"
+            enterkeyhint="next"
+            required
+          />
+        </div>
+
+        <div class="field">
+          <div class="field-header">
+            <label for="current-password">Senha <span class="req" aria-hidden="true">*</span></label>
+            <button
+              id="toggle-password"
+              type="button"
+              class="toggle-btn"
+              aria-pressed="false"
+              aria-label="Mostrar senha"
+              aria-describedby="toggle-warning"
+            >Mostrar senha</button>
+          </div>
+          <span id="toggle-warning" class="visually-hidden">Aviso: isso exibirá sua senha na tela.</span>
+          <input
+            id="current-password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            enterkeyhint="done"
+            required
+          />
+        </div>
+
+        <button id="btn-login" type="submit" class="submit-btn">Entrar no Estúdio</button>
+      </form>
+
+      <div class="hint-footer">
+        <div>Sessão criptografada válida por 14 dias. Altere usuário e senha na aba <strong>Setup</strong> no notebook.</div>
+        <div class="badge-row">
+          <span class="pill pill-lime">🔒 Cookie HttpOnly</span>
+          <span class="pill">🛡️ /data Protegido</span>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script nonce="{{ csp_nonce }}">
+    (function () {
+      const toggleBtn = document.getElementById('toggle-password');
+      const pwdInput = document.getElementById('current-password');
+      const form = document.getElementById('login-form');
+      const submitBtn = document.getElementById('btn-login');
+
+      if (toggleBtn && pwdInput) {
+        toggleBtn.addEventListener('click', function () {
+          const showing = pwdInput.type === 'text';
+          pwdInput.type = showing ? 'password' : 'text';
+          toggleBtn.setAttribute('aria-pressed', showing ? 'false' : 'true');
+          toggleBtn.setAttribute('aria-label', showing ? 'Mostrar senha' : 'Ocultar senha');
+          toggleBtn.textContent = showing ? 'Mostrar senha' : 'Ocultar senha';
+        });
+      }
+
+      if (form && submitBtn) {
+        form.addEventListener('submit', function () {
+          if (form.checkValidity()) {
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Entrando...';
+          }
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

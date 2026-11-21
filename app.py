@@ -10,24 +10,46 @@ Unifies:
 from __future__ import annotations
 
 import asyncio
+import hmac
 import inspect
 import json
 import re
+import secrets
 import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from agents.feedback_loop import get_feedback_summary, log_real_performance
 from agents.llm_router import list_skills
+from security import (
+    CSRF_COOKIE_NAME,
+    HTTP_COOKIE_NAME,
+    HTTPS_COOKIE_NAME,
+    LOGIN_RATE_LIMITER,
+    SESSION_TTL_SECONDS,
+    bootstrap_initial_credentials_if_missing,
+    create_session_token,
+    ensure_auth_secret,
+    extract_authenticated_user,
+    get_client_ip,
+    is_direct_local_request,
+    is_https_request,
+    probe_tailscale_status,
+    sanitize_next_url,
+    sanitize_settings_for_client,
+    update_remote_credentials,
+    verify_password,
+)
 from database import (
     create_schedule,
     get_client,
@@ -100,8 +122,86 @@ app = FastAPI(title="FrimeRise Studio", version="2.0.0")
 app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
 app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_DIR)), name="outputs")
-app.mount("/data", StaticFiles(directory=str(DATA_DIR)), name="data")
+# SECURITY: Never expose root data/ (which holds frimerise.db & Camoufox session profiles).
+# Mount strictly allowlisted public asset subfolders only.
+app.mount("/data/logos", StaticFiles(directory=str(UPLOAD_LOGOS_DIR)), name="data_logos")
+app.mount("/data/ref_cache", StaticFiles(directory=str(DATA_DIR / "ref_cache")), name="data_ref_cache")
 templates = Jinja2Templates(directory=str(WEB_DIR / "templates"))
+
+_PUBLIC_AUTH_PATHS = {
+    "/login",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/status",
+    "/assets/brand/frimerise_logo.png",
+    "/static/styles.css",
+}
+
+
+def _apply_security_headers(request: Request, response: Response) -> Response:
+    response.headers.setdefault("Vary", "Sec-Fetch-Dest, Sec-Fetch-Mode, Sec-Fetch-Site")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin-allow-popups")
+    response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    response.headers.setdefault(
+        "Permissions-Policy",
+        "camera=(), geolocation=(), microphone=(), focus-without-user-activation=()",
+    )
+    if "Content-Security-Policy" not in response.headers:
+        response.headers["Content-Security-Policy"] = (
+            "frame-ancestors 'none'; object-src 'none'; base-uri 'none'; form-action 'self'"
+        )
+    if is_https_request(request):
+        response.headers.setdefault("Strict-Transport-Security", "max-age=300; includeSubDomains")
+    if request.url.path.startswith("/api/") or request.url.path == "/login":
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
+@app.middleware("http")
+async def security_and_auth_middleware(request: Request, call_next):
+    # 1. Fetch Metadata resource isolation BEFORE auth checks (prevents CSRF & timing leaks)
+    fetch_site = (request.headers.get("sec-fetch-site") or "").strip().lower()
+    fetch_mode = (request.headers.get("sec-fetch-mode") or "").strip().lower()
+    fetch_dest = (request.headers.get("sec-fetch-dest") or "").strip().lower()
+    if fetch_site == "cross-site":
+        is_safe_nav = (
+            fetch_mode == "navigate"
+            and request.method == "GET"
+            and fetch_dest not in ("object", "embed")
+        )
+        if not is_safe_nav:
+            return _apply_security_headers(
+                request,
+                JSONResponse({"detail": "Requisição cross-site bloqueada."}, status_code=403),
+            )
+
+    # 2. Remote / Tailscale / Optional-Local Authentication Gate
+    path = request.url.path
+    is_local = is_direct_local_request(request)
+    settings = get_settings()
+    require_auth = (not is_local) or (settings.get("auth_require_local") == "1")
+
+    if require_auth and path not in _PUBLIC_AUTH_PATHS:
+        user = extract_authenticated_user(request, settings)
+        if not user:
+            if path.startswith("/api/"):
+                return _apply_security_headers(
+                    request,
+                    JSONResponse(
+                        {"detail": "Autenticação necessária.", "login_url": "/login"},
+                        status_code=401,
+                    ),
+                )
+            raw_next = path + (f"?{request.url.query}" if request.url.query else "")
+            safe_next = sanitize_next_url(raw_next)
+            login_url = "/login" if safe_next == "/" else f"/login?{urlencode({'next': safe_next})}"
+            return _apply_security_headers(request, RedirectResponse(url=login_url, status_code=303))
+
+    response = await call_next(request)
+    return _apply_security_headers(request, response)
 
 # Sequential job queue worker so Acer Aspire 5 Core i5 never overloads RAM/thermals
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
@@ -187,6 +287,7 @@ async def _check_due_schedules() -> None:
 @app.on_event("startup")
 async def on_startup() -> None:
     init_db()
+    bootstrap_initial_credentials_if_missing()
     seed_twin_channels_and_queue()
     probe_quicksync()
     asyncio.create_task(_job_worker())
@@ -401,6 +502,211 @@ class FeedbackPayload(BaseModel):
     hook_variant: str = "A"
 
 
+class AuthLoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+class AuthCredentialsPayload(BaseModel):
+    username: Optional[str] = None
+    new_password: Optional[str] = None
+    require_local: Optional[bool] = None
+
+
+def _set_session_cookie(request: Request, response: Response, username: str, secret: str) -> None:
+    token = create_session_token(username, secret, ttl_seconds=SESSION_TTL_SECONDS)
+    https = is_https_request(request)
+    cookie_name = HTTPS_COOKIE_NAME if https else HTTP_COOKIE_NAME
+    response.set_cookie(
+        key=cookie_name,
+        value=token,
+        max_age=SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=https,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_session_cookies(response: Response) -> None:
+    for cname in (HTTPS_COOKIE_NAME, HTTP_COOKIE_NAME, CSRF_COOKIE_NAME):
+        response.delete_cookie(key=cname, path="/")
+
+
+def _render_login_page(
+    request: Request,
+    *,
+    next_url: str = "/",
+    username_value: str = "",
+    error_message: str = "",
+    status_code: int = 200,
+) -> HTMLResponse:
+    csp_nonce = secrets.token_urlsafe(16)
+    csrf_token = secrets.token_urlsafe(24)
+    safe_next = sanitize_next_url(next_url)
+    resp = templates.TemplateResponse(
+        request=request,
+        name="login.html",
+        context={
+            "csp_nonce": csp_nonce,
+            "csrf_token": csrf_token,
+            "next_url": safe_next,
+            "username_value": username_value,
+            "error_message": error_message,
+        },
+        status_code=status_code,
+    )
+    resp.headers["Content-Security-Policy"] = (
+        f"script-src 'nonce-{csp_nonce}' 'strict-dynamic' 'report-sample'; "
+        "object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    )
+    resp.set_cookie(
+        key=CSRF_COOKIE_NAME,
+        value=csrf_token,
+        max_age=1800,
+        httponly=True,
+        secure=is_https_request(request),
+        samesite="lax",
+        path="/login",
+    )
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# Routes: Authentication & Remote Tailscale Security
+# ---------------------------------------------------------------------------
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, next: str = "/"):
+    settings = get_settings()
+    safe_next = sanitize_next_url(next)
+    if extract_authenticated_user(request, settings):
+        return RedirectResponse(url=safe_next, status_code=303)
+    default_user = (settings.get("auth_username") or "frimerise").strip()
+    return _render_login_page(request, next_url=safe_next, username_value=default_user)
+
+
+@app.post("/login")
+async def login_submit(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+    next: str = Form("/"),
+    csrf_token: str = Form(""),
+):
+    safe_next = sanitize_next_url(next)
+    client_ip = get_client_ip(request)
+    blocked, retry_after = LOGIN_RATE_LIMITER.is_blocked(client_ip)
+    if blocked:
+        return _render_login_page(
+            request,
+            next_url=safe_next,
+            username_value=username.strip(),
+            error_message=f"Muitas tentativas inválidas. Aguarde {retry_after}s e tente novamente.",
+            status_code=429,
+        )
+
+    cookie_csrf = request.cookies.get(CSRF_COOKIE_NAME) or ""
+    if not cookie_csrf or not csrf_token or not hmac.compare_digest(cookie_csrf, csrf_token):
+        return _render_login_page(
+            request,
+            next_url=safe_next,
+            username_value=username.strip(),
+            error_message="Sessão de login expirada. Tente enviar novamente.",
+            status_code=400,
+        )
+
+    settings = get_settings()
+    expected_user = (settings.get("auth_username") or "frimerise").strip()
+    pw_hash = (settings.get("auth_password_hash") or "").strip()
+
+    if not pw_hash or not hmac.compare_digest(username.strip(), expected_user) or not verify_password(password, pw_hash):
+        LOGIN_RATE_LIMITER.record_failure(client_ip)
+        return _render_login_page(
+            request,
+            next_url=safe_next,
+            username_value=username.strip(),
+            error_message="Usuário ou senha incorretos.",
+            status_code=401,
+        )
+
+    LOGIN_RATE_LIMITER.clear(client_ip)
+    secret = ensure_auth_secret(settings)
+    resp = RedirectResponse(url=safe_next, status_code=303)
+    resp.delete_cookie(key=CSRF_COOKIE_NAME, path="/login")
+    _set_session_cookie(request, resp, expected_user, secret)
+    return resp
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(request: Request, payload: AuthLoginPayload):
+    client_ip = get_client_ip(request)
+    blocked, retry_after = LOGIN_RATE_LIMITER.is_blocked(client_ip)
+    if blocked:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Muitas tentativas inválidas. Aguarde {retry_after}s.",
+        )
+
+    settings = get_settings()
+    expected_user = (settings.get("auth_username") or "frimerise").strip()
+    pw_hash = (settings.get("auth_password_hash") or "").strip()
+    if not pw_hash or not hmac.compare_digest(payload.username.strip(), expected_user) or not verify_password(payload.password, pw_hash):
+        LOGIN_RATE_LIMITER.record_failure(client_ip)
+        raise HTTPException(status_code=401, detail="Usuário ou senha incorretos.")
+
+    LOGIN_RATE_LIMITER.clear(client_ip)
+    secret = ensure_auth_secret(settings)
+    resp = JSONResponse({"status": "authenticated", "username": expected_user})
+    _set_session_cookie(request, resp, expected_user, secret)
+    return resp
+
+
+@app.post("/api/auth/logout")
+async def api_auth_logout():
+    resp = JSONResponse({"status": "logged_out"})
+    _clear_session_cookies(resp)
+    resp.headers["Clear-Site-Data"] = '"cookies", "storage", "cache"'
+    return resp
+
+
+@app.get("/api/auth/status")
+async def api_auth_status(request: Request):
+    settings = get_settings()
+    is_local = is_direct_local_request(request)
+    user = extract_authenticated_user(request, settings)
+    require_local = settings.get("auth_require_local") == "1"
+    return {
+        "authenticated": bool(user),
+        "is_local": is_local,
+        "auth_required": (not is_local) or require_local,
+        "auth_configured": bool((settings.get("auth_password_hash") or "").strip()),
+        "auth_require_local": require_local,
+        "username": user or (settings.get("auth_username") or "frimerise"),
+        "tailscale": probe_tailscale_status(),
+    }
+
+
+@app.post("/api/auth/credentials")
+async def api_update_auth_credentials(request: Request, payload: AuthCredentialsPayload):
+    try:
+        res = update_remote_credentials(
+            username=payload.username,
+            new_password=payload.new_password,
+            require_local=payload.require_local,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    resp = JSONResponse({"status": "saved", **res})
+    # If the user updated their password while authenticated (or turned on require_local),
+    # seamlessly re-issue a fresh session cookie for the current device so they stay logged in.
+    settings = get_settings()
+    if res.get("password_rotated") or res.get("auth_require_local"):
+        secret = ensure_auth_secret(settings)
+        _set_session_cookie(request, resp, str(res["auth_username"]), secret)
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # Routes: Main Dashboard
 # ---------------------------------------------------------------------------
@@ -485,7 +791,7 @@ def _enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @app.get("/api/bootstrap-data")
-async def api_bootstrap_data():
+async def api_bootstrap_data(request: Request):
     from engine.gemini_tts import GEMINI_EXPRESSIVE_VOICES
     from engine.rhubarb_lipsync import find_rhubarb_binary
 
@@ -501,8 +807,21 @@ async def api_bootstrap_data():
     music = sorted([p.name for p in (ASSETS_DIR / "music").glob("*.mp3")])
     flow_status = await _get_flow_status_safe()
     doc_queue = get_twin_channels_queue()
+    raw_settings = get_settings()
+    is_local = is_direct_local_request(request)
+    auth_user = extract_authenticated_user(request, raw_settings)
+    tailscale = probe_tailscale_status()
     return {
-        "settings": get_settings(),
+        "settings": sanitize_settings_for_client(raw_settings),
+        "auth_status": {
+            "authenticated": bool(auth_user),
+            "is_local": is_local,
+            "auth_required": (not is_local) or (raw_settings.get("auth_require_local") == "1"),
+            "auth_configured": bool((raw_settings.get("auth_password_hash") or "").strip()),
+            "auth_require_local": raw_settings.get("auth_require_local") == "1",
+            "username": auth_user or (raw_settings.get("auth_username") or "frimerise"),
+        },
+        "tailscale": tailscale,
         "presets": list_presets(),
         "clients": list_clients(),
         "skills": list_skills(),
@@ -601,7 +920,7 @@ async def api_manufacture_doc_queue(payload: DocQueueManufacturePayload):
 @app.post("/api/settings")
 async def api_save_settings(payload: SettingsPayload):
     saved = save_settings(payload.model_dump(exclude_none=True))
-    return {"status": "saved", "settings": saved}
+    return {"status": "saved", "settings": sanitize_settings_for_client(saved)}
 
 
 @app.post("/api/settings/test")

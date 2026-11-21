@@ -97,6 +97,11 @@ async function api(url, opts = {}) {
     headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
     ...opts,
   });
+  if (res.status === 401) {
+    const nextUrl = encodeURIComponent(window.location.pathname + window.location.search);
+    window.location.href = `/login?next=${nextUrl}`;
+    throw new Error('Sessão expirada. Redirecionando para o login...');
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     throw new Error(data.detail || `Erro HTTP ${res.status}`);
@@ -977,6 +982,7 @@ async function refreshAll() {
     renderPresetsGrid();
     renderClientChips();
     renderSettingsForm();
+    renderRemoteAccessCard();
     renderJobs();
     renderSchedules();
     renderFeedback();
@@ -1700,6 +1706,135 @@ function renderSettingsForm() {
   document.getElementById('set-thermal').value = s.thermal_limit_c || '85';
 }
 
+/* -------------------- Remote Access & Tailscale Security -------------------- */
+function renderRemoteAccessCard() {
+  const auth = STATE.auth_status || {};
+  const ts = STATE.tailscale || {};
+  const s = STATE.settings || {};
+
+  const logoutBtn = document.getElementById('btn-logout');
+  if (logoutBtn) {
+    if (auth.authenticated || auth.auth_required) {
+      logoutBtn.classList.remove('hidden');
+    } else {
+      logoutBtn.classList.add('hidden');
+    }
+  }
+
+  const userInput = document.getElementById('auth-username');
+  if (userInput && document.activeElement !== userInput) {
+    userInput.value = auth.username || s.auth_username || 'frimerise';
+  }
+  const reqLocal = document.getElementById('auth-require-local');
+  if (reqLocal) {
+    reqLocal.checked = Boolean(auth.auth_require_local ?? s.auth_require_local);
+  }
+
+  const pill = document.getElementById('ts-status-pill');
+  const linkEl = document.getElementById('ts-https-link');
+  const hintEl = document.getElementById('ts-setup-hint');
+  const detailEl = document.getElementById('ts-status-detail');
+  if (!pill || !linkEl || !hintEl || !detailEl) return;
+
+  if (ts.connected && ts.https_url) {
+    pill.textContent = ts.serve_configured ? '🟢 Tailscale HTTPS Ativo' : '🟡 Tailscale Conectado';
+    pill.className = ts.serve_configured
+      ? 'text-[11px] font-extrabold px-3 py-1 rounded-full bg-frimelime/15 text-frimelime border border-frimelime/50'
+      : 'text-[11px] font-extrabold px-3 py-1 rounded-full bg-frimegold/15 text-frimegold border border-frimegold/40';
+    linkEl.href = ts.https_url;
+    linkEl.textContent = ts.https_url;
+    linkEl.classList.remove('hidden');
+    hintEl.classList.add('hidden');
+    detailEl.textContent = ts.serve_configured
+      ? `IP Tailscale: ${ts.tailscale_ip}. Abra o link HTTPS acima no celular com o app Tailscale ativo (funciona no 4G/5G ou outro Wi-Fi).`
+      : `Tailscale conectado (${ts.tailscale_ip}). Rode ./setup_tailscale.sh para ligar o proxy HTTPS privado na porta 8000.`;
+  } else if (ts.installed) {
+    pill.textContent = '🟡 Tailscale Instalado (Aguardando Login)';
+    pill.className = 'text-[11px] font-extrabold px-3 py-1 rounded-full bg-frimegold/15 text-frimegold border border-frimegold/40';
+    linkEl.classList.add('hidden');
+    hintEl.classList.remove('hidden');
+    hintEl.textContent = './setup_tailscale.sh';
+    detailEl.textContent = 'Rode ./setup_tailscale.sh no terminal deste notebook para autenticar sua conta Tailscale e ativar o link privado.';
+  } else {
+    pill.textContent = '⚪ Pronto p/ Instalar Tailscale';
+    pill.className = 'text-[11px] font-extrabold px-3 py-1 rounded-full bg-frimelilac/15 text-frimelilac border border-frimelilac/40';
+    linkEl.classList.add('hidden');
+    hintEl.classList.remove('hidden');
+    hintEl.textContent = './setup_tailscale.sh';
+    detailEl.textContent = 'Servidor já blindado (/data fechado + login ativo para acessos remotos). Execute ./setup_tailscale.sh no terminal deste notebook para conectar ao celular.';
+  }
+}
+
+async function logoutSession() {
+  try {
+    await fetch('/api/auth/logout', { method: 'POST' });
+  } catch (e) {}
+  window.location.href = '/login';
+}
+
+function initRemoteAccessControls() {
+  const logoutBtn = document.getElementById('btn-logout');
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', () => {
+      logoutSession();
+    });
+  }
+
+  const toggleBtn = document.getElementById('btn-toggle-new-pwd');
+  const pwdInput = document.getElementById('auth-new-password');
+  if (toggleBtn && pwdInput) {
+    toggleBtn.addEventListener('click', () => {
+      const showing = pwdInput.type === 'text';
+      pwdInput.type = showing ? 'password' : 'text';
+      toggleBtn.setAttribute('aria-pressed', showing ? 'false' : 'true');
+      toggleBtn.setAttribute('aria-label', showing ? 'Mostrar nova senha' : 'Ocultar nova senha');
+      toggleBtn.textContent = showing ? 'Mostrar' : 'Ocultar';
+    });
+  }
+
+  const form = document.getElementById('remote-auth-form');
+  const submitBtn = document.getElementById('btn-save-remote-auth');
+  const statusEl = document.getElementById('remote-auth-status');
+  if (form) {
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!form.reportValidity()) return;
+      const username = (document.getElementById('auth-username')?.value || '').trim();
+      const newPassword = document.getElementById('auth-new-password')?.value || '';
+      const requireLocal = Boolean(document.getElementById('auth-require-local')?.checked);
+
+      if (submitBtn) submitBtn.disabled = true;
+      try {
+        const res = await api('/api/auth/credentials', {
+          method: 'POST',
+          body: JSON.stringify({
+            username,
+            new_password: newPassword || null,
+            require_local: requireLocal,
+          }),
+        });
+        if (pwdInput) pwdInput.value = '';
+        if (statusEl) {
+          statusEl.textContent = res.password_rotated
+            ? '✅ Usuário e nova senha salvos (hash PBKDF2-SHA256). Sessões antigas foram revogadas.'
+            : '✅ Preferências de acesso remoto salvas com sucesso.';
+          statusEl.classList.remove('hidden');
+        }
+        showToast('🔐 Credenciais de acesso remoto atualizadas!');
+        await refreshAll();
+      } catch (err) {
+        if (statusEl) {
+          statusEl.textContent = `❌ ${err.message}`;
+          statusEl.classList.remove('hidden');
+        }
+        showToast(`Erro ao salvar credenciais: ${err.message}`, true);
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
+  }
+}
+
 async function saveSettingsForm() {
   try {
     await api('/api/settings', {
@@ -1847,6 +1982,7 @@ function renderFeedback() {
 }
 
 /* -------------------- Boot -------------------- */
+initRemoteAccessControls();
 setFactoryDuration(30);
 updateLibraryMixCount();
 updateMusicVolLabel();
