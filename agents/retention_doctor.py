@@ -112,21 +112,21 @@ OPEN_LOOP_BRIDGES_CARTOON_ES = [
 ]
 
 OPEN_LOOP_BRIDGES_DOC_PT = [
-    "Mas havia uma falha fatal escondida nos arquivos — como ninguém percebeu antes do colapso?",
-    "Só que o documento vazado no capítulo seguinte revelou algo ainda mais sombrio: quem estava por trás da conta?",
-    "E o pior ainda estava por vir: para onde foram os milhões que desapareceram naquela madrugada?",
+    "Mas havia um detalhe sombrio escondido nos arquivos... por que ninguém fala disso até hoje?",
+    "Só que os registros da época revelaram algo ainda mais perturbador: o que realmente aconteceu naquela noite?",
+    "E o capítulo seguinte viraria toda essa história do avesso... como esse segredo sobreviveu por tantos séculos?",
 ]
 
 OPEN_LOOP_BRIDGES_DOC_EN = [
-    "But there was one fatal flaw hidden in the vault — how did the auditors miss it before the collapse?",
-    "Yet a leaked filing in the next chapter exposed a deeper secret: who actually signed off on the transfer?",
-    "And the worst was yet to come: where did the missing millions vanish to overnight?",
+    "Yet one chilling detail remained buried in the archives... why does almost nobody talk about it today?",
+    "But period records uncovered something far darker: what really happened behind closed doors that night?",
+    "And the next chapter turned the entire legend upside down... how did that secret survive for centuries?",
 ]
 
 OPEN_LOOP_BRIDGES_DOC_ES = [
-    "Pero había una falla fatal oculta en los archivos: ¿cómo nadie lo notó antes del colapso?",
-    "Sin embargo, un documento filtrado reveló algo más oscuro: ¿quién autorizó realmente esa transferencia?",
-    "Y lo peor estaba por venir: ¿adónde fueron los millones que desaparecieron esa madrugada?",
+    "Pero había un detalle sombrío oculto en los archivos... ¿por qué casi nadie habla de esto hoy?",
+    "Sin embargo, los registros de la época revelaron algo más oscuro: ¿qué ocurrió realmente aquella noche?",
+    "Y el siguiente capítulo cambiaría toda la historia... ¿cómo sobrevivió ese secreto durante tantos siglos?",
 ]
 
 
