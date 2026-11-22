@@ -177,7 +177,11 @@ def group_words_into_chunks(words: List[Dict[str, Any]], max_words: int = 3) -> 
     global_idx = 0
     for w in words:
         raw = str(w.get("word", "")).strip()
-        parts = [p for p in re.split(r"\s+", raw) if p]
+        parts = [
+            p
+            for p in re.split(r"\s+", raw)
+            if p and (re.search(r"[0-9A-Za-zÀ-ÿ]", p) or any(_is_emoji(ch) for ch in p))
+        ]
         if not parts:
             continue
         st = float(w["start"])
@@ -662,40 +666,85 @@ def render_cover_9x16(
     preset: Dict[str, Any],
     out_png: Path,
     bg_frame_path: Optional[Path] = None,
+    mood: str = "",
 ) -> Path:
-    """Render a clean, editorial 1080x1920 HD Thumbnail Cover in Skia C++ (zero debug labels)."""
+    """Render a clean, editorial 1080x1920 HD Thumbnail Cover in Skia C++ (zero debug labels).
+
+    Accepts optional `mood` (e.g. 'dark_horror', 'investigative_crime') to adapt scrim &
+    title badge styling to dark crimson/obsidian + burnished gold instead of neon/pastel lilac.
+    """
     w, h = 1080, 1920
     surf = skia.Surface(w, h)
     c = surf.getCanvas()
 
-    if bg_frame_path and bg_frame_path.exists():
-        img = skia.Image.open(str(bg_frame_path))
-        c.drawImageRect(img, skia.Rect.MakeWH(w, h))
-        scrim = skia.Paint()
-        scrim.setShader(
-            skia.GradientShader.MakeLinear(
-                [(0, 0), (0, h)],
-                [
+    mood_norm = str(mood or "").strip().lower()
+    is_dark_cinema = mood_norm in ("dark_horror", "investigative_crime", "mystery_crime")
+
+    bg_drawn = False
+    bg_path = Path(bg_frame_path) if bg_frame_path else None
+    if bg_path is not None and bg_path.exists():
+        img = skia.Image.open(str(bg_path))
+        if img is not None and img.width() > 0 and img.height() > 0:
+            iw, ih = float(img.width()), float(img.height())
+            target_ar = w / float(h)
+            img_ar = iw / max(1.0, ih)
+            if img_ar > target_ar:
+                crop_w = ih * target_ar
+                sx0 = (iw - crop_w) * 0.5
+                src_rect = skia.Rect.MakeXYWH(sx0, 0.0, crop_w, ih)
+            else:
+                crop_h = iw / target_ar
+                sy0 = (ih - crop_h) * 0.35
+                src_rect = skia.Rect.MakeXYWH(0.0, sy0, iw, crop_h)
+            c.drawImageRect(
+                img,
+                src_rect,
+                skia.Rect.MakeWH(w, h),
+                skia.SamplingOptions(skia.FilterMode.kLinear, skia.MipmapMode.kLinear),
+            )
+            scrim = skia.Paint()
+            if is_dark_cinema:
+                scrim_colors = [
+                    skia.ColorSetARGB(92, 8, 6, 8),
+                    skia.ColorSetARGB(158, 10, 6, 8),
+                    skia.ColorSetARGB(228, 16, 4, 8),
+                ]
+            else:
+                scrim_colors = [
                     skia.ColorSetARGB(120, 11, 7, 19),
                     skia.ColorSetARGB(175, 11, 7, 19),
                     skia.ColorSetARGB(220, 11, 7, 19),
-                ],
-                [0.0, 0.55, 1.0],
+                ]
+            scrim.setShader(
+                skia.GradientShader.MakeLinear(
+                    [(0, 0), (0, h)],
+                    scrim_colors,
+                    [0.0, 0.55, 1.0],
+                )
             )
-        )
-        c.drawRect(skia.Rect.MakeWH(w, h), scrim)
-    else:
+            c.drawRect(skia.Rect.MakeWH(w, h), scrim)
+            bg_drawn = True
+
+    if not bg_drawn:
         bgp = skia.Paint()
+        if is_dark_cinema:
+            fb_colors = [skia.ColorSetARGB(255, 34, 8, 13), skia.ColorSetARGB(255, 8, 6, 8)]
+        else:
+            fb_colors = [skia.ColorSetARGB(255, 24, 14, 46), skia.ColorSetARGB(255, 11, 7, 19)]
         bgp.setShader(
             skia.GradientShader.MakeLinear(
                 points=[(0, 0), (w, h)],
-                colors=[skia.ColorSetARGB(255, 24, 14, 46), skia.ColorSetARGB(255, 11, 7, 19)],
+                colors=fb_colors,
             )
         )
         c.drawRect(skia.Rect.MakeWH(w, h), bgp)
 
-    c_highlight = hex_to_skia(preset.get("highlight_color", "#B8FF01"))
-    c_gold = hex_to_skia(preset.get("accent_gold", "#FFD166"))
+    if is_dark_cinema:
+        c_highlight = hex_to_skia("#7F1124")
+        c_gold = hex_to_skia("#E8B954")
+    else:
+        c_highlight = hex_to_skia(preset.get("highlight_color", "#B8FF01"))
+        c_gold = hex_to_skia(preset.get("accent_gold", "#FFD166"))
     main_tf, _ = _load_verified_typeface(preset.get("font_file", "Montserrat-Black.ttf"), role="cover")
     ui_tf, _ = _load_verified_typeface("PlusJakartaSans-ExtraBold.ttf", role="cover_sub")
 
@@ -704,27 +753,76 @@ def render_cover_9x16(
     line_step = title_font.getSize() * 1.24
     y0 = 920.0 - ((len(lines) - 1) * line_step) / 2.0
 
+    if is_dark_cinema and lines:
+        bar_w = 180.0
+        bar_x = (w - bar_w) / 2.0
+        bar_y = y0 - title_font.getSize() * 1.32
+        bar_p = skia.Paint(AntiAlias=True)
+        bar_p.setShader(
+            skia.GradientShader.MakeLinear(
+                [(bar_x, bar_y), (bar_x + bar_w, bar_y)],
+                [hex_to_skia("#9F1239"), c_gold, hex_to_skia("#9F1239")],
+                [0.0, 0.5, 1.0],
+            )
+        )
+        c.drawRoundRect(skia.Rect.MakeXYWH(bar_x, bar_y, bar_w, 6.0), 3.0, 3.0, bar_p)
+
     for idx, line in enumerate(lines):
         tw = title_font.measureText(line)
         lx = (w - tw) / 2.0
         ly = y0 + idx * line_step
         if idx == len(lines) - 1:
-            c.drawRoundRect(
-                skia.Rect.MakeXYWH(lx - 28, ly - title_font.getSize() * 0.88, tw + 56, title_font.getSize() * 1.18),
-                22, 22,
-                skia.Paint(AntiAlias=True, Color=c_highlight),
+            pill_rect = skia.Rect.MakeXYWH(
+                lx - 30,
+                ly - title_font.getSize() * 0.88,
+                tw + 60,
+                title_font.getSize() * 1.18,
             )
-            c.drawString(line, lx, ly, title_font, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(255, 11, 7, 19)))
+            if is_dark_cinema:
+                pill_fill = skia.Paint(AntiAlias=True)
+                pill_fill.setShader(
+                    skia.GradientShader.MakeLinear(
+                        [(pill_rect.left(), pill_rect.top()), (pill_rect.right(), pill_rect.bottom())],
+                        [hex_to_skia("#881327"), hex_to_skia("#3B0712"), hex_to_skia("#14090D")],
+                        [0.0, 0.55, 1.0],
+                    )
+                )
+                pill_fill.setImageFilter(
+                    skia.ImageFilters.DropShadow(0, 10, 22, 22, skia.ColorSetARGB(200, 0, 0, 0))
+                )
+                c.drawRoundRect(pill_rect, 18, 18, pill_fill)
+                pill_border = skia.Paint(
+                    AntiAlias=True,
+                    Style=skia.Paint.kStroke_Style,
+                    StrokeWidth=3.5,
+                    Color=c_gold,
+                )
+                c.drawRoundRect(pill_rect, 18, 18, pill_border)
+                c.drawString(
+                    line,
+                    lx,
+                    ly,
+                    title_font,
+                    skia.Paint(AntiAlias=True, Color=hex_to_skia("#FFF5DC")),
+                )
+            else:
+                c.drawRoundRect(
+                    pill_rect,
+                    22, 22,
+                    skia.Paint(AntiAlias=True, Color=c_highlight),
+                )
+                c.drawString(line, lx, ly, title_font, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(255, 11, 7, 19)))
         else:
             sp = skia.Paint(
                 AntiAlias=True,
                 Style=skia.Paint.kStroke_Style,
                 StrokeWidth=12,
                 StrokeJoin=skia.Paint.kRound_Join,
-                Color=skia.ColorSetARGB(255, 5, 3, 10),
+                Color=skia.ColorSetARGB(255, 7, 4, 6) if is_dark_cinema else skia.ColorSetARGB(255, 5, 3, 10),
             )
             c.drawString(line, lx, ly, title_font, sp)
-            fp = skia.Paint(AntiAlias=True, Color=c_gold if idx == 0 else skia.ColorWHITE)
+            body_col = hex_to_skia("#F8F4EC") if is_dark_cinema else skia.ColorWHITE
+            fp = skia.Paint(AntiAlias=True, Color=c_gold if idx == 0 else body_col)
             fp.setImageFilter(skia.ImageFilters.DropShadow(0, 8, 18, 18, skia.ColorSetARGB(200, 0, 0, 0)))
             c.drawString(line, lx, ly, title_font, fp)
 
@@ -732,9 +830,10 @@ def render_cover_9x16(
     if clean_sub:
         sub_font, sub_lines = _wrap_text_to_width(clean_sub, ui_tf, 36.0, 24.0, w - 180.0, max_lines=2)
         sy = 1560.0
+        sub_col = skia.ColorSetARGB(240, 240, 232, 224) if is_dark_cinema else skia.ColorSetARGB(240, 240, 235, 255)
         for sln in sub_lines:
             sw = sub_font.measureText(sln)
-            c.drawString(sln, (w - sw) / 2.0, sy, sub_font, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(240, 240, 235, 255)))
+            c.drawString(sln, (w - sw) / 2.0, sy, sub_font, skia.Paint(AntiAlias=True, Color=sub_col))
             sy += sub_font.getSize() * 1.25
 
     surf.makeImageSnapshot().save(str(out_png), skia.kPNG)
