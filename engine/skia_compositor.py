@@ -114,55 +114,87 @@ def _ease_out_cubic(x: float) -> float:
 
 
 def _wrap_text_to_width(text: str, typeface: skia.Typeface, start_size: float, min_size: float, max_w: float, max_lines: int) -> Tuple[skia.Font, List[str]]:
-    """Auto-wrap text into <= max_lines and shrink font size if needed so text NEVER clips."""
+    """Auto-wrap text into <= max_lines and shrink font size cleanly so text NEVER clips mid-word."""
     clean = " ".join(str(text).strip().split())
     if not clean:
         return skia.Font(typeface, start_size), []
 
-    size = float(start_size)
-    while size >= min_size:
-        font = skia.Font(typeface, size)
-        words = clean.split(" ")
-        lines: List[str] = []
-        cur = ""
-        fits = True
-        for wd in words:
-            cand = f"{cur} {wd}".strip()
-            if font.measureText(cand) <= max_w:
-                cur = cand
-            else:
-                if cur:
-                    lines.append(cur)
-                if font.measureText(wd) > max_w:
-                    fits = False
-                    break
-                cur = wd
-        if cur:
-            lines.append(cur)
-        if fits and len(lines) <= max_lines:
-            return font, lines
-        size -= 3.0
-
-    # At min_size, clamp to max_lines with ellipsis if extremely long
-    font = skia.Font(typeface, min_size)
+    safe_max_w = max(24.0, float(max_w))
+    safe_max_lines = max(1, int(max_lines))
     words = clean.split(" ")
-    lines = []
-    cur = ""
-    for wd in words:
-        cand = f"{cur} {wd}".strip()
-        if font.measureText(cand) <= max_w:
-            cur = cand
-        else:
-            if cur:
-                lines.append(cur)
-            cur = wd
-    if cur:
-        lines.append(cur)
-    if len(lines) > max_lines:
-        lines = lines[:max_lines]
-        while len(lines[-1]) > 4 and font.measureText(lines[-1] + "...") > max_w:
-            lines[-1] = lines[-1][:-1].rstrip()
-        lines[-1] = lines[-1] + "..."
+
+    def _layout_at_size(sz: float) -> Tuple[skia.Font, List[str], bool]:
+        f = skia.Font(typeface, sz)
+        f.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
+        lns: List[str] = []
+        cur_ln = ""
+        fits_all = True
+        for wd in words:
+            cand = f"{cur_ln} {wd}".strip()
+            if f.measureText(cand) <= safe_max_w:
+                cur_ln = cand
+            else:
+                if cur_ln:
+                    lns.append(cur_ln)
+                if f.measureText(wd) > safe_max_w:
+                    fits_all = False
+                cur_ln = wd
+        if cur_ln:
+            lns.append(cur_ln)
+        return f, lns, (fits_all and len(lns) <= safe_max_lines)
+
+    # 1. Step smoothly from start_size down to min_size (always testing exact min_size)
+    size = float(start_size)
+    floor_primary = max(8.0, float(min_size))
+    tested_sizes: List[float] = []
+    while size > floor_primary + 0.05:
+        tested_sizes.append(size)
+        size -= 1.5 if size <= 24.0 else 2.0
+    tested_sizes.append(floor_primary)
+
+    # 2. If still overflowing at min_size, try graceful secondary shrink down to 78% of min_size
+    floor_soft = max(9.5, floor_primary * 0.78)
+    if floor_soft < floor_primary - 0.5:
+        sz_s = floor_primary - 1.0
+        while sz_s > floor_soft + 0.05:
+            tested_sizes.append(sz_s)
+            sz_s -= 1.0
+        tested_sizes.append(floor_soft)
+
+    for sz_try in tested_sizes:
+        font, lines, ok = _layout_at_size(sz_try)
+        if ok:
+            return font, lines
+
+    # 3. For single-line boxes that still barely exceed safe_max_w, scale proportionally down to 9.5px
+    if safe_max_lines == 1:
+        f_min = skia.Font(typeface, floor_soft)
+        f_min.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
+        tw = float(f_min.measureText(clean))
+        if tw > safe_max_w and tw > 1.0:
+            prop_sz = max(9.5, floor_soft * (safe_max_w / tw) * 0.98)
+            f_prop = skia.Font(typeface, prop_sz)
+            f_prop.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
+            if float(f_prop.measureText(clean)) <= safe_max_w:
+                return f_prop, [clean]
+
+    # 4. Whole-word boundary clamp with ellipsis (NEVER slice mid-word!)
+    font, lines, _ = _layout_at_size(floor_soft)
+    if len(lines) > safe_max_lines:
+        lines = lines[:safe_max_lines]
+        last_words = lines[-1].split(" ")
+        while len(last_words) > 1 and font.measureText(" ".join(last_words) + "...") > safe_max_w:
+            last_words.pop()
+        tail = " ".join(last_words).rstrip(".,;:—-• ")
+        if tail and font.measureText(tail + "...") <= safe_max_w:
+            lines[-1] = tail + "..."
+        elif tail:
+            # Single token wider than box: shrink font proportionally instead of cutting inside the word
+            tw_tok = float(font.measureText(tail + "..."))
+            if tw_tok > safe_max_w and tw_tok > 1.0:
+                font = skia.Font(typeface, max(8.5, font.getSize() * (safe_max_w / tw_tok) * 0.98))
+                font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
+            lines[-1] = tail + "..."
     return font, lines
 
 

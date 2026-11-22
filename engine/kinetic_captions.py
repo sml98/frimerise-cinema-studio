@@ -387,6 +387,99 @@ _DANGLING_CONJUNCTIONS = {
     "O", "A", "OS", "AS", "UM", "UMA", "COM", "POR", "PARA", "QUE", "SE",
 }
 
+_PT_MONTHS: Dict[str, str] = {
+    "JANEIRO": "JANEIRO",
+    "FEVEREIRO": "FEVEREIRO",
+    "MARCO": "MARÇO",
+    "ABRIL": "ABRIL",
+    "MAIO": "MAIO",
+    "JUNHO": "JUNHO",
+    "JULHO": "JULHO",
+    "AGOSTO": "AGOSTO",
+    "SETEMBRO": "SETEMBRO",
+    "OUTUBRO": "OUTUBRO",
+    "NOVEMBRO": "NOVEMBRO",
+    "DEZEMBRO": "DEZEMBRO",
+}
+
+_PT_QUANTITY_UNITS: Dict[str, str] = {
+    "ANO": "ANO",
+    "ANOS": "ANOS",
+    "NOITE": "NOITE",
+    "NOITES": "NOITES",
+    "DIA": "DIA",
+    "DIAS": "DIAS",
+    "MES": "MÊS",
+    "MESES": "MESES",
+    "SEMANA": "SEMANA",
+    "SEMANAS": "SEMANAS",
+    "HORA": "HORA",
+    "HORAS": "HORAS",
+    "SECULO": "SÉCULO",
+    "SECULOS": "SÉCULOS",
+    "DECADA": "DÉCADA",
+    "DECADAS": "DÉCADAS",
+    "MILENIO": "MILÊNIO",
+    "MILENIOS": "MILÊNIOS",
+    "MILHAO": "MILHÃO",
+    "MILHOES": "MILHÕES",
+    "BILHAO": "BILHÃO",
+    "BILHOES": "BILHÕES",
+    "KM": "KM",
+    "QUILOMETROS": "KM",
+    "METROS": "METROS",
+    "PESSOAS": "PESSOAS",
+    "HOMENS": "HOMENS",
+    "SOLDADOS": "SOLDADOS",
+    "MORTOS": "MORTOS",
+    "VIDAS": "VIDAS",
+    "VEZES": "VEZES",
+    "XELIM": "XELIM",
+    "XELINS": "XELINS",
+    "LIBRA": "LIBRA",
+    "LIBRAS": "LIBRAS",
+    "DOLAR": "DÓLAR",
+    "DOLARES": "DÓLARES",
+    "EURO": "EURO",
+    "EUROS": "EUROS",
+    "REAL": "REAL",
+    "REAIS": "REAIS",
+}
+
+_YEAR_CONTEXT_PREPS = {"EM", "DE", "ANO", "ANOS", "POR", "DESDE", "ATE", "ENTRE", "CIRCA", "CERCA"}
+_TITLE_PREFIX_WORDS = {
+    "IMPERADOR", "REI", "RAINHA", "PRINCIPE", "BISPO", "PAPA", "GENERAL", "LORDE", "SAO", "SANTO", "SANTA"
+}
+_MONTH_PATTERN_STR = "|".join(_PT_MONTHS.keys())
+_CALENDAR_DATE_RE = re.compile(rf"^\d{{1,2}}(?:[–-]\d{{1,2}})?\s+DE\s+(?:{_MONTH_PATTERN_STR})$")
+_COMPACTED_CENTURY_RE = re.compile(r"^SEC\.\s+[IVXLCDM]{1,5}(?:[–-][IVXLCDM]{1,5})?$")
+_COMPACTED_ERA_RE = re.compile(r"^\d{1,4}\s+[AD]\.C\.$")
+_COMPACTED_QTY_RE = re.compile(r"^(\d{1,3}(?:\.\d{3})*|\d+)\s+([A-Z]+)$")
+
+
+def _format_quantity_int(val: int) -> str:
+    if val >= 1000:
+        return f"{val:,}".replace(",", ".")
+    return str(val)
+
+
+def _is_already_compacted_token(raw: str) -> bool:
+    """Return True if `raw` is already a multi-word compacted token (for strict idempotency)."""
+    core, _ = _strip_word_punct(raw)
+    if " " not in core:
+        return False
+    norm = _strip_accents_upper(core)
+    if _COMPACTED_CENTURY_RE.fullmatch(norm):
+        return True
+    if _COMPACTED_ERA_RE.fullmatch(norm):
+        return True
+    if _CALENDAR_DATE_RE.fullmatch(norm):
+        return True
+    m_qty = _COMPACTED_QTY_RE.fullmatch(norm)
+    if m_qty and m_qty.group(2) in _PT_QUANTITY_UNITS:
+        return True
+    return False
+
 # Multi-word secret code names, historical entities, and dates for Selective Emphasis
 _SELECTIVE_MULTIWORD_PHRASES: Dict[Tuple[str, ...], Tuple[str, str]] = {
     ("SOL", "INVICTUS"): ("SOL INVICTUS", "entity"),
@@ -618,18 +711,26 @@ def _parse_pt_number_sequence(tokens: List[Dict[str, Any]], start_idx: int) -> O
     # Guard against turning lone articles/small prose words ("um conto", "uma noite", "dois lados") into digits
     if matched_words == 1:
         if first_norm in ("UM", "UMA", "DOIS", "DUAS", "TRES", "QUATRO", "CINCO", "SEIS", "SETE", "OITO", "NOVE"):
-            # Only convert lone small number if directly followed by era ("a.C."/"d.C."/"antes de cristo") or "%"/"por cento"
+            # Allow lone small number if followed by era, %, millions/billions, OR day + "DE" + month (e.g. "cinco de dezembro")
             next_is_qual = False
             if i < n:
                 n1 = _norm_at(i)[0]
                 if n1 in ("POR", "MILHOES", "BILHOES", "ANTES", "DEPOIS", "AC", "DC"):
                     next_is_qual = True
+                elif n1 == "DE" and (i + 1) < n and _norm_at(i + 1)[0] in _PT_MONTHS and not last_punct:
+                    next_is_qual = True
+                elif n1 in ("E", "A", "ATE") and not last_punct:
+                    # Look ahead for day-range + "DE" + month (e.g. "cinco a dez de dezembro")
+                    for lk in range(i + 1, min(n - 1, i + 5)):
+                        if _norm_at(lk)[0] == "DE" and _norm_at(lk + 1)[0] in _PT_MONTHS:
+                            next_is_qual = True
+                            break
             if not next_is_qual:
                 return None
         if first_norm in ("MIL", "CEM", "DEZ", "VINTE", "TRINTA", "QUARENTA", "CINQUENTA", "SESSENTA", "SETENTA", "OITENTA", "NOVENTA"):
-            # Convert lone round numbers >= 100 or when followed by "de" / "anos" / "por cento" / era
+            # Convert lone round numbers >= 100 or when followed by "de" / "anos" / "por cento" / quantity unit / era
             if val < 100:
-                if i < n and _norm_at(i)[0] in ("POR", "ANOS", "DE", "MIL", "MILHOES", "BILHOES"):
+                if i < n and _norm_at(i)[0] in ("POR", "ANOS", "NOITES", "DIAS", "DE", "MIL", "MILHOES", "BILHOES"):
                     pass
                 else:
                     return None
@@ -637,66 +738,231 @@ def _parse_pt_number_sequence(tokens: List[Dict[str, Any]], start_idx: int) -> O
     return i, val, last_punct
 
 
-def compact_spelled_numbers_in_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Normalize raw word timestamps and compact PT-BR spelled-out years, numbers, and centuries
-    into crisp numerals/dates (e.g. 'mil seiscentos e quarenta e sete' -> '1647',
-    'trezentos e trinta e seis' -> '336', 'duzentos e dezessete antes de cristo' -> '217 a.C.',
-    'século décimo primeiro' -> 'SÉC. XI').
+def _match_century_ordinal(flat: List[Dict[str, Any]], start_idx: int) -> Optional[Tuple[int, str, str]]:
+    """Match a PT-BR century ordinal/numeral starting at `start_idx`.
+    Returns `(end_idx_exclusive, roman_numeral, trailing_punct)` or None.
     """
-    # 1. Split multi-word entries & drop standalone pure punctuation
+    n = len(flat)
+    for span_len in (3, 2, 1):
+        if start_idx + span_len <= n:
+            cand_tuple = tuple(
+                _strip_accents_upper(_strip_word_punct(flat[start_idx + k]["word"])[0])
+                for k in range(span_len)
+            )
+            if cand_tuple in _PT_CENTURY_ORDINALS:
+                _, end_p = _strip_word_punct(flat[start_idx + span_len - 1]["word"])
+                return start_idx + span_len, _PT_CENTURY_ORDINALS[cand_tuple], end_p
+    return None
+
+
+def _parse_day_token(flat: List[Dict[str, Any]], idx: int) -> Optional[Tuple[int, int, str]]:
+    """Parse a calendar day (1..31) starting at `idx` (already numeric or spelled-out)."""
+    n = len(flat)
+    if idx >= n:
+        return None
+    core, punct = _strip_word_punct(flat[idx]["word"])
+    if re.fullmatch(r"\d{1,2}", core):
+        d = int(core)
+        if 1 <= d <= 31:
+            return idx + 1, d, punct
+        return None
+    parsed = _parse_pt_number_sequence(flat, idx)
+    if parsed is not None:
+        end_i, val, tr_p = parsed
+        if 1 <= val <= 31:
+            return end_i, val, tr_p
+    return None
+
+
+def compact_spelled_numbers_in_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize raw word timestamps and compact PT-BR spelled-out years, numbers, dates,
+    quantities with units, and singular/plural centuries into crisp numerals/stamps:
+      - 'mil seiscentos e quarenta e sete' -> '1647'
+      - 'duzentos e dezessete antes de cristo' -> '217 a.C.'
+      - 'século décimo primeiro' -> 'SÉC. XI'
+      - 'séculos catorze e dezesseis' -> 'SÉC. XIV–XVI'
+      - 'cinco de dezembro' -> '5 DE DEZEMBRO'
+      - 'dezessete e vinte e três de dezembro' -> '17–23 DE DEZEMBRO'
+      - 'doze noites' -> '12 NOITES', 'vinte anos' -> '20 ANOS', 'dois mil anos' -> '2.000 ANOS'
+    Strictly idempotent: calling it twice never splits or corrupts already-compacted tokens.
+    """
+    # 1. Split multi-word entries (preserving already-compacted tokens intact!) & drop standalone pure punctuation
     flat: List[Dict[str, Any]] = []
     for w in words or []:
         raw = str(w.get("word", w.get("text", ""))).strip()
-        parts = [p for p in re.split(r"\s+", raw) if p and _has_alnum_or_emoji(p)]
-        if not parts:
+        if not raw or not _has_alnum_or_emoji(raw):
             continue
         st = float(w.get("start", 0.0))
         en = float(w.get("end", st + 0.06))
-        step = max(0.06, (en - st) / float(len(parts)))
-        for j, part in enumerate(parts):
+        if bool(w.get("_compacted")) or _is_already_compacted_token(raw):
             flat.append(
                 {
-                    "word": part,
-                    "start": round(st + j * step, 3),
-                    "end": round(st + (j + 1) * step, 3),
+                    "word": raw,
+                    "start": round(st, 3),
+                    "end": round(en, 3),
+                    "_compacted": True,
                 }
             )
+            continue
+        parts = [p for p in re.split(r"\s+", raw) if p and _has_alnum_or_emoji(p)]
+        if not parts:
+            continue
+        if len(parts) == 1:
+            flat.append(
+                {
+                    "word": parts[0],
+                    "start": round(st, 3),
+                    "end": round(en, 3),
+                }
+            )
+        else:
+            step = max(0.06, (en - st) / float(len(parts)))
+            for j, part in enumerate(parts):
+                flat.append(
+                    {
+                        "word": part,
+                        "start": round(st + j * step, 3),
+                        "end": round(st + (j + 1) * step, 3),
+                    }
+                )
 
     out: List[Dict[str, Any]] = []
     n = len(flat)
     i = 0
     while i < n:
+        if flat[i].get("_compacted"):
+            item_c = dict(flat[i])
+            item_c["g_idx"] = len(out)
+            out.append(item_c)
+            i += 1
+            continue
+
         core_i, punct_i = _strip_word_punct(flat[i]["word"])
         norm_i = _strip_accents_upper(core_i)
 
-        # A) Century expressions: "século quarto" / "século décimo primeiro" / "século XIX" / "séc. IV"
-        if norm_i in ("SECULO", "SEC", "SEC.") and (i + 1) < n:
-            matched_cent = None
-            for span_len in (3, 2, 1):
-                if i + 1 + span_len <= n:
-                    cand_tuple = tuple(
-                        _strip_accents_upper(_strip_word_punct(flat[i + 1 + k]["word"])[0])
-                        for k in range(span_len)
-                    )
-                    if cand_tuple in _PT_CENTURY_ORDINALS:
-                        _, end_p = _strip_word_punct(flat[i + span_len]["word"])
-                        matched_cent = (i + 1 + span_len, f"SÉC. {_PT_CENTURY_ORDINALS[cand_tuple]}{end_p}")
-                        break
-            if matched_cent is not None:
-                end_idx, cent_str = matched_cent
+        # A) Century expressions (singular AND plural):
+        #    "século quarto" -> "SÉC. IV", "séculos catorze e dezesseis" -> "SÉC. XIV–XVI"
+        if norm_i in ("SECULO", "SEC", "SEC.", "SECULOS", "SECS", "SECS.") and (i + 1) < n:
+            is_plural = norm_i in ("SECULOS", "SECS", "SECS.")
+            # Handle pre-split Roman range after "SÉC." (e.g. ["SÉC.", "XIV–XVI"])
+            c_nxt, p_nxt = _strip_word_punct(flat[i + 1]["word"])
+            n_nxt = _strip_accents_upper(c_nxt)
+            m_rom_range = re.fullmatch(r"([IVXLCDM]{1,5})[–-]([IVXLCDM]{1,5})", n_nxt)
+            if m_rom_range:
                 out.append(
                     {
-                        "word": cent_str,
+                        "word": f"SÉC. {m_rom_range.group(1)}–{m_rom_range.group(2)}{p_nxt}",
                         "start": flat[i]["start"],
-                        "end": flat[end_idx - 1]["end"],
+                        "end": flat[i + 1]["end"],
                         "g_idx": len(out),
+                        "_compacted": True,
                     }
                 )
-                i = end_idx
+                i += 2
                 continue
 
-        # B) Already-numeric token followed by "antes de cristo" / "depois de cristo" / "a.C." / "d.C."
-        if re.fullmatch(r"\d{1,4}", core_i):
+            m1 = _match_century_ordinal(flat, i + 1)
+            if m1 is not None:
+                end1, rom1, p1 = m1
+                # Check for century range: "<rom1> (e|a|até) <rom2>"
+                matched_range = None
+                if not p1 and (end1 + 1) < n:
+                    conn = _strip_accents_upper(_strip_word_punct(flat[end1]["word"])[0])
+                    if conn in ("E", "A", "ATE"):
+                        m2 = _match_century_ordinal(flat, end1 + 1)
+                        if m2 is not None:
+                            end2, rom2, p2 = m2
+                            matched_range = (end2, f"SÉC. {rom1}–{rom2}{p2}")
+                if matched_range is not None:
+                    end_idx, cent_str = matched_range
+                    out.append(
+                        {
+                            "word": cent_str,
+                            "start": flat[i]["start"],
+                            "end": flat[end_idx - 1]["end"],
+                            "g_idx": len(out),
+                            "_compacted": True,
+                        }
+                    )
+                    i = end_idx
+                    continue
+                if not is_plural:
+                    out.append(
+                        {
+                            "word": f"SÉC. {rom1}{p1}",
+                            "start": flat[i]["start"],
+                            "end": flat[end1 - 1]["end"],
+                            "g_idx": len(out),
+                            "_compacted": True,
+                        }
+                    )
+                    i = end1
+                    continue
+
+        # B) Already-numeric token (including day-ranges like "17–23" or "2.000")
+        m_day_range_tok = re.fullmatch(r"(\d{1,2})[–-](\d{1,2})", core_i)
+        if m_day_range_tok and not punct_i and (i + 2) < n:
+            t_de = _strip_accents_upper(_strip_word_punct(flat[i + 1]["word"])[0])
+            c_mo, p_mo = _strip_word_punct(flat[i + 2]["word"])
+            n_mo = _strip_accents_upper(c_mo)
+            if t_de == "DE" and n_mo in _PT_MONTHS:
+                out.append(
+                    {
+                        "word": f"{int(m_day_range_tok.group(1))}–{int(m_day_range_tok.group(2))} DE {_PT_MONTHS[n_mo]}{p_mo}",
+                        "start": flat[i]["start"],
+                        "end": flat[i + 2]["end"],
+                        "g_idx": len(out),
+                        "_compacted": True,
+                    }
+                )
+                i += 3
+                continue
+
+        if re.fullmatch(r"\d{1,4}|\d{1,3}\.\d{3}", core_i):
+            val_num = int(core_i.replace(".", ""))
+            # B1: Calendar day-range + DE + MONTH (e.g. "17 e 23 de dezembro")
+            if 1 <= val_num <= 31 and not punct_i and (i + 3) < n:
+                conn_b = _strip_accents_upper(_strip_word_punct(flat[i + 1]["word"])[0])
+                if conn_b in ("E", "A", "ATE"):
+                    d2_parsed = _parse_day_token(flat, i + 2)
+                    if d2_parsed is not None and not d2_parsed[2]:
+                        d2_end, d2_val, _ = d2_parsed
+                        if (d2_end + 1) < n:
+                            t_de = _strip_accents_upper(_strip_word_punct(flat[d2_end]["word"])[0])
+                            c_mo, p_mo = _strip_word_punct(flat[d2_end + 1]["word"])
+                            n_mo = _strip_accents_upper(c_mo)
+                            if t_de == "DE" and n_mo in _PT_MONTHS:
+                                out.append(
+                                    {
+                                        "word": f"{val_num}–{d2_val} DE {_PT_MONTHS[n_mo]}{p_mo}",
+                                        "start": flat[i]["start"],
+                                        "end": flat[d2_end + 1]["end"],
+                                        "g_idx": len(out),
+                                        "_compacted": True,
+                                    }
+                                )
+                                i = d2_end + 2
+                                continue
+
+            # B2: Single day + DE + MONTH (e.g. "5 de dezembro", "25 de dezembro")
+            if 1 <= val_num <= 31 and not punct_i and (i + 2) < n:
+                t_de = _strip_accents_upper(_strip_word_punct(flat[i + 1]["word"])[0])
+                c_mo, p_mo = _strip_word_punct(flat[i + 2]["word"])
+                n_mo = _strip_accents_upper(c_mo)
+                if t_de == "DE" and n_mo in _PT_MONTHS:
+                    out.append(
+                        {
+                            "word": f"{val_num} DE {_PT_MONTHS[n_mo]}{p_mo}",
+                            "start": flat[i]["start"],
+                            "end": flat[i + 2]["end"],
+                            "g_idx": len(out),
+                            "_compacted": True,
+                        }
+                    )
+                    i += 3
+                    continue
+
+            # B3: Era suffix ("antes de cristo" / "depois de cristo" / "a.C." / "d.C.")
             era_suffix = ""
             advance = 1
             if i + 3 < n:
@@ -726,18 +992,66 @@ def compact_spelled_numbers_in_words(words: List[Dict[str, Any]]) -> List[Dict[s
                         "start": flat[i]["start"],
                         "end": flat[i + advance - 1]["end"],
                         "g_idx": len(out),
+                        "_compacted": True,
                     }
                 )
                 i += advance
                 continue
 
-        # C) Spelled-out Portuguese number / year sequence
+            # B4: Numeric token followed directly by a quantity unit ("12 noites", "2.000 anos")
+            if not punct_i and (i + 1) < n:
+                cu, pu = _strip_word_punct(flat[i + 1]["word"])
+                nu = _strip_accents_upper(cu)
+                if nu in _PT_QUANTITY_UNITS:
+                    out.append(
+                        {
+                            "word": f"{_format_quantity_int(val_num)} {_PT_QUANTITY_UNITS[nu]}{pu}",
+                            "start": flat[i]["start"],
+                            "end": flat[i + 1]["end"],
+                            "g_idx": len(out),
+                            "_compacted": True,
+                        }
+                    )
+                    i += 2
+                    continue
+
+        # C) Spelled-out Portuguese number / year / date / quantity sequence
         parsed = _parse_pt_number_sequence(flat, i)
         if parsed is not None:
             end_idx, val, trail_p = parsed
             text_val = str(val)
-            # Check for trailing "antes de cristo" / "depois de cristo" / "a.C." / "d.C." / "por cento"
-            if end_idx + 2 < n:
+            is_comp = False
+
+            # C1: Day-range + DE + MONTH ("dezessete e vinte e três de dezembro" -> "17–23 DE DEZEMBRO")
+            if 1 <= val <= 31 and not trail_p and (end_idx + 2) < n:
+                conn_c = _strip_accents_upper(_strip_word_punct(flat[end_idx]["word"])[0])
+                if conn_c in ("E", "A", "ATE"):
+                    d2_parsed = _parse_day_token(flat, end_idx + 1)
+                    if d2_parsed is not None and not d2_parsed[2]:
+                        d2_end, d2_val, _ = d2_parsed
+                        if (d2_end + 1) < n:
+                            t_de = _strip_accents_upper(_strip_word_punct(flat[d2_end]["word"])[0])
+                            c_mo, p_mo = _strip_word_punct(flat[d2_end + 1]["word"])
+                            n_mo = _strip_accents_upper(c_mo)
+                            if t_de == "DE" and n_mo in _PT_MONTHS:
+                                text_val = f"{val}–{d2_val} DE {_PT_MONTHS[n_mo]}"
+                                trail_p = p_mo
+                                end_idx = d2_end + 2
+                                is_comp = True
+
+            # C2: Single day + DE + MONTH ("cinco de dezembro" -> "5 DE DEZEMBRO", "vinte e cinco de dezembro" -> "25 DE DEZEMBRO")
+            if not is_comp and 1 <= val <= 31 and not trail_p and (end_idx + 1) < n:
+                t_de = _strip_accents_upper(_strip_word_punct(flat[end_idx]["word"])[0])
+                c_mo, p_mo = _strip_word_punct(flat[end_idx + 1]["word"])
+                n_mo = _strip_accents_upper(c_mo)
+                if t_de == "DE" and n_mo in _PT_MONTHS:
+                    text_val = f"{val} DE {_PT_MONTHS[n_mo]}"
+                    trail_p = p_mo
+                    end_idx += 2
+                    is_comp = True
+
+            # C3: Trailing "antes de cristo" / "depois de cristo" / "a.C." / "d.C." / "por cento"
+            if not is_comp and end_idx + 2 < n:
                 t1 = _strip_accents_upper(_strip_word_punct(flat[end_idx]["word"])[0])
                 t2 = _strip_accents_upper(_strip_word_punct(flat[end_idx + 1]["word"])[0])
                 t3_raw, p3 = _strip_word_punct(flat[end_idx + 2]["word"])
@@ -746,11 +1060,13 @@ def compact_spelled_numbers_in_words(words: List[Dict[str, Any]]) -> List[Dict[s
                     text_val = f"{val} a.C."
                     trail_p = p3
                     end_idx += 3
+                    is_comp = True
                 elif t1 == "DEPOIS" and t2 == "DE" and t3 == "CRISTO":
                     text_val = f"{val} d.C."
                     trail_p = p3
                     end_idx += 3
-            if end_idx + 1 < n and "C." not in text_val:
+                    is_comp = True
+            if not is_comp and end_idx + 1 < n and "C." not in text_val:
                 t1 = _strip_accents_upper(_strip_word_punct(flat[end_idx]["word"])[0])
                 t2_raw, p2 = _strip_word_punct(flat[end_idx + 1]["word"])
                 t2 = _strip_accents_upper(t2_raw)
@@ -758,26 +1074,40 @@ def compact_spelled_numbers_in_words(words: List[Dict[str, Any]]) -> List[Dict[s
                     text_val = f"{val}%"
                     trail_p = p2
                     end_idx += 2
-            if end_idx < n and "C." not in text_val and "%" not in text_val:
+                    is_comp = True
+            if not is_comp and end_idx < n and "C." not in text_val and "%" not in text_val:
                 c_next, p_next = _strip_word_punct(flat[end_idx]["word"])
                 n_next = _strip_accents_upper(c_next).replace(".", "")
                 if n_next == "AC":
                     text_val = f"{val} a.C."
                     trail_p = p_next
                     end_idx += 1
+                    is_comp = True
                 elif n_next == "DC":
                     text_val = f"{val} d.C."
                     trail_p = p_next
                     end_idx += 1
+                    is_comp = True
 
-            out.append(
-                {
-                    "word": f"{text_val}{trail_p}",
-                    "start": flat[i]["start"],
-                    "end": flat[end_idx - 1]["end"],
-                    "g_idx": len(out),
-                }
-            )
+            # C4: Attach trailing quantity unit ("doze noites" -> "12 NOITES", "vinte anos" -> "20 ANOS", "dois mil anos" -> "2.000 ANOS")
+            if not is_comp and not trail_p and end_idx < n:
+                cu, pu = _strip_word_punct(flat[end_idx]["word"])
+                nu = _strip_accents_upper(cu)
+                if nu in _PT_QUANTITY_UNITS:
+                    text_val = f"{_format_quantity_int(val)} {_PT_QUANTITY_UNITS[nu]}"
+                    trail_p = pu
+                    end_idx += 1
+                    is_comp = True
+
+            item_num: Dict[str, Any] = {
+                "word": f"{text_val}{trail_p}",
+                "start": flat[i]["start"],
+                "end": flat[end_idx - 1]["end"],
+                "g_idx": len(out),
+            }
+            if is_comp:
+                item_num["_compacted"] = True
+            out.append(item_num)
             i = end_idx
             continue
 
@@ -789,22 +1119,36 @@ def compact_spelled_numbers_in_words(words: List[Dict[str, Any]]) -> List[Dict[s
     return out
 
 
+def _trigger_priority(tr: Dict[str, Any]) -> int:
+    cat = str(tr.get("category") or "")
+    base = {"date_num": 30, "entity": 22, "danger": 20, "verb": 12}.get(cat, 10)
+    txt = str((tr.get("words") or [{}])[0].get("word", ""))
+    if " " in txt or "•" in txt:
+        base += 4
+    return base
+
+
 def build_selective_emphasis_chunks(
     words: List[Dict[str, Any]],
     min_display_s: float = 0.72,
     max_display_s: float = 1.65,
+    min_gap_s: float = 0.45,
 ) -> List[Dict[str, Any]]:
     """Build 16:9 Documentary Selective Emphasis keyword triggers (NO continuous karaoke!).
     Triggers ONLY on:
-      - numbers, dates, years, centuries ('217 a.C.', '336', '1647', '1843', 'SÉC. IV', 'SÉC. XI')
-      - secret code names & key historical nouns ('SATURNÁLIA', 'SOL INVICTUS', 'KRAMPUS', 'PAPAI NOEL', 'CROMWELL', 'CANTERBURY')
-      - dramatic impact verbs ('PROIBIRAM', 'INVADIAM', 'DEMOLIA', 'EXPLODIU', 'APAGAR', 'MORREU')
+      - dates, years, centuries, quantities with units ('217 a.C.', '336', '1647', 'SÉC. XIV–XVI',
+        '5 DE DEZEMBRO', '17–23 DE DEZEMBRO', '12 NOITES', '20 ANOS', '2.000 ANOS')
+      - secret code names & key historical nouns ('SATURNÁLIA', 'SOL INVICTUS', 'KRAMPUS', 'PAPAI NOEL', 'CROMWELL')
+      - dramatic impact verbs ('PROIBIRAM', 'INVADIAM', 'DEMOLIA', 'EXPLODIU', 'REVOGOU')
+    Suppresses bare context-free digits (< 1000 without unit/date/year-context), coalesces rapid
+    consecutive hits (< 0.55s apart) into crisp 2-token compound stamps, and strictly prevents
+    overlapping or starved display windows (`end <= next_start - 0.04`).
     """
     compacted = compact_spelled_numbers_in_words(words)
     if not compacted:
         return []
 
-    triggers: List[Dict[str, Any]] = []
+    raw_triggers: List[Dict[str, Any]] = []
     n = len(compacted)
     i = 0
     while i < n:
@@ -825,19 +1169,24 @@ def build_selective_emphasis_chunks(
             end_i, disp_txt, cat = phrase_hit
             st = float(compacted[i]["start"])
             en = float(compacted[end_i - 1]["end"])
-            triggers.append(
+            # Apply consistent +0.25s tail pad & max_display_s cap on multi-word phrases too
+            dur_end = min(st + max_display_s, max(en + 0.25, st + min_display_s))
+            raw_triggers.append(
                 {
-                    "start": st,
-                    "end": max(en, st + min_display_s),
+                    "start": round(st, 3),
+                    "raw_end": round(en, 3),
+                    "end": round(dur_end, 3),
+                    "word_i0": i,
+                    "word_i1": end_i,
                     "selective": True,
                     "category": cat,
                     "accent_hex": "#D9381E" if cat in ("verb", "danger") else "#EAB308",
                     "words": [
                         {
                             "word": disp_txt,
-                            "start": st,
-                            "end": max(en, st + min_display_s),
-                            "g_idx": len(triggers),
+                            "start": round(st, 3),
+                            "end": round(dur_end, 3),
+                            "g_idx": len(raw_triggers),
                         }
                     ],
                 }
@@ -851,16 +1200,36 @@ def build_selective_emphasis_chunks(
         cat = ""
         disp = ""
 
-        # Numbers, years, dates, centuries (e.g. '217 a.C.', '336', '1647', '1843', 'SÉC. IV', 'SÉC. XI')
+        # Centuries, era dates, calendar dates, quantities with units, percentages, and genuine years
         if norm.startswith("SEC.") or re.search(r"\d", core):
-            # Preserve 'a.C.' / 'd.C.' formatting cleanly
             m_era = re.match(r"^(\d{1,4})\s*([ad]\.?\s*c\.?)$", core, flags=re.IGNORECASE)
+            m_qty = _COMPACTED_QTY_RE.fullmatch(norm)
             if m_era:
                 era = "a.C." if m_era.group(2).lower().startswith("a") else "d.C."
                 disp = f"{m_era.group(1)} {era}"
-            else:
+                cat = "date_num"
+            elif norm.startswith("SEC."):
                 disp = unicodedata.normalize("NFC", core).upper()
-            cat = "date_num"
+                cat = "date_num"
+            elif _CALENDAR_DATE_RE.fullmatch(norm):
+                disp = unicodedata.normalize("NFC", core).upper()
+                cat = "date_num"
+            elif re.fullmatch(r"\d+(?:[.,]\d+)?\s*%", norm):
+                disp = unicodedata.normalize("NFC", core).upper()
+                cat = "date_num"
+            elif m_qty and m_qty.group(2) in _PT_QUANTITY_UNITS:
+                disp = unicodedata.normalize("NFC", core).upper()
+                cat = "date_num"
+            elif re.fullmatch(r"\d{4}", core) and 1000 <= int(core) <= 2199:
+                disp = core
+                cat = "date_num"
+            elif re.fullmatch(r"\d{3}", core) and 100 <= int(core) <= 999:
+                # 3-digit historical year (e.g. 'Roma de 336', 'em 325') — require year preposition context
+                prev_norm = _strip_accents_upper(_strip_word_punct(compacted[i - 1]["word"])[0]) if i > 0 else ""
+                if prev_norm in _YEAR_CONTEXT_PREPS:
+                    disp = core
+                    cat = "date_num"
+            # Otherwise suppress bare context-free digits (< 1000 without unit/date/era/year-context)
         elif norm in _SELECTIVE_HISTORICAL_NOUNS:
             disp = unicodedata.normalize("NFC", core).upper()
             cat = _SELECTIVE_HISTORICAL_NOUNS[norm]
@@ -872,35 +1241,116 @@ def build_selective_emphasis_chunks(
             st = float(compacted[i]["start"])
             en = float(compacted[i]["end"])
             dur_end = min(st + max_display_s, max(en + 0.25, st + min_display_s))
-            triggers.append(
+            raw_triggers.append(
                 {
-                    "start": st,
-                    "end": dur_end,
+                    "start": round(st, 3),
+                    "raw_end": round(en, 3),
+                    "end": round(dur_end, 3),
+                    "word_i0": i,
+                    "word_i1": i + 1,
                     "selective": True,
                     "category": cat,
                     "accent_hex": "#D9381E" if cat in ("verb", "danger") else "#EAB308",
                     "words": [
                         {
                             "word": disp,
-                            "start": st,
-                            "end": dur_end,
-                            "g_idx": len(triggers),
+                            "start": round(st, 3),
+                            "end": round(dur_end, 3),
+                            "g_idx": len(raw_triggers),
                         }
                     ],
                 }
             )
         i += 1
 
-    # Ensure strictly non-overlapping display windows
+    # 3. Coalesce consecutive selective hits starting < 0.55s apart (or < 0.62s for entity+date pairs like MIRA + SÉC. IV)
+    #    into a single crisp 2-token compound stamp, OR retain the higher-priority entity/date with min_gap_s >= 0.45s.
+    merged: List[Dict[str, Any]] = []
+    for cur in raw_triggers:
+        if not merged:
+            merged.append(cur)
+            continue
+
+        prev = merged[-1]
+        d_st = float(cur["start"]) - float(prev["start"])
+        prev_txt = str(prev["words"][0]["word"])
+        cur_txt = str(cur["words"][0]["word"])
+        pair_cats = {str(prev["category"]), str(cur["category"])}
+        merge_window = 0.62 if pair_cats == {"entity", "date_num"} else 0.55
+
+        if d_st < merge_window and not prev.get("_merged"):
+            prev_norm = _strip_accents_upper(prev_txt)
+            cur_norm = _strip_accents_upper(cur_txt)
+            adjacent_words = int(cur.get("word_i0", -9)) == int(prev.get("word_i1", -1))
+            use_space_join = adjacent_words and (
+                prev_norm in _TITLE_PREFIX_WORDS
+                or (prev["category"] == "entity" and cur["category"] == "verb" and len(prev_txt.split()) == 1)
+            )
+            if cur_norm in prev_norm:
+                compound = prev_txt
+            elif prev_norm in cur_norm:
+                compound = cur_txt
+            else:
+                sep = " " if use_space_join else " • "
+                compound = f"{prev_txt}{sep}{cur_txt}"
+
+            if len(compound) <= 26:
+                new_st = float(prev["start"])
+                new_raw_end = max(float(prev.get("raw_end", prev["end"])), float(cur.get("raw_end", cur["end"])))
+                new_end = min(new_st + max_display_s, max(new_raw_end + 0.25, new_st + min_display_s))
+                if "danger" in pair_cats:
+                    new_cat = "danger"
+                elif "date_num" in pair_cats:
+                    new_cat = "date_num"
+                elif "entity" in pair_cats:
+                    new_cat = "entity"
+                else:
+                    new_cat = str(cur["category"])
+                new_accent = "#D9381E" if (new_cat in ("danger", "verb") or str(cur["category"]) == "verb") else "#EAB308"
+                prev["start"] = round(new_st, 3)
+                prev["raw_end"] = round(new_raw_end, 3)
+                prev["end"] = round(new_end, 3)
+                prev["word_i1"] = int(cur.get("word_i1", prev.get("word_i1", 0)))
+                prev["category"] = new_cat
+                prev["accent_hex"] = new_accent
+                prev["_merged"] = True
+                prev["words"][0]["word"] = compound
+                prev["words"][0]["start"] = prev["start"]
+                prev["words"][0]["end"] = prev["end"]
+                continue
+
+        # If still closer than min_gap_s (0.45s), keep strictly the higher-priority entity/date
+        if d_st < float(min_gap_s):
+            if _trigger_priority(cur) > _trigger_priority(prev):
+                merged[-1] = cur
+            continue
+
+        merged.append(cur)
+
+    # 4. Strictly enforce non-overlapping display windows: NEVER exceed `nxt_st - 0.04`!
+    triggers: List[Dict[str, Any]] = []
+    for idx, ch in enumerate(merged):
+        # Strip internal helper keys
+        ch.pop("raw_end", None)
+        ch.pop("word_i0", None)
+        ch.pop("word_i1", None)
+        ch.pop("_merged", None)
+        ch["words"][0]["g_idx"] = idx
+        triggers.append(ch)
+
     for idx in range(len(triggers) - 1):
+        st = float(triggers[idx]["start"])
         nxt_st = float(triggers[idx + 1]["start"])
-        if float(triggers[idx]["end"]) > nxt_st - 0.04:
-            new_end = max(float(triggers[idx]["start"]) + 0.18, nxt_st - 0.04)
-            triggers[idx]["end"] = round(new_end, 3)
-            triggers[idx]["words"][0]["end"] = round(new_end, 3)
-        else:
-            triggers[idx]["end"] = round(min(float(triggers[idx]["end"]), float(triggers[idx]["start"]) + max_display_s), 3)
-            triggers[idx]["words"][0]["end"] = triggers[idx]["end"]
+        cap_end = round(nxt_st - 0.04, 3)
+        cur_end = min(float(triggers[idx]["end"]), round(st + max_display_s, 3), cap_end)
+        triggers[idx]["end"] = round(cur_end, 3)
+        triggers[idx]["words"][0]["end"] = triggers[idx]["end"]
+
+    if triggers:
+        last_st = float(triggers[-1]["start"])
+        last_end = round(min(float(triggers[-1]["end"]), last_st + max_display_s), 3)
+        triggers[-1]["end"] = last_end
+        triggers[-1]["words"][0]["end"] = last_end
 
     return triggers
 
@@ -2113,6 +2563,92 @@ def _ensure_selective_chunks(chunk_list: List[Dict[str, Any]]) -> List[Dict[str,
     return selective
 
 
+def _is_redundant_with_lower_third(label: str, lower_third_title: Optional[str]) -> bool:
+    """Return True if selective caption `label` is an exact word-bounded substring of active `lower_third_title`."""
+    if not label or not lower_third_title:
+        return False
+    lbl_norm = " ".join(_strip_accents_upper(label).split()).strip()
+    lt_norm = " ".join(_strip_accents_upper(lower_third_title).split()).strip()
+    if not lbl_norm or not lt_norm:
+        return False
+    return re.search(rf"(?<![A-Z0-9]){re.escape(lbl_norm)}(?![A-Z0-9])", lt_norm) is not None
+
+
+def _compute_selective_emphasis_layout(
+    label: str,
+    w: int,
+    h: int,
+    cp_tf: skia.Typeface,
+    base_size: float,
+    lower_third_active: bool = False,
+) -> Dict[str, Any]:
+    """Compute exact zero-collision geometry for Selective Emphasis box, brackets, and text."""
+    is_wide = w >= h
+    scale_ref = (float(w) / 1920.0) if is_wide else (float(w) / 1080.0)
+    eff_size = float(base_size) if (base_size > 10.0) else (64.0 * scale_ref)
+    margin_x = 96.0 * (float(w) / 1920.0) if is_wide else 56.0
+
+    if is_wide and lower_third_active:
+        min_box_l = float(w) * 0.52
+        max_box_w = max(200.0, float(w) - margin_x - min_box_l)
+    else:
+        min_box_l = margin_x
+        max_box_w = float(w) * (0.84 if is_wide else 0.88)
+
+    font = skia.Font(cp_tf, eff_size)
+    font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
+    text_w = float(font.measureText(label))
+    pad_x = max(14.0, eff_size * 0.28)
+    box_w = text_w + pad_x * 2.0
+
+    for _ in range(2):
+        if box_w > max_box_w and box_w > 1.0:
+            eff_size = max(22.0, eff_size * (max_box_w / box_w) * 0.985)
+            font = skia.Font(cp_tf, eff_size)
+            font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
+            text_w = float(font.measureText(label))
+            pad_x = max(14.0, eff_size * 0.28)
+            box_w = text_w + pad_x * 2.0
+        else:
+            break
+
+    fm = font.getMetrics()
+    ascent = abs(float(fm.fAscent))
+    descent = abs(float(fm.fDescent))
+    pad_top = max(10.0, eff_size * 0.20)
+    pad_bot = max(12.0, eff_size * 0.24)
+    box_h = ascent + descent + pad_top + pad_bot
+
+    if is_wide and lower_third_active:
+        box_l = max(min_box_l, float(w) - margin_x - box_w)
+        text_x = box_l + pad_x
+        baseline_y = float(h) - 92.0 * (float(h) / 1080.0)
+    elif is_wide:
+        text_x = (float(w) - text_w) * 0.5
+        box_l = text_x - pad_x
+        baseline_y = float(h) - 108.0 * (float(h) / 1080.0)
+    else:
+        text_x = (float(w) - text_w) * 0.5
+        box_l = text_x - pad_x
+        baseline_y = float(h) * 0.82
+
+    return {
+        "font": font,
+        "eff_size": eff_size,
+        "text_w": text_w,
+        "text_x": text_x,
+        "baseline_y": baseline_y,
+        "ascent": ascent,
+        "descent": descent,
+        "pad_x": pad_x,
+        "pad_top": pad_top,
+        "pad_bot": pad_bot,
+        "box_l": box_l,
+        "box_w": box_w,
+        "box_h": box_h,
+    }
+
+
 def _render_selective_emphasis(
     canvas: skia.Canvas,
     chunk: Dict[str, Any],
@@ -2123,13 +2659,17 @@ def _render_selective_emphasis(
     typeface: skia.Typeface,
     base_size: float,
     lower_third_active: bool = False,
+    lower_third_title: Optional[str] = None,
 ) -> None:
     """Render JSON v3.0.0 `keyword_kinetic_captions` in Selective Emphasis mode:
     - Courier Prime Bold 64px (`#FFFFFF`)
     - Drop shadow `0px 4px 16px rgba(0,0,0,0.85)`
     - `#EAB308` / `#D9381E` tactical bracket & animated underline accent
-    - Positioned at `bottom_right` (`x = w - 96 - text_w, y = h - 92`) when lower-left date stamp is active,
-      or centered at `y = h - 108` otherwise.
+    - Clean opacity + `slide_y` + subtle `0.96 -> 1.00` scale entrance (ZERO `canvas.clipRect`
+      slicing around letters or brackets; horizontal wipe strictly on the bottom underline bar!)
+    - Positioned strictly in the right half (`box_l >= max(0.52 * w, w - 96 - box_w)`) when
+      lower-left date stamp is active in 16:9, and skipped if an exact redundant substring of
+      the active `lower_third_title`.
     """
     words = chunk.get("words") or []
     if not words:
@@ -2141,45 +2681,43 @@ def _render_selective_emphasis(
     if not label:
         return
 
+    if lower_third_active and _is_redundant_with_lower_third(label, lower_third_title):
+        return
+
     chunk_start = float(chunk.get("start", words[0].get("start", 0.0)))
     chunk_end = float(chunk.get("end", words[-1].get("end", chunk_start + 0.8)))
+    dur = max(0.08, chunk_end - chunk_start)
     age = max(0.0, t - chunk_start)
     rem = max(0.0, chunk_end - t)
 
-    ent = _cubic_bezier_doc_snap(_clamp01(age / 0.24))
-    exit_p = _ease_out_cubic(_clamp01(rem / 0.16)) if rem < 0.16 else 1.0
+    # Clamp fade-in/out to min(0.14, dur * 0.25) so short triggers ALWAYS reach 100% full opacity
+    fade_in_s = max(0.02, min(0.14, dur * 0.25))
+    fade_out_s = max(0.02, min(0.14, dur * 0.25))
+    ent = _cubic_bezier_doc_snap(_clamp01(age / fade_in_s))
+    exit_p = _ease_out_cubic(_clamp01(rem / fade_out_s)) if rem < fade_out_s else 1.0
     alpha = int(round(255.0 * min(ent, exit_p)))
     if alpha <= 6:
         return
 
-    is_wide = w >= h
-    scale_ref = (float(w) / 1920.0) if is_wide else (float(w) / 1080.0)
-    eff_size = float(base_size) if (base_size > 10.0) else (64.0 * scale_ref)
-
-    max_avail_w = float(w) * (0.44 if (is_wide and lower_third_active) else 0.80)
-    font = skia.Font(cp_tf, eff_size)
-    font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
-    text_w = float(font.measureText(label))
-    if text_w > max_avail_w and text_w > 1.0:
-        eff_size = max(28.0, eff_size * (max_avail_w / text_w))
-        font = skia.Font(cp_tf, eff_size)
-        font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
-        text_w = float(font.measureText(label))
-
-    fm = font.getMetrics()
-    ascent = abs(float(fm.fAscent))
-    descent = abs(float(fm.fDescent))
-
-    margin_x = 96.0 * (float(w) / 1920.0) if is_wide else 56.0
-    if is_wide and lower_third_active:
-        text_x = max(float(w) * 0.48, float(w) - margin_x - text_w)
-        baseline_y = float(h) - 92.0 * (float(h) / 1080.0)
-    elif is_wide:
-        text_x = (float(w) - text_w) * 0.5
-        baseline_y = float(h) - 108.0 * (float(h) / 1080.0)
-    else:
-        text_x = (float(w) - text_w) * 0.5
-        baseline_y = float(h) * 0.82
+    lay = _compute_selective_emphasis_layout(
+        label=label,
+        w=w,
+        h=h,
+        cp_tf=cp_tf,
+        base_size=base_size,
+        lower_third_active=lower_third_active,
+    )
+    font = lay["font"]
+    eff_size = lay["eff_size"]
+    text_w = lay["text_w"]
+    text_x = lay["text_x"]
+    baseline_y = lay["baseline_y"]
+    ascent = lay["ascent"]
+    descent = lay["descent"]
+    pad_top = lay["pad_top"]
+    box_l = lay["box_l"]
+    box_w = lay["box_w"]
+    box_h = lay["box_h"]
 
     accent_hex = str(chunk.get("accent_hex") or "")
     if not accent_hex:
@@ -2189,25 +2727,21 @@ def _render_selective_emphasis(
 
     slide_y = (1.0 - ent) * 14.0
     draw_y = baseline_y + slide_y
-
-    # Subtle translucent slate tactical frame behind keyword (zero bulky cartoon box)
-    pad_x = max(14.0, eff_size * 0.28)
-    pad_top = max(10.0, eff_size * 0.20)
-    pad_bot = max(12.0, eff_size * 0.24)
-    box_l = text_x - pad_x
     box_t = draw_y - ascent - pad_top
-    box_w = text_w + pad_x * 2.0
-    box_h = ascent + descent + pad_top + pad_bot
+    box_cx = box_l + box_w * 0.5
+    box_cy = box_t + box_h * 0.5
+    scale_ent = 0.96 + 0.04 * ent
 
-    # Clip left-to-right reveal on entrance for snappy Vox/Johnny Harris kinetic feel
+    # Clean opacity + slide_y + subtle scale (0.96 -> 1.00) with ZERO clipRect slicing around text/brackets!
     canvas.save()
-    reveal_w = (box_w + 48.0) * max(0.05, ent)
-    canvas.clipRect(skia.Rect.MakeXYWH(box_l - 24.0, box_t - 24.0, reveal_w, box_h + 64.0))
+    canvas.translate(box_cx, box_cy)
+    canvas.scale(scale_ent, scale_ent)
+    canvas.translate(-box_cx, -box_cy)
 
     bg_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(int(alpha * 0.48), 18, 20, 23))
     canvas.drawRoundRect(skia.Rect.MakeXYWH(box_l, box_t, box_w, box_h), 6.0, 6.0, bg_p)
 
-    # Tactical left & right square brackets `[` `]` in #EAB308 / #D9381E
+    # Tactical left & right square brackets `[` `]` in #EAB308 / #D9381E (100% unclipped on every frame!)
     brk_len = max(12.0, eff_size * 0.24)
     brk_p = skia.Paint(
         AntiAlias=True,
@@ -2226,8 +2760,9 @@ def _render_selective_emphasis(
     canvas.drawLine(box_r, box_t, box_r, box_t + box_h, brk_p)
     canvas.drawLine(box_r - brk_len, box_t + box_h, box_r, box_t + box_h, brk_p)
 
-    # Animated sweeping underline bar beneath baseline (`#EAB308` or `#D9381E`)
-    ul_prog = _cubic_bezier_doc_snap(_clamp01(age / 0.30))
+    # Animated sweeping underline bar beneath baseline (horizontal wipe kept STRICTLY on underline bar!)
+    ul_dur = max(0.08, min(0.26, dur * 0.45))
+    ul_prog = _cubic_bezier_doc_snap(_clamp01(age / ul_dur))
     ul_y = draw_y + descent + 5.0
     ul_h = max(3.5, eff_size * 0.065)
     ul_rect = skia.Rect.MakeXYWH(text_x, ul_y, max(6.0, text_w * ul_prog), ul_h)
@@ -2260,6 +2795,7 @@ def draw_kinetic_captions(
     mood: str = "",
     caption_style: Optional[str] = None,
     lower_third_active: Optional[bool] = None,
+    lower_third_title: Optional[str] = None,
     selective_mode: Optional[bool] = None,
     scene_local_t: Optional[float] = None,
     **kwargs: Any,
@@ -2296,6 +2832,7 @@ def draw_kinetic_captions(
                 lt_active = 0.0 <= float(scene_local_t) < 3.8
         else:
             lt_active = bool(lower_third_active)
+        eff_lt_title = lower_third_title if lower_third_title is not None else chunk.get("lower_third_title")
         # Default to exact 64px Courier Prime Bold at 1920x1080 (ignore legacy 58px cinema_minimal default)
         if font_size is None or (is_wide and abs(float(font_size) - 58.0) < 0.5):
             sel_size = 64.0 * (float(w) / 1920.0) if is_wide else 56.0 * (float(w) / 1080.0)
@@ -2311,6 +2848,7 @@ def draw_kinetic_captions(
             typeface,
             sel_size,
             lower_third_active=lt_active,
+            lower_third_title=str(eff_lt_title) if eff_lt_title else None,
         )
         return
 
