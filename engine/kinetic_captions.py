@@ -2233,17 +2233,12 @@ def _render_selective_emphasis(
     ul_rect = skia.Rect.MakeXYWH(text_x, ul_y, max(6.0, text_w * ul_prog), ul_h)
     canvas.drawRoundRect(ul_rect, 2.0, 2.0, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(alpha, ar, ag, ab)))
 
-    # Pure #FFFFFF Courier Prime Bold 64px text with drop_shadow: 0px 4px 16px rgba(0,0,0,0.85)
+    # Pure #FFFFFF Courier Prime Bold 64px text with fast 2-pass cinema drop shadow
+    sh_soft = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(int(round(alpha * 0.42)), 0, 0, 0))
+    canvas.drawString(label, text_x + 1.0, draw_y + 6.0, font, sh_soft)
+    sh_tight = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(int(round(alpha * 0.85)), 0, 0, 0))
+    canvas.drawString(label, text_x, draw_y + 3.5, font, sh_tight)
     txt_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(alpha, 255, 255, 255))
-    txt_p.setImageFilter(
-        skia.ImageFilters.DropShadow(
-            0.0,
-            4.0,
-            8.0,
-            8.0,
-            skia.ColorSetARGB(int(round(alpha * 0.85)), 0, 0, 0),
-        )
-    )
     canvas.drawString(label, text_x, draw_y, font, txt_p)
     canvas.restore()
 

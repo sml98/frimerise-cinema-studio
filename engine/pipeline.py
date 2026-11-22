@@ -130,6 +130,7 @@ _VALID_CAPTION_STYLES: Tuple[str, ...] = (
     "word_slam",
     "cinema_minimal",
     "typewriter_highlight",
+    "selective_emphasis",
     "none",
 )
 

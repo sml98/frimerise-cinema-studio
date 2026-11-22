@@ -7442,9 +7442,9 @@ def _find_cached_work_asset(work_dir: Path, prefix: str, min_bytes: int = 4096) 
 
 
 def _find_cached_slot_photo(work_dir: Path, slot_key: str, min_bytes: int = 12_000) -> Optional[Path]:
-    """Locate any cached bespoke Flow or archival photo for `slot_key` (`flow_{slot_key}*` OR `photo_{slot_key}*`)."""
+    """Locate any cached bespoke Flow, Wikimedia archival, or stock photo for `slot_key`."""
     valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
-    for pattern in (f"flow_{slot_key}*", f"photo_{slot_key}*"):
+    for pattern in (f"flow_{slot_key}*", f"wiki_{slot_key}*", f"photo_{slot_key}*"):
         for cand in sorted(work_dir.glob(pattern)):
             try:
                 if cand.is_file() and cand.suffix.lower() in valid_exts and cand.stat().st_size >= min_bytes:
@@ -7569,6 +7569,12 @@ def _prefetch_scene_media_sync(
             "cinematic overhead archival mystery frame of",
         )
 
+    # Long-Form Hybrid Archival + Bespoke AI Matrix (v3.0.0):
+    # When len(scenes) >= 15, cap n_seq_photos to 5 per scene (~4.4s avg shot length with B-roll + 11.5s graphic),
+    # route Slot 0 (Hero 2.5D Parallax Opener) to ONE fast Google Flow Pro (Nano Banana 2.1, 16:9) batch (25 prompts),
+    # and route Slots 1..4 to Priority 1 Wikimedia Commons Public Domain / CC0 historical paintings & engravings!
+    is_long_form = len(scenes) >= 15
+
     for s_idx, sc in enumerate(scenes):
         if s_idx in skip_set:
             scene_slot_specs.append([])
@@ -7582,6 +7588,8 @@ def _prefetch_scene_media_sync(
             else 4
         )
         n_seq_photos = max(3, target_shots - (1 if item.primary_broll_mp4 else 0))
+        if is_long_form:
+            n_seq_photos = min(5, n_seq_photos)
 
         # Build an ordered list of rich, chronological, scene-specific English visual prompts
         prompt_candidates: List[str] = []
@@ -7631,27 +7639,38 @@ def _prefetch_scene_media_sync(
 
             slot_key = f"sc{s_idx:02d}_shot{sh_i:02d}"
             out_p = work_dir / f"flow_{slot_key}.jpg"
-            fb_q = fallback_queries[sh_i % len(fallback_queries)]
+            # In long-form hybrid allocation, Slot 0 = bespoke Flow Hero and Slots 1..4 map 1-to-1
+            # onto all 4 unique historical archival queries [photo_query_en, extra_0, extra_1, extra_2]!
+            is_flow_hero_slot = (not is_long_form) or (sh_i == 0)
+            fb_q = (
+                fallback_queries[(sh_i - 1) % len(fallback_queries)]
+                if (is_long_form and sh_i >= 1)
+                else fallback_queries[sh_i % len(fallback_queries)]
+            )
             cached_p = _find_cached_slot_photo(work_dir, slot_key, min_bytes=12_000) if resume else None
             spec = {
                 "key": slot_key,
+                "slot_index": sh_i,
+                "source_tier": "flow_hero" if is_flow_hero_slot else "wikimedia_archival",
                 "role": "shot",
                 "prompt_en": p_txt,
                 "fallback_query": fb_q,
+                "alt_query": fallback_queries[0],
                 "out_path": out_p,
                 "cached": cached_p,
             }
             specs_for_scene.append(spec)
-            if cached_p is None:
+            if cached_p is None and is_flow_hero_slot:
                 batch_items.append({"key": slot_key, "prompt_en": p_txt, "out_path": out_p})
 
         scene_slot_specs.append(specs_for_scene)
 
-    # Execute ONE single Google Flow Pro (`Nano Banana 2.1`) batch session for ALL bespoke shots!
+    # Execute ONE single Google Flow Pro (`Nano Banana 2.1`) batch session for ALL bespoke hero shots!
     flow_results: Dict[str, Path] = {}
     if batch_items:
+        mode_lbl = "Long-Form Hybrid Hero Opener (Slot 0)" if is_long_form else "Full Bespoke"
         print(
-            f"[NetflixDoc] Generating {len(batch_items)} unique era-locked {aspect_ratio} cinema stills via Google Flow Pro (Nano Banana 2.1)...",
+            f"[NetflixDoc] [{mode_lbl}] Generating {len(batch_items)} unique era-locked {aspect_ratio} cinema stills via Google Flow Pro (Nano Banana 2.1)...",
             flush=True,
         )
         flow_results = generate_flow_batch_images_sync(
@@ -7666,8 +7685,10 @@ def _prefetch_scene_media_sync(
 
     # -------------------------------------------------------------------------
     # PHASE C: Assemble strictly UNIQUE, NON-REPEATING `shot_sequence` per scene
-    # + Screen Flow plates for historical anachronisms (replacing rejected plates
-    #   with Priority 1 Wikimedia Commons archival plates!)
+    # - Slot 0 (`flow_hero`): Screen Flow plates for historical anachronisms
+    # - Slots 1..4 (`wikimedia_archival` in long-form): Priority 1 Wikimedia Commons
+    #   Public Domain / CC0 archival paintings & portraits first, falling back to
+    #   `fetch_doc_hero_or_archival_photo` if Wikimedia yields < 2 plates for the scene!
     # -------------------------------------------------------------------------
     anachronism_rejections = 0
     wikimedia_archival_count = 0
@@ -7677,14 +7698,16 @@ def _prefetch_scene_media_sync(
         item = assets_list[s_idx]
         sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
         scene_photos: List[Path] = []
+        wiki_hits_for_scene = 0
         _, is_pre_modern = _extract_historical_era_lock(sc.lower_third_title, sc.lower_third_subtitle, sc.narration)
 
         for spec in scene_slot_specs[s_idx]:
             key = spec["key"]
+            is_archival_slot = spec.get("source_tier") == "wikimedia_archival"
             ppath: Optional[Path] = spec["cached"] or flow_results.get(key)
             if ppath is not None and Path(ppath).exists():
                 flow_ok = True
-                if sc_mood in ("dark_horror", "epic_history") and is_pre_modern:
+                if (not is_archival_slot) and sc_mood in ("dark_horror", "epic_history") and is_pre_modern:
                     # Gemini Vision anachronism screening on bespoke Flow plates (rejects modern police/vans/hoodies!)
                     ok_ana, ana_sc, ana_why = verify_historical_anachronism_vision(
                         Path(ppath),
@@ -7707,43 +7730,61 @@ def _prefetch_scene_media_sync(
                     photos_used.append(str(ppath))
                     continue
 
-            # Priority 1 Free Archival Source: Wikimedia Commons API (public domain / CC, >=900px, Vision + dHash!)
+            # Priority 1 Free Archival Source: Wikimedia Commons API (PD/CC0 historical paintings first!)
+            # For long-form archival slots (sh_i >= 1), use fast PD-first mode (`strict_vision=False`, which still
+            # runs anachronism Vision on any non-PD CC-BY photo!) to avoid 200 sequential Vision/Flow bottlenecks.
+            wiki_strict = not is_archival_slot
             wiki_path = fetch_wikimedia_commons_archival_photo(
                 query_en=spec["fallback_query"],
                 out_dir=work_dir,
                 prefix=f"wiki_{key}",
                 is_wide=(not is_vertical),
-                topic_context=f"{sc.lower_third_title} {sc.narration}",
+                topic_context=f"{sc.lower_third_title} {sc.narration[:220]}",
                 mood=sc_mood,
                 used_urls=used_photo_urls,
                 used_dhashes=used_dhashes,
-                strict_vision=True,
+                strict_vision=wiki_strict,
             )
+            if (wiki_path is None) and is_archival_slot and spec.get("alt_query") and spec["alt_query"] != spec["fallback_query"]:
+                wiki_path = fetch_wikimedia_commons_archival_photo(
+                    query_en=spec["alt_query"],
+                    out_dir=work_dir,
+                    prefix=f"wiki_{key}",
+                    is_wide=(not is_vertical),
+                    topic_context=f"{sc.lower_third_title} {sc.narration[:220]}",
+                    mood=sc_mood,
+                    used_urls=used_photo_urls,
+                    used_dhashes=used_dhashes,
+                    strict_vision=False,
+                )
             if wiki_path is not None and wiki_path.exists():
                 wikimedia_archival_count += 1
+                wiki_hits_for_scene += 1
                 scene_photos.append(wiki_path)
                 photos_used.append(str(wiki_path))
                 continue
 
-            # Secondary Vision-verified archival fallback (Openverse / Pixabay / era-locked Flow regen)
-            fb_path = fetch_doc_hero_or_archival_photo(
-                spec["fallback_query"],
-                work_dir,
-                key,
-                min_width=640,
-                used_urls=used_photo_urls,
-                mood=sc_mood,
-                prefer_gemini=False,
-                aspect_ratio=aspect_ratio,
-                bespoke_prompt_en=spec["prompt_en"],
-                scene_context=f"{sc.lower_third_title} — {sc.narration}",
-                used_dhashes=used_dhashes,
-                strict_vision=True,
-                allow_duplicate=False,
-            )
-            if fb_path is not None and fb_path.exists():
-                scene_photos.append(fb_path)
-                photos_used.append(str(fb_path))
+            # Secondary Vision-verified archival fallback:
+            # Always run for Hero Slot 0 or short-form; in long-form archival slots, run whenever Wikimedia returned < 2 results!
+            if (not is_archival_slot) or (wiki_hits_for_scene < 2) or (len(scene_photos) < 3):
+                fb_path = fetch_doc_hero_or_archival_photo(
+                    spec["fallback_query"],
+                    work_dir,
+                    key,
+                    min_width=640,
+                    used_urls=used_photo_urls,
+                    mood=sc_mood,
+                    prefer_gemini=False,
+                    aspect_ratio=aspect_ratio,
+                    bespoke_prompt_en=spec["prompt_en"],
+                    scene_context=f"{sc.lower_third_title} — {sc.narration[:220]}",
+                    used_dhashes=used_dhashes,
+                    strict_vision=True,
+                    allow_duplicate=False,
+                )
+                if fb_path is not None and fb_path.exists():
+                    scene_photos.append(fb_path)
+                    photos_used.append(str(fb_path))
 
         # Populate primary_photo_path & initial extra_photo_paths
         if scene_photos:
@@ -8612,7 +8653,11 @@ async def render_netflix_documentary(
 
         seq_len = len(rec["media_assets"].shot_sequence or [])
         if seq_len == 0 and rec["already_rendered"]:
-            cached_shots = len(list(work_dir.glob(f"flow_sc{s_idx:02d}_shot*"))) + len(list(work_dir.glob(f"photo_sc{s_idx:02d}_shot*")))
+            cached_shots = (
+                len(list(work_dir.glob(f"flow_sc{s_idx:02d}_shot*")))
+                + len(list(work_dir.glob(f"wiki_sc{s_idx:02d}_shot*")))
+                + len(list(work_dir.glob(f"photo_sc{s_idx:02d}_shot*")))
+            )
             has_cached_broll = 1 if _find_cached_work_asset(work_dir, f"broll_sc{s_idx:02d}_main", min_bytes=32_768) else 0
             seq_len = (cached_shots + has_cached_broll) or scene_shot_counts[s_idx]
 

@@ -1263,6 +1263,39 @@ def fetch_wikimedia_commons_archival_photo(
     short_q = _shorten_query(norm_q, max_words=4)
     if short_q and short_q.lower() != norm_q.lower() and len(short_q.split()) >= 2:
         queries_to_try.append(short_q)
+    # Strip stylistic adjectives to build a concise 2-3 word historical subject query for Wikimedia CirrusSearch
+    _wiki_filler = {
+        "antique", "vintage", "historical", "history", "dark", "atmospheric", "cinematic",
+        "moody", "original", "classic", "old", "ancient", "traditional", "dramatic", "shadow",
+        "shadows", "candlelit", "nocturnal", "night", "winter", "illustration", "painting",
+        "engraving", "portrait", "drawing", "etching", "art", "artwork", "photo", "still",
+        "scene", "frame", "detail", "period", "century", "european", "folklore",
+    }
+    core_tokens = [
+        tok for tok in re.findall(r"[A-Za-z0-9'-]+", norm_q)
+        if tok.lower() not in _wiki_filler and len(tok) >= 2
+    ]
+    if core_tokens:
+        core_q = " ".join(core_tokens[:3]).strip()
+        if core_q and core_q.lower() not in {x.lower() for x in queries_to_try}:
+            queries_to_try.append(core_q)
+        if len(core_tokens) >= 2:
+            core_2 = " ".join(core_tokens[:2]).strip()
+            if core_2 and core_2.lower() not in {x.lower() for x in queries_to_try}:
+                queries_to_try.append(core_2)
+
+    _art_bonus_terms = (
+        "painting", "engraving", "etching", "woodcut", "lithograph", "fresco",
+        "manuscript", "codex", "illustration", "mosaic", "miniature", "tapestry",
+        "leech", "bruegel", "nast", "durer", "rembrandt", "rubens", "caravaggio",
+        "portrait", "chronograph", "broadsheet", "postcard", "184", "186", "188",
+        "164", "165", "166", "17th", "18th", "19th",
+    )
+    _modern_snap_terms = (
+        "dsc_", "img_", "pxl_", "2018", "2019", "2020", "2021", "2022", "2023",
+        "2024", "2025", "books", "shelf", "paperback", "edition", "sign", "plaque",
+        "tourist", "modern", "souvenir", "bookshop", "storefront", "selfie", "cosplay",
+    )
 
     candidates: List[Dict[str, Any]] = []
     seen_urls: Set[str] = set()
@@ -1276,7 +1309,7 @@ def fetch_wikimedia_commons_archival_photo(
                         "generator": "search",
                         "gsrnamespace": 6,
                         "gsrsearch": q,
-                        "gsrlimit": 12,
+                        "gsrlimit": 16,
                         "prop": "imageinfo",
                         "iiprop": "url|extmetadata|dimensions|mime|size",
                         "iiurlwidth": 1920,
@@ -1312,7 +1345,7 @@ def fetch_wikimedia_commons_archival_photo(
                         continue
                     ar = eff_w / max(1.0, float(eff_h))
                     if is_wide:
-                        if ar < 1.15 or ar > 2.65:
+                        if ar < 0.92 or ar > 2.65:
                             continue
                     else:
                         if ar < 0.42 or ar > 1.45:
@@ -1327,19 +1360,30 @@ def fetch_wikimedia_commons_archival_photo(
                         continue
                     # Build a lighter 480px preview URL if thumburl is 1920px
                     thumb_preview = re.sub(r"/\d+px-", "/480px-", full_url) if "/1920px-" in full_url else full_url
+                    lic_l = lic_lbl.lower()
+                    is_pd_art = ("public domain" in lic_l) or lic_l.startswith("pd") or ("cc0" in lic_l)
                     rel_score = _score_media_relevance(q, title_l, mood=mood)
+                    if is_pd_art:
+                        rel_score += 6
+                    if any(term in title_l for term in _art_bonus_terms):
+                        rel_score += 4
+                    if is_wide and ar >= 1.18:
+                        rel_score += 2
+                    if any(term in title_l for term in _modern_snap_terms):
+                        rel_score -= 6
                     seen_urls.add(full_url)
                     candidates.append({
                         "url": full_url,
                         "thumb": thumb_preview,
                         "title": title_raw,
                         "license": lic_lbl,
+                        "is_pd": is_pd_art,
                         "width": eff_w,
                         "height": eff_h,
                         "ar_dist": abs(ar - (16.0 / 9.0 if is_wide else 9.0 / 16.0)),
                         "rel_score": rel_score,
                     })
-                if len(candidates) >= 4:
+                if len(candidates) >= 5:
                     break
             except Exception:
                 continue
@@ -1351,8 +1395,9 @@ def fetch_wikimedia_commons_archival_photo(
 
         cand_items: List[Dict[str, Any]] = []
         cand_bgrs: List[np.ndarray] = []
+        max_thumbs_needed = 4 if strict_vision else 1
         for item in candidates[:8]:
-            if len(cand_items) >= 4:
+            if len(cand_items) >= max_thumbs_needed:
                 break
             tbgr = _download_thumb_bgr(client, item["thumb"], timeout=8.0)
             if tbgr is None and item["thumb"] != item["url"]:
@@ -1366,6 +1411,22 @@ def fetch_wikimedia_commons_archival_photo(
             dh = compute_image_dhash(tbgr)
             if is_perceptual_duplicate(dh, dhash_pool, max_hamming=8):
                 continue
+            # Fast anachronism guard ONLY on modern CC-BY uploads when strict_vision=False;
+            # genuine Public Domain / CC0 museum works pass immediately at 0ms Vision cost!
+            if (not strict_vision) and (not item.get("is_pd")) and mood in ("dark_horror", "epic_history"):
+                ok_ana, ana_sc, ana_why = verify_historical_anachronism_vision(
+                    tbgr,
+                    query=norm_q,
+                    lower_third_title=topic_context[:120],
+                    mood=mood,
+                    strict_vision=False,
+                )
+                if not ok_ana and ana_why != "no_vision_key":
+                    print(
+                        f"[DocMedia] Wikimedia fast-gate rejected modern CC photo '{item['title'][:48]}' ({ana_sc}/10: {ana_why})",
+                        flush=True,
+                    )
+                    continue
             cand_items.append(item)
             cand_bgrs.append(tbgr)
 
@@ -1402,7 +1463,7 @@ def fetch_wikimedia_commons_archival_photo(
             winner = cand_items[best_i]
         else:
             winner = cand_items[0]
-            v_score, v_reason = 8, "vision_bypassed"
+            v_score, v_reason = (9, "pd_museum_fast") if winner.get("is_pd") else (8, "cc_anachronism_ok")
 
         q_hash = hashlib.sha256(norm_q.lower().encode("utf-8")).hexdigest()[:12]
         dl = _download_and_validate_photo(
