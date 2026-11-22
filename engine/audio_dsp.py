@@ -3,9 +3,11 @@
 - Instant Cloud Voices: edge-tts >= 7.3.0 with boundary="WordBoundary" exact timestamps
 - Offline fallback: espeak-ng PT-BR
 - Neural Silence Trimming: Silero VAD ONNX (preserving consonant starts & question tails, capping internal pauses >0.35s to 0.32-0.35s) + energy VAD fallback
-- Broadcast Tactile Sound Design Chain (JSON v3.0.0, 100% permissive FFmpeg filters — ZERO GPL pedalboard):
-    Voice: highpass=80Hz -> +2dB warmth @120Hz -> +3dB presence @4.5kHz -> 3:1 comp (12ms/140ms) -> -14.0 LUFS
-    BGM:   -4.5dB vocal pocket @700-2500Hz -> -23.0 LUFS base -> -5.0dB sidechain duck (150ms/400ms, makeup=1.0) -> -28.0 LUFS under speech
+- Broadcast Tactile Sound Design Chain (Cinema v8 / JSON v3.0.0, 100% permissive FFmpeg filters — ZERO GPL pedalboard):
+    Voice: highpass=80Hz -> +2dB warmth @120Hz -> +3dB presence @4.5kHz -> 2:1 gentle comp (-18dB) -> -14.0 LUFS
+    BGM:   -4.5dB vocal pocket @700-2500Hz -> -23.0 LUFS base -> -5.0dB sidechain duck -> smooth 35ms/60ms PI drops
+    Room:  Continuous dark atmospheric room_tone_bed.wav at -31 dBFS underneath the mix (zero digital dropout!)
+    SFX:   -4.5dB vocal pocket @700-3500Hz + mild -4dB voice-sidechain ducking during active speech
     Master: Linear -14.0 LUFS calibration + 192kHz True-Peak limiter <= -1.0 dBTP (LRA >= 4.5 LU)
 """
 from __future__ import annotations
@@ -17,12 +19,13 @@ import re
 import subprocess
 import wave
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import edge_tts
 import numpy as np
 import onnxruntime as ort
 from scipy import signal
+from scipy.fft import dct as _scipy_dct
 
 from engine.intel_vaapi import run_ffmpeg_safe
 
@@ -378,41 +381,45 @@ def trim_silence_vad(
         keep_mask[start_f:first_act] = True
         keep_mask[last_act + 1 : end_f] = True
 
-        # JSON v3.0.0 pacing_rule: cap internal silences > 0.35s cleanly to 0.32–0.35s
-        if max_internal_pause_s is not None:
-            cap_s = max(0.16, float(max_internal_pause_s))
+        if trim_edges_only:
+            # Genuinely trim ONLY leading and trailing silence: preserve 100% of internal pauses bit-exact untouched!
+            keep_mask[first_act : last_act + 1] = True
         else:
-            cap_s = min(0.35, max(0.16, float(max_pause_s)))
-
-        # Number of kept silence frames so (target_keep_frames * frame_s - xf_s) lands right in 0.32–0.35s
-        # (including ~15-25ms natural syllable tail ramp at real speech boundaries: 10 frames - 12ms = 0.308s core -> ~0.33s acoustic pause)
-        target_keep_frames = max(5, int(round((cap_s + xf_s) / frame_s)))
-        if cap_s >= 0.32:
-            target_keep_frames = 10  # 6 frames tail (192ms) + 4 frames onset (128ms) - 12ms xf -> ~0.32–0.34s acoustic gap!
-
-        # Walk inside [first_act, last_act] preserving all active frames and tightening ONLY gaps > cap_s
-        i = first_act
-        while i <= last_act:
-            if active[i]:
-                keep_mask[i] = True
-                i += 1
-                continue
-            g_start = i
-            while i <= last_act and not active[i]:
-                i += 1
-            g_end = i
-            gap_len = g_end - g_start
-            if gap_len <= target_keep_frames:
-                # Natural micro-pause (<= 0.35s): preserve 100% bit-exact untouched!
-                keep_mask[g_start:g_end] = True
+            # JSON v3.0.0 pacing_rule: cap internal silences > 0.35s cleanly to 0.32–0.35s
+            if max_internal_pause_s is not None:
+                cap_s = max(0.16, float(max_internal_pause_s))
             else:
-                # Cut strictly from the dead center of the pause:
-                # keep >=55% on the left (word/question tail) & remaining on the right (next consonant onset)!
-                min_tail = max(3, int(math.ceil(consonant_pad_s / frame_s)))
-                keep_left = min(target_keep_frames - 2, max(min_tail, int(round(target_keep_frames * 0.55))))
-                keep_right = max(2, target_keep_frames - keep_left)
-                keep_mask[g_start : g_start + keep_left] = True
-                keep_mask[g_end - keep_right : g_end] = True
+                cap_s = min(0.35, max(0.16, float(max_pause_s)))
+
+            # Number of kept silence frames so (target_keep_frames * frame_s - xf_s) lands right in 0.32–0.35s
+            # (including ~15-25ms natural syllable tail ramp at real speech boundaries: 10 frames - 12ms = 0.308s core -> ~0.33s acoustic pause)
+            target_keep_frames = max(5, int(round((cap_s + xf_s) / frame_s)))
+            if cap_s >= 0.32:
+                target_keep_frames = 10  # 6 frames tail (192ms) + 4 frames onset (128ms) - 12ms xf -> ~0.32–0.34s acoustic gap!
+
+            # Walk inside [first_act, last_act] preserving all active frames and tightening ONLY gaps > cap_s
+            i = first_act
+            while i <= last_act:
+                if active[i]:
+                    keep_mask[i] = True
+                    i += 1
+                    continue
+                g_start = i
+                while i <= last_act and not active[i]:
+                    i += 1
+                g_end = i
+                gap_len = g_end - g_start
+                if gap_len <= target_keep_frames:
+                    # Natural micro-pause (<= 0.35s): preserve 100% bit-exact untouched!
+                    keep_mask[g_start:g_end] = True
+                else:
+                    # Cut strictly from the dead center of the pause:
+                    # keep >=55% on the left (word/question tail) & remaining on the right (next consonant onset)!
+                    min_tail = max(3, int(math.ceil(consonant_pad_s / frame_s)))
+                    keep_left = min(target_keep_frames - 2, max(min_tail, int(round(target_keep_frames * 0.55))))
+                    keep_right = max(2, target_keep_frames - keep_left)
+                    keep_mask[g_start : g_start + keep_left] = True
+                    keep_mask[g_end - keep_right : g_end] = True
 
     # Build time remapping table to shift WordBoundary timestamps accurately
     kept_indices = np.where(keep_mask)[0]
@@ -532,62 +539,43 @@ def normalize_scene_wav_lufs(
     wav_path: Path,
     target_lufs: float = -18.0,
     thermal_limit_c: float = 85.0,
+    max_trim_db: float = 3.0,
+    deadband_db: float = 1.5,
 ) -> Path:
-    """Normalize a scene narration WAV in-place to uniform integrated loudness (default -18 LUFS)
-    via atomic temp file + EBU R128 loudnorm (`TP=-2.0:LRA=9`), using 2-pass linear gain when
-    measurable (zero pumping!) with safe single-pass fallback on ultra-short clips.
+    """Apply a gentle bounded linear trim (±3.0 dB max, ±1.5 dB deadband) around `target_lufs`
+    so extreme scene outliers are softly tamed WITHOUT hard-flattening every scene to exact -18.0 LUFS
+    or crushing natural broadcast dynamic range (preserving LRA >= 4.5 LU across acts).
     """
     wav_p = Path(wav_path)
     if not wav_p.exists() or wav_p.stat().st_size <= 44:
         return wav_p
 
-    tmp_wav = wav_p.with_name(f"{wav_p.stem}_lufs_tmp{wav_p.suffix}")
-    af_filter = f"loudnorm=I={target_lufs:.1f}:TP=-2.0:LRA=9,aresample=48000"
+    stats = _measure_audio_lufs(wav_p)
+    if stats is None:
+        return wav_p
 
-    try:
-        # Pass 1: fast loudness measurement for clean linear gain (prevents per-scene pumping)
-        probe = subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-v",
-                "info",
-                "-i",
-                str(wav_p),
-                "-af",
-                f"loudnorm=I={target_lufs:.1f}:TP=-2.0:LRA=9:print_format=json",
-                "-f",
-                "null",
-                "-",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        m_json = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", probe.stderr or "", re.S)
-        if m_json:
-            stats = json.loads(m_json.group(0))
-            mi = float(stats.get("input_i", "-inf"))
-            mtp = float(stats.get("input_tp", "-inf"))
-            mlra = float(stats.get("input_lra", "0.0"))
-            mth = float(stats.get("input_thresh", "-inf"))
-            moff = float(stats.get("target_offset", "0.0"))
-            if (
-                math.isfinite(mi)
-                and math.isfinite(mtp)
-                and math.isfinite(mlra)
-                and math.isfinite(mth)
-                and math.isfinite(moff)
-                and -60.0 <= mi <= 0.0
-            ):
-                af_filter = (
-                    f"loudnorm=I={target_lufs:.1f}:TP=-2.0:LRA=9:"
-                    f"measured_I={mi:.2f}:measured_TP={mtp:.2f}:"
-                    f"measured_LRA={mlra:.2f}:measured_thresh={mth:.2f}:"
-                    f"offset={moff:.2f}:linear=true,aresample=48000"
-                )
-    except Exception:
-        pass
+    mi = float(stats["i"])
+    mtp = float(stats["tp"])
+    raw_delta = float(target_lufs) - mi
+    dband = max(0.0, float(deadband_db))
+    cap_trim = max(0.0, float(max_trim_db))
+
+    # Leave scenes naturally within ±deadband_db completely untouched to preserve narrative LRA!
+    if abs(raw_delta) <= dband or cap_trim <= 0.0:
+        return wav_p
+
+    excess = (raw_delta - dband) if raw_delta > 0.0 else (raw_delta + dband)
+    gain_db = max(-cap_trim, min(cap_trim, excess))
+
+    # Peak safety headroom (-1.5 dBTP ceiling) so linear trim never clips 16-bit PCM
+    if math.isfinite(mtp) and (mtp + gain_db) > -1.5:
+        gain_db = min(gain_db, -1.5 - mtp)
+
+    if abs(gain_db) < 0.15:
+        return wav_p
+
+    tmp_wav = wav_p.with_name(f"{wav_p.stem}_lufs_tmp{wav_p.suffix}")
+    af_filter = f"volume={gain_db:+.2f}dB,aresample=48000"
 
     try:
         run_ffmpeg_safe(
@@ -660,6 +648,266 @@ def _load_wav_16k_float32(wav_path: Path) -> np.ndarray:
     if sr != 16000 and len(pcm) > 0:
         pcm = signal.resample_poly(pcm, 16000, sr).astype(np.float32)
     return pcm.astype(np.float32, copy=False)
+
+
+def _load_audio_16k_float32(audio_path: Path) -> np.ndarray:
+    """Decode WAV (fast native wave reader) or any FFmpeg-readable audio (MP3/M4A) to 16kHz mono float32."""
+    p = Path(audio_path)
+    if not p.exists() or p.stat().st_size <= 44:
+        return np.zeros(0, dtype=np.float32)
+    try:
+        return _load_wav_16k_float32(p)
+    except Exception:
+        res = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(p), "-f", "s16le", "-ac", "1", "-ar", "16000", "-"],
+            capture_output=True,
+            timeout=60,
+        )
+        if not res.stdout:
+            return np.zeros(0, dtype=np.float32)
+        return np.frombuffer(res.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def _build_mel_filterbank(
+    sr: int = 16000,
+    n_fft: int = 1024,
+    n_mels: int = 26,
+    fmin: float = 80.0,
+    fmax: float = 7600.0,
+) -> np.ndarray:
+    """Construct triangular Mel filterbank matrix `(n_mels, n_fft // 2 + 1)` using pure NumPy."""
+    def _hz_to_mel(f: float) -> float:
+        return 2595.0 * math.log10(1.0 + f / 700.0)
+
+    def _mel_to_hz(m: np.ndarray) -> np.ndarray:
+        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    hi_hz = min(float(fmax), sr * 0.49)
+    mel_pts = np.linspace(_hz_to_mel(float(fmin)), _hz_to_mel(hi_hz), n_mels + 2)
+    hz_pts = _mel_to_hz(mel_pts)
+    bins = np.floor((n_fft + 1) * hz_pts / float(sr)).astype(int)
+    bins = np.clip(bins, 0, n_fft // 2)
+
+    fb = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float64)
+    for m in range(1, n_mels + 1):
+        f_left, f_center, f_right = int(bins[m - 1]), int(bins[m]), int(bins[m + 1])
+        if f_center > f_left:
+            fb[m - 1, f_left:f_center] = (np.arange(f_left, f_center) - f_left) / float(f_center - f_left)
+        if f_right > f_center:
+            fb[m - 1, f_center:f_right] = (f_right - np.arange(f_center, f_right)) / float(f_right - f_center)
+    return fb
+
+
+def _extract_speech_acoustic_signature(
+    audio_16k: np.ndarray,
+    sr: int = 16000,
+) -> Optional[Dict[str, Any]]:
+    """Extract speech-only F0 median (FFT-YIN CMNDF), spectral centroid (Hz), and MFCC[1..12]
+    purely via NumPy + SciPy for fast pre-render speaker-consistency QC.
+    """
+    frame_len = 640  # 40ms @ 16kHz (covers >= 2.4 periods down to 60 Hz)
+    hop = 256        # 16ms hop
+    if len(audio_16k) < frame_len:
+        return None
+
+    n_frames = 1 + (len(audio_16k) - frame_len) // hop
+    if n_frames <= 0:
+        return None
+
+    idx = np.arange(frame_len)[None, :] + (np.arange(n_frames) * hop)[:, None]
+    frames = audio_16k[idx].astype(np.float64)
+    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    peak_rms = float(np.percentile(rms, 95))
+    if peak_rms < 1e-4:
+        return None
+
+    active_mask = rms >= max(0.008, peak_rms * 0.14)
+    act = frames[active_mask]
+    if len(act) < 3:
+        return None
+
+    # 1. Speech-only F0 estimation via vectorized FFT-YIN CMNDF (60 Hz .. 320 Hz)
+    w_len = 320
+    lag_min = max(1, int(sr / 320.0))  # 50
+    lag_max = min(frame_len - w_len - 2, int(sr / 60.0))  # 266
+    xc = act - np.mean(act, axis=1, keepdims=True)
+    n_fft_yin = 1024
+    f_all = np.fft.rfft(xc, n=n_fft_yin, axis=1)
+    f_w = np.fft.rfft(xc[:, :w_len], n=n_fft_yin, axis=1)
+    r_tau = np.fft.irfft(f_all * np.conj(f_w), n=n_fft_yin, axis=1)[:, : lag_max + 2]
+
+    cs = np.concatenate([np.zeros((len(xc), 1), dtype=np.float64), np.cumsum(xc ** 2, axis=1)], axis=1)
+    e0 = cs[:, w_len : w_len + 1]
+    taus = np.arange(lag_max + 2)
+    e_tau = cs[:, taus + w_len] - cs[:, taus]
+    diff = np.maximum(0.0, e0 + e_tau - 2.0 * r_tau)
+    diff[:, 0] = 0.0
+    cum_diff = np.cumsum(diff[:, 1:], axis=1)
+    cmndf = np.ones_like(diff)
+    cmndf[:, 1:] = diff[:, 1:] * np.arange(1, lag_max + 2)[None, :] / (cum_diff + 1e-12)
+
+    f0_vals: List[float] = []
+    for row in cmndf:
+        seg = row[lag_min : lag_max + 1]
+        below = np.where(seg < 0.20)[0]
+        tau_rel: Optional[int] = None
+        if len(below) > 0:
+            t0 = int(below[0])
+            while t0 + 1 < len(seg) and seg[t0 + 1] < seg[t0]:
+                t0 += 1
+            tau_rel = t0
+        else:
+            tmin = int(np.argmin(seg))
+            if seg[tmin] < 0.28:
+                tau_rel = tmin
+        if tau_rel is not None:
+            tau = lag_min + tau_rel
+            if 1 <= tau < lag_max:
+                y0, y1, y2 = float(row[tau - 1]), float(row[tau]), float(row[tau + 1])
+                denom = y0 - 2.0 * y1 + y2
+                shift = (0.5 * (y0 - y2) / denom) if abs(denom) > 1e-12 else 0.0
+                tau_ref = tau + max(-0.5, min(0.5, shift))
+            else:
+                tau_ref = float(tau)
+            f0 = sr / max(1.0, tau_ref)
+            if 60.0 <= f0 <= 320.0:
+                f0_vals.append(f0)
+
+    # 2. Speech-only Spectral Centroid (Hz) & MFCC[1..12]
+    n_fft = 1024
+    win = np.hanning(frame_len)[None, :]
+    spec = np.abs(np.fft.rfft(xc * win, n=n_fft, axis=1))
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / float(sr))
+    cent_frames = np.sum(spec * freqs[None, :], axis=1) / (np.sum(spec, axis=1) + 1e-12)
+
+    mel_fb = _build_mel_filterbank(sr=sr, n_fft=n_fft, n_mels=26, fmin=80.0, fmax=7600.0)
+    pow_spec = (spec ** 2) / float(n_fft)
+    mel_energy = np.dot(pow_spec, mel_fb.T)
+    log_mel = np.log(mel_energy + 1e-10)
+    mfcc_frames = _scipy_dct(log_mel, type=2, axis=1, norm="ortho")[:, 1:13]
+    mfcc_vec = np.mean(mfcc_frames, axis=0)
+
+    return {
+        "f0_median_hz": round(float(np.median(f0_vals)), 2) if f0_vals else 0.0,
+        "spectral_centroid_hz": round(float(np.median(cent_frames)), 2),
+        "mfcc_1_12": [round(float(x), 4) for x in mfcc_vec],
+        "voiced_frames": len(f0_vals),
+        "active_frames": int(len(act)),
+    }
+
+
+def validate_speaker_consistency(
+    scene_wavs: Sequence[Union[Path, str]],
+    f0_tol_hz: float = 11.0,
+    mfcc_l2_tol: float = 2.8,
+) -> Dict[str, Any]:
+    """Speaker-Consistency Acoustic QC Gate across all synthesized documentary scene WAVs.
+
+    Computes per-scene speech-only `F0_median` (Hz), `spectral_centroid` (Hz), and `MFCC[1..12]`
+    L2 distance against the job median, flagging any speaker/model/persona outlier (such as
+    accidental Edge-TTS fallback, cross-model drift, or breathy ASMR whisper drift) BEFORE video render.
+    """
+    paths = [Path(p) for p in (scene_wavs or [])]
+    if not paths:
+        return {
+            "passed": True,
+            "median_f0_hz": 0.0,
+            "median_centroid_hz": 0.0,
+            "median_mfcc": [],
+            "f0_tol_hz": float(f0_tol_hz),
+            "mfcc_l2_tol": float(mfcc_l2_tol),
+            "outliers": [],
+            "per_scene": [],
+        }
+
+    raw_feats: List[Optional[Dict[str, Any]]] = []
+    for p in paths:
+        try:
+            audio_16k = _load_audio_16k_float32(p)
+            feat = _extract_speech_acoustic_signature(audio_16k, sr=16000)
+        except Exception:
+            feat = None
+        raw_feats.append(feat)
+
+    valid_f0s = [f["f0_median_hz"] for f in raw_feats if f is not None and f["f0_median_hz"] > 0.0]
+    valid_cents = [f["spectral_centroid_hz"] for f in raw_feats if f is not None]
+    valid_mfccs = [np.asarray(f["mfcc_1_12"], dtype=np.float64) for f in raw_feats if f is not None]
+
+    median_f0 = round(float(np.median(valid_f0s)), 2) if valid_f0s else 0.0
+    median_cent = round(float(np.median(valid_cents)), 2) if valid_cents else 0.0
+    median_mfcc_arr = np.median(np.vstack(valid_mfccs), axis=0) if valid_mfccs else np.zeros(12, dtype=np.float64)
+
+    outliers: List[int] = []
+    per_scene: List[Dict[str, Any]] = []
+    eff_f0_tol = max(1.0, float(f0_tol_hz))
+    eff_mfcc_tol = max(0.1, float(mfcc_l2_tol))
+
+    for idx_s, (p, feat) in enumerate(zip(paths, raw_feats)):
+        reasons: List[str] = []
+        if feat is None:
+            reasons.append("missing_or_silent")
+            if len(paths) > 1 or valid_mfccs:
+                outliers.append(idx_s)
+            per_scene.append(
+                {
+                    "scene_idx": idx_s,
+                    "path": str(p),
+                    "f0_median_hz": 0.0,
+                    "delta_f0_hz": 0.0,
+                    "spectral_centroid_hz": 0.0,
+                    "mfcc_1_12": [],
+                    "mfcc_l2_dist": 0.0,
+                    "voiced_frames": 0,
+                    "active_frames": 0,
+                    "is_outlier": idx_s in outliers,
+                    "reasons": reasons,
+                }
+            )
+            continue
+
+        f0_hz = float(feat["f0_median_hz"])
+        delta_f0 = round(f0_hz - median_f0, 2) if (f0_hz > 0.0 and median_f0 > 0.0) else 0.0
+        mfcc_arr = np.asarray(feat["mfcc_1_12"], dtype=np.float64)
+        mfcc_l2 = round(float(np.linalg.norm(mfcc_arr - median_mfcc_arr)), 3) if valid_mfccs else 0.0
+
+        if len(paths) > 1:
+            if median_f0 > 0.0 and f0_hz > 0.0 and abs(delta_f0) > eff_f0_tol:
+                reasons.append(f"f0_drift({delta_f0:+.1f}Hz)")
+            elif median_f0 > 0.0 and feat["voiced_frames"] < 3:
+                reasons.append("unvoiced_or_whisper")
+            if mfcc_l2 > eff_mfcc_tol:
+                reasons.append(f"mfcc_drift(L2={mfcc_l2:.2f})")
+
+        is_out = bool(reasons)
+        if is_out:
+            outliers.append(idx_s)
+
+        per_scene.append(
+            {
+                "scene_idx": idx_s,
+                "path": str(p),
+                "f0_median_hz": f0_hz,
+                "delta_f0_hz": delta_f0,
+                "spectral_centroid_hz": float(feat["spectral_centroid_hz"]),
+                "mfcc_1_12": feat["mfcc_1_12"],
+                "mfcc_l2_dist": mfcc_l2,
+                "voiced_frames": int(feat["voiced_frames"]),
+                "active_frames": int(feat["active_frames"]),
+                "is_outlier": is_out,
+                "reasons": reasons,
+            }
+        )
+
+    return {
+        "passed": len(outliers) == 0,
+        "median_f0_hz": median_f0,
+        "median_centroid_hz": median_cent,
+        "median_mfcc": [round(float(x), 4) for x in median_mfcc_arr.tolist()] if valid_mfccs else [],
+        "f0_tol_hz": eff_f0_tol,
+        "mfcc_l2_tol": eff_mfcc_tol,
+        "outliers": outliers,
+        "per_scene": per_scene,
+    }
 
 
 _PT_NUM_UNITS: Dict[str, int] = {
@@ -1442,6 +1690,64 @@ def _detect_last_speech_end_s(audio_path: Path, fallback_s: float) -> float:
         return fb
 
 
+def _measure_audio_rms_dbfs(audio_path: Path, fallback_dbfs: float = -26.0) -> float:
+    """Measure wideband RMS level in dBFS for a short WAV/audio bed (e.g. room_tone_bed.wav)."""
+    p = Path(audio_path)
+    if not p.exists() or p.stat().st_size <= 44:
+        return float(fallback_dbfs)
+    try:
+        with wave.open(str(p), "rb") as wf:
+            pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float64) / 32768.0
+        if pcm.size < 64:
+            return float(fallback_dbfs)
+        rms = float(np.sqrt(np.mean(pcm * pcm) + 1e-12))
+        if rms <= 1e-9:
+            return float(fallback_dbfs)
+        return max(-60.0, min(0.0, 20.0 * math.log10(rms)))
+    except Exception:
+        try:
+            arr = _load_audio_16k_float32(p)
+            if arr.size < 64:
+                return float(fallback_dbfs)
+            rms = float(np.sqrt(np.mean(arr.astype(np.float64) ** 2) + 1e-12))
+            if rms <= 1e-9:
+                return float(fallback_dbfs)
+            return max(-60.0, min(0.0, 20.0 * math.log10(rms)))
+        except Exception:
+            return float(fallback_dbfs)
+
+
+def _build_smooth_pi_volume_filters(
+    valid_pi_times: Sequence[float],
+    final_dur: float,
+    pi_dur_s: float = 1.25,
+    fade_out_s: float = 0.035,
+    fade_in_s: float = 0.060,
+) -> List[str]:
+    """Build smooth per-PI FFmpeg linear ramp volume filters (35ms fade-out / 60ms fade-in)
+    replacing harsh 0ms square-wave digital mutes.
+    """
+    filters: List[str] = []
+    for t0_raw in valid_pi_times:
+        t0 = max(0.0, float(t0_raw))
+        t_end = min(float(final_dur), t0 + float(pi_dur_s))
+        span = t_end - t0
+        if span < 0.08:
+            continue
+        fo = max(0.005, min(float(fade_out_s), span * 0.35))
+        fi = max(0.005, min(float(fade_in_s), span * 0.45))
+        t_fo_end = t0 + fo
+        t_fi_start = max(t_fo_end, t_end - fi)
+        expr = (
+            f"if(lt(t,{t_fo_end:.4f}),({t_fo_end:.4f}-t)/{fo:.4f},"
+            f"if(gt(t,{t_fi_start:.4f}),(t-{t_fi_start:.4f})/{fi:.4f},0))"
+        )
+        filters.append(
+            f"volume=volume='{expr}':eval=frame:enable='between(t,{t0:.4f},{t_end:.4f})'"
+        )
+    return filters
+
+
 def master_broadcast_audio(
     voice_wav: Path,
     music_mp3: Optional[Path],
@@ -1455,20 +1761,29 @@ def master_broadcast_audio(
     abrupt_ending_cut: bool = False,
     music_bed_db: float = -23.0,
     music_auto_ducking_db: float = -5.0,
+    room_tone_bed_path: Optional[Union[Path, str]] = None,
+    room_tone_bed_dbfs: float = -31.0,
 ) -> Tuple[Path, float]:
-    """Apply JSON v3.0.0 `tactile_sound_design_engine` Broadcast Mastering Chain:
+    """Apply Cinema v8 / JSON v3.0.0 `tactile_sound_design_engine` Broadcast Mastering Chain:
     - Track 1 Voiceover (`-14.0 LUFS`):
       `highpass=f=80` -> `+2.0 dB` warmth @ `120 Hz` -> `+3.0 dB` presence @ `4.5 kHz` ->
-      3:1 compression (`attack=12ms`, `release=140ms`) -> exact linear `-14.0 LUFS` calibration.
+      gentle 2.0:1 compression (`threshold=-18dB`, `attack=12ms`, `release=140ms`, `makeup=1.0`) ->
+      exact linear `-14.0 LUFS` calibration (preserving natural LRA >= 4.5 LU!).
     - Track 2 Music Bed (`-23.0 LUFS` un-ducked in pauses -> `-28.0 LUFS` under speech, `+14 dB` Voice-to-BGM SNR!):
       `-4.5 dB` vocal-pocket carve (`700–2500 Hz`) -> calibrated to `music_bed_db` (`-23.0 LUFS`) ->
       `-5.0 dB` sidechain auto-ducking (`attack=150ms`, `release=400ms`, `makeup=1.0`, NEVER > 1.0!) ->
-      optional `1.25s` hard-cut silence gates at every `t_pi` in `pattern_interrupt_times`.
+      smooth `35ms` fade-out / `60ms` fade-in `1.25s` Pattern Interrupt envelopes at `pattern_interrupt_times`.
+    - Track 2b Room Tone Bed (`room_tone_bed.wav`, continuous `-31 dBFS` RMS):
+      Defaults to `assets/sfx/room_tone_bed.wav` when present so Pattern Interrupt silence drops land
+      on dark atmospheric room air instead of digital `-120 dBFS` dropout.
+    - Track 3 Tactile SFX Bus:
+      All SFX cues summed and routed through `-4.5 dB` vocal-pocket EQ (`700–3500 Hz`) + mild
+      voice-sidechain ducking (`-4 dB` during active speech) so foley never masks narrator consonants.
     - Abrupt Ending (`abrupt_ending_cut=True`, `ACT_4_ABRUPT_ENDING`):
       Ends cleanly at `speech_end + 0.50s` with a subtle lingering dark-room vocal reverb decay and
       a `0.15s` hard fade-out to silence.
     - Master Bus (2-pass linear gain + 192kHz True-Peak Limiter):
-      Exact `-14.0 LUFS` integrated, True Peak `<= -1.0 dBTP`, preserving natural dynamic range `LRA >= 4.5 LU`.
+      Exact `-14.0 LUFS` integrated, True Peak `<= -1.0 dBTP` (`alimiter=0.79`), `LRA >= 4.5 LU`.
     Returns `(output_m4a, final_duration_s)`.
     """
     if abrupt_ending_cut:
@@ -1480,13 +1795,13 @@ def master_broadcast_audio(
         final_dur = round(duration_s + tail_pad_s, 3)
         eff_tail_pad = max(0.35, float(tail_pad_s))
 
-    # Exact JSON v3.0.0 track_1_voiceover EQ + compression chain
+    # Gentle Cinema v8 track_1_voiceover EQ + compression chain (ratio=2.0, threshold=-18dB preserves LRA >= 4.5 LU)
     voice_dsp_chain = (
         "aformat=sample_rates=48000:channel_layouts=stereo,"
         "highpass=f=80,"
         "equalizer=f=120:t=q:w=1.1:g=2.0,"
         "equalizer=f=4500:t=q:w=1.2:g=3.0,"
-        "acompressor=threshold=-20dB:ratio=3:attack=12:release=140:makeup=1.5"
+        "acompressor=threshold=-18dB:ratio=2.0:attack=12:release=140:makeup=1.0"
     )
     voice_stats = _measure_audio_lufs(voice_wav, af_chain=voice_dsp_chain)
     voice_cal_db = (
@@ -1495,41 +1810,67 @@ def master_broadcast_audio(
         else 0.0
     )
 
+    has_music = bool(music_mp3 and Path(music_mp3).exists() and float(music_volume) > 0.001)
+    valid_sfx: List[Tuple[Path, float, float]] = [
+        (Path(sfx_path), float(t_s), float(vol))
+        for sfx_path, t_s, vol in (sfx_events or [])
+        if Path(sfx_path).exists() and 0.0 <= float(t_s) <= final_dur
+    ]
+    has_sfx = len(valid_sfx) > 0
+
+    # Resolve optional continuous dark atmospheric room_tone_bed.wav (defaults to assets/sfx/room_tone_bed.wav)
+    resolved_room_tone: Optional[Path] = None
+    if room_tone_bed_path is None:
+        default_rt = ASSETS_DIR / "sfx" / "room_tone_bed.wav"
+        if default_rt.exists() and default_rt.stat().st_size > 44:
+            resolved_room_tone = default_rt
+    elif isinstance(room_tone_bed_path, (Path, str)) and str(room_tone_bed_path).strip():
+        cand_rt = Path(room_tone_bed_path)
+        if cand_rt.exists() and cand_rt.stat().st_size > 44:
+            resolved_room_tone = cand_rt
+
     inputs: List[str] = ["-i", str(voice_wav)]
     use_reverb_tail = bool(abrupt_ending_cut and speech_end >= 0.45)
 
+    voice_splits: List[str] = ["[v_main]"]
+    if use_reverb_tail:
+        voice_splits.append("[v_tail_src]")
+    if has_music:
+        voice_splits.append("[v_sc_bgm]")
+    if has_sfx:
+        voice_splits.append("[v_sc_sfx]")
+
+    voice_base = (
+        f"[0:a]{voice_dsp_chain},volume={voice_cal_db:+.2f}dB,"
+        f"apad=pad_dur={eff_tail_pad:.2f},atrim=0:{final_dur:.3f},asetpts=PTS-STARTPTS"
+    )
+    if len(voice_splits) == 1:
+        filter_parts: List[str] = [f"{voice_base}[v_main]"]
+    else:
+        filter_parts = [f"{voice_base},asplit={len(voice_splits)}{''.join(voice_splits)}"]
+
+    mix_labels: List[str] = ["[v_main]"]
     if use_reverb_tail:
         tail_start = max(0.0, speech_end - 1.35)
         tail_gate_t = max(0.0, speech_end - 0.10)
-        filter_parts: List[str] = [
-            (
-                f"[0:a]{voice_dsp_chain},volume={voice_cal_db:+.2f}dB,"
-                f"apad=pad_dur={eff_tail_pad:.2f},atrim=0:{final_dur:.3f},asetpts=PTS-STARTPTS,"
-                "asplit=3[v_main][v_tail_src][v_sc]"
-            ),
-            (
-                # Time-aligned subtle lingering room reverb tail on the final phrase only (zero PTS shift!)
-                f"[v_tail_src]volume=enable='lt(t,{tail_start:.3f})':volume=0,"
-                "aecho=0.60:0.65:55|115|195|290|395:0.34|0.25|0.18|0.12|0.08,"
-                "highpass=f=180,lowpass=f=2400,"
-                f"volume=enable='lt(t,{tail_gate_t:.3f})':volume=0,"
-                "volume=0.35[v_reverb_tail]"
-            ),
-        ]
-        mix_labels: List[str] = ["[v_main]", "[v_reverb_tail]"]
-    else:
-        filter_parts = [
-            (
-                f"[0:a]{voice_dsp_chain},volume={voice_cal_db:+.2f}dB,"
-                f"apad=pad_dur={eff_tail_pad:.2f},atrim=0:{final_dur:.3f},asetpts=PTS-STARTPTS,"
-                "asplit=2[v_main][v_sc]"
-            )
-        ]
-        mix_labels = ["[v_main]"]
+        filter_parts.append(
+            # Time-aligned subtle lingering room reverb tail on the final phrase only (zero PTS shift!)
+            f"[v_tail_src]volume=enable='lt(t,{tail_start:.3f})':volume=0,"
+            "aecho=0.60:0.65:55|115|195|290|395:0.34|0.25|0.18|0.12|0.08,"
+            "highpass=f=180,lowpass=f=2400,"
+            f"volume=enable='lt(t,{tail_gate_t:.3f})':volume=0,"
+            "volume=0.35[v_reverb_tail]"
+        )
+        mix_labels.append("[v_reverb_tail]")
 
     next_idx = 1
+    if abrupt_ending_cut:
+        fade_out_d = 0.20
+    else:
+        fade_out_d = min(1.20, max(0.35, float(tail_pad_s) * 0.90 if tail_pad_s >= 0.8 else final_dur * 0.12))
+    fade_out_start = max(0.0, final_dur - fade_out_d)
 
-    if music_mp3 and Path(music_mp3).exists() and float(music_volume) > 0.001:
+    if has_music and music_mp3 is not None:
         music_p = Path(music_mp3)
         # Wide -4.5 dB vocal-pocket carve across 700–2500 Hz (geometric center ~1320 Hz, Q=0.75)
         bgm_pocket_eq = (
@@ -1550,13 +1891,6 @@ def master_broadcast_audio(
         bgm_cal_db = max(-32.0, min(12.0, target_bgm_pause_lufs - bgm_measured_i))
 
         inputs.extend(["-stream_loop", "-1", "-i", str(music_p)])
-        if abrupt_ending_cut:
-            fade_out_d = 0.20
-            fade_out_start = max(0.0, final_dur - fade_out_d)
-        else:
-            fade_out_d = min(1.20, max(0.35, float(tail_pad_s) * 0.90 if tail_pad_s >= 0.8 else final_dur * 0.12))
-            fade_out_start = max(0.0, final_dur - fade_out_d)
-
         filter_parts.append(
             f"[{next_idx}:a]atrim=0:{final_dur:.3f},asetpts=PTS-STARTPTS,"
             f"{bgm_pocket_eq},volume={bgm_cal_db:+.2f}dB,"
@@ -1574,41 +1908,75 @@ def master_broadcast_audio(
             for t_pi in (pattern_interrupt_times or [])
             if 0.0 <= float(t_pi) < final_dur
         )
-        if valid_pi:
+        pi_filters = _build_smooth_pi_volume_filters(
+            valid_pi,
+            final_dur=final_dur,
+            pi_dur_s=1.25,
+            fade_out_s=0.035,
+            fade_in_s=0.060,
+        )
+        if pi_filters:
             filter_parts.append(
-                f"[bgm_raw][v_sc]sidechaincompress=threshold={sc_thresh:.3f}:ratio={sc_ratio:.2f}:"
+                f"[bgm_raw][v_sc_bgm]sidechaincompress=threshold={sc_thresh:.3f}:ratio={sc_ratio:.2f}:"
                 "attack=150:release=400:makeup=1.0:knee=2.8:detection=rms[bgm_sc]"
             )
-            pi_filters = [
-                f"volume=enable='between(t,{t0:.3f},{min(final_dur, t0 + 1.25):.3f})':volume=0"
-                for t0 in valid_pi
-            ]
-            filter_parts.append(f"[bgm_sc]{','.join(pi_filters)}[bgm_ducked]")
+            # Fine 64-sample (1.33ms) framing ensures smooth 35ms fade-out / 60ms fade-in PI ramps with zero clicks!
+            filter_parts.append(
+                f"[bgm_sc]asetnsamples=n=64:p=0,{','.join(pi_filters)},asetnsamples=n=1024:p=0[bgm_ducked]"
+            )
         else:
             filter_parts.append(
-                f"[bgm_raw][v_sc]sidechaincompress=threshold={sc_thresh:.3f}:ratio={sc_ratio:.2f}:"
+                f"[bgm_raw][v_sc_bgm]sidechaincompress=threshold={sc_thresh:.3f}:ratio={sc_ratio:.2f}:"
                 "attack=150:release=400:makeup=1.0:knee=2.8:detection=rms[bgm_ducked]"
             )
 
         mix_labels.append("[bgm_ducked]")
         next_idx += 1
-    else:
-        filter_parts.append("[v_sc]anullsink")
 
-    # Timed SFX cues
-    for sfx_path, t_s, vol in sfx_events:
-        if not Path(sfx_path).exists() or t_s < 0 or t_s > final_dur:
-            continue
-        delay_ms = int(round(float(t_s) * 1000.0))
-        inputs.extend(["-i", str(sfx_path)])
-        lbl = f"[sfx{next_idx}]"
+    # Continuous dark atmospheric room_tone_bed.wav at -31 dBFS (NEVER muted on Pattern Interrupts!)
+    if resolved_room_tone is not None:
+        rt_rms_dbfs = _measure_audio_rms_dbfs(resolved_room_tone, fallback_dbfs=-26.0)
+        rt_cal_db = max(-36.0, min(12.0, float(room_tone_bed_dbfs) - rt_rms_dbfs))
+        rt_fade_in = min(0.25, max(0.02, final_dur * 0.1))
+        inputs.extend(["-stream_loop", "-1", "-i", str(resolved_room_tone)])
         filter_parts.append(
-            f"[{next_idx}:a]aresample=48000,aformat=channel_layouts=stereo,"
-            f"volume={float(vol):.3f},adelay={delay_ms}|{delay_ms}[sfx_d{next_idx}];"
-            f"[sfx_d{next_idx}]apad=whole_dur={final_dur:.3f},atrim=0:{final_dur:.3f},asetpts=PTS-STARTPTS{lbl}"
+            f"[{next_idx}:a]atrim=0:{final_dur:.3f},asetpts=PTS-STARTPTS,"
+            f"aformat=sample_rates=48000:channel_layouts=stereo,volume={rt_cal_db:+.2f}dB,"
+            f"afade=t=in:st=0:d={rt_fade_in:.2f},afade=t=out:st={fade_out_start:.3f}:d={fade_out_d:.3f}[room_tone]"
         )
-        mix_labels.append(lbl)
+        mix_labels.append("[room_tone]")
         next_idx += 1
+
+    # Timed SFX cues -> unified SFX Bus with -4.5 dB vocal-pocket EQ (700–3500 Hz) + mild -4 dB voice-sidechain ducking
+    if has_sfx:
+        # Anchor SFX bus duration deterministically via exact-length stereo silence base + adelay=:all=1
+        # (avoids FFmpeg 8.x adelay+apad=whole_dur drop bugs and avoids padding every cue to full video length!)
+        filter_parts.append(f"anullsrc=r=48000:cl=stereo:d={final_dur:.3f}[sfx_base]")
+        sfx_labels: List[str] = ["[sfx_base]"]
+        for sfx_path, t_s, vol in valid_sfx:
+            delay_ms = max(0, int(round(t_s * 1000.0)))
+            inputs.extend(["-i", str(sfx_path)])
+            lbl = f"[sfx{next_idx}]"
+            delay_chain = f",adelay={delay_ms}:all=1" if delay_ms > 0 else ""
+            filter_parts.append(
+                f"[{next_idx}:a]aresample=48000,aformat=channel_layouts=stereo,"
+                f"volume={vol:.3f}{delay_chain}{lbl}"
+            )
+            sfx_labels.append(lbl)
+            next_idx += 1
+
+        filter_parts.append(
+            f"{''.join(sfx_labels)}amix=inputs={len(sfx_labels)}:duration=first:dropout_transition=0:normalize=0,"
+            f"atrim=0:{final_dur:.3f},asetpts=PTS-STARTPTS,"
+            "aformat=sample_rates=48000:channel_layouts=stereo,"
+            "equalizer=f=1565:t=q:w=0.56:g=-4.5[sfx_eq]"
+        )
+        # Mild -4 dB voice-sidechain ducking on active speech so tactile foley never masks consonants
+        filter_parts.append(
+            "[sfx_eq][v_sc_sfx]sidechaincompress=threshold=0.089:ratio=1.95:"
+            "attack=25:release=180:makeup=1.0:knee=2.5:detection=rms[sfx_bus]"
+        )
+        mix_labels.append("[sfx_bus]")
 
     # Pass 1: Sum all stems cleanly into 32-bit float intermediate (infinite headroom, zero premature clipping)
     if len(mix_labels) == 1:

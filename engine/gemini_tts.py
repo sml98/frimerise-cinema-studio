@@ -9,10 +9,11 @@ from __future__ import annotations
 import base64
 import re
 import subprocess
+import threading
 import time
 import wave
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -21,7 +22,16 @@ from engine.intel_vaapi import run_ffmpeg_safe
 
 GEMINI_TTS_MODELS = ("gemini-2.5-flash-preview-tts", "gemini-3.1-flash-tts-preview")
 GEMINI_TTS_MODEL = GEMINI_TTS_MODELS[0]
-GEMINI_TEXT_MODELS = ("gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash")
+GEMINI_TEXT_MODELS = ("gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash")
+
+GEMINI_TTS_DEFAULT_TEMPERATURE = 0.28
+GEMINI_TTS_MIN_INTERVAL_S = 4.5
+GEMINI_TTS_HTTP_TIMEOUT_S = 90.0
+GEMINI_TTS_MAX_ATTEMPTS = 6
+GEMINI_TTS_MAX_BACKOFF_S = 24.0
+
+_TTS_RATE_LOCK = threading.Lock()
+_LAST_TTS_REQUEST_MONOTONIC: float = 0.0
 
 _ROMAN_TO_PT: Dict[str, str] = {
     "I": "um",
@@ -346,111 +356,189 @@ def has_valid_gemini_key() -> Tuple[bool, str]:
     return False, key
 
 
+def _wait_for_tts_rpm_slot(min_interval_s: float = GEMINI_TTS_MIN_INTERVAL_S) -> float:
+    """Proactively pace Gemini TTS REST calls via a module-level timestamp lock to avoid RPM 429 bursts."""
+    global _LAST_TTS_REQUEST_MONOTONIC
+    min_gap = max(0.0, float(min_interval_s))
+    with _TTS_RATE_LOCK:
+        now = time.monotonic()
+        waited = 0.0
+        if min_gap > 0.0 and _LAST_TTS_REQUEST_MONOTONIC > 0.0:
+            elapsed = now - _LAST_TTS_REQUEST_MONOTONIC
+            if elapsed < min_gap:
+                waited = min_gap - elapsed
+                time.sleep(waited)
+        _LAST_TTS_REQUEST_MONOTONIC = time.monotonic()
+        return waited
+
+
 def _compute_backoff_s(attempt: int, status_code: Optional[int] = None, retry_after: Optional[str] = None) -> float:
-    """Compute bounded exponential backoff delay (respecting Retry-After header on HTTP 429/503)."""
+    """Compute bounded exponential backoff delay up to 24s (respecting Retry-After header on HTTP 429/503)."""
     if retry_after:
         try:
             ra = float(str(retry_after).strip())
             if ra > 0.0:
-                return min(15.0, max(0.5, ra))
+                return min(GEMINI_TTS_MAX_BACKOFF_S, max(0.5, ra))
         except Exception:
             pass
-    base = 1.5 if status_code == 429 else 1.0
-    return min(12.0, base * (2 ** max(0, attempt)))
+    base = 2.0 if status_code in (429, 503) else 1.5
+    return min(GEMINI_TTS_MAX_BACKOFF_S, base * (2 ** max(0, attempt)))
+
+
+def _resolve_candidate_tts_models(
+    pinned_model: Optional[str] = None,
+    allowed_models: Optional[Sequence[str]] = None,
+) -> Tuple[str, ...]:
+    """Resolve the ordered Gemini TTS model list. When `pinned_model` is set, NEVER failover to another model."""
+    if pinned_model is not None and str(pinned_model).strip():
+        return (str(pinned_model).strip(),)
+    if allowed_models is not None:
+        cleaned = tuple(str(m).strip() for m in allowed_models if str(m).strip())
+        if cleaned:
+            return cleaned
+    return GEMINI_TTS_MODELS
 
 
 # ---------------------------------------------------------------------------
-# Expressive Punctuation, True Interrogative Prosody & 5-Act Voice Direction
+# Expressive Punctuation, True Interrogative Prosody & Immutable Narrator Lock
 # ---------------------------------------------------------------------------
 _ELLIPSIS_TOKEN = "\uE001"
 _DOT_TOKEN = "\uE002"
 
+NARRATOR_IDENTITY_LOCK_PT = (
+    "IMMUTABLE VOICE LOCK — Same single Brazilian Portuguese documentary narrator across all scenes: "
+    "calm, grounded, resonant studio baritone at steady conversational projection — NEVER whisper, "
+    "NEVER breathy ASMR, NEVER shout, and NEVER switch to fast TV-news style."
+)
+NARRATOR_IDENTITY_LOCK_EN = (
+    "IMMUTABLE VOICE LOCK — Same single American English documentary narrator across all scenes: "
+    "calm, grounded, resonant studio baritone at steady conversational projection — NEVER whisper, "
+    "NEVER breathy ASMR, NEVER shout, and NEVER switch to fast TV-news style."
+)
+NARRATOR_IDENTITY_LOCK_ES = (
+    "IMMUTABLE VOICE LOCK — Same single Latin American Spanish documentary narrator across all scenes: "
+    "calm, grounded, resonant studio baritone at steady conversational projection — NEVER whisper, "
+    "NEVER breathy ASMR, NEVER shout, and NEVER switch to fast TV-news style."
+)
+
+_NARRATOR_IDENTITY_LOCK_HEADERS: Dict[str, str] = {
+    "pt": NARRATOR_IDENTITY_LOCK_PT,
+    "en": NARRATOR_IDENTITY_LOCK_EN,
+    "es": NARRATOR_IDENTITY_LOCK_ES,
+}
+
 _ACT_DIRECTION_PROFILES: Dict[str, Dict[str, str]] = {
     "ACT_0_COLD_OPEN_HOOK": {
         "pt": (
-            "ACT 0 — COLD OPEN HOOK: Urgent, gripping investigative documentary hook in natural Brazilian Portuguese "
-            "(~150-160 WPM). Deliver sharp, deliberate suspense pauses before shocking contradictions, build dark intrigue "
-            "from the very first syllable, and land any closing question with a provocative rising interrogative inflection."
+            f"{NARRATOR_IDENTITY_LOCK_PT} "
+            "ACT 0 — COLD OPEN HOOK: Maintain the exact same studio baritone voice and pitch register with only "
+            "a subtle +4% focused opening pace (~143 WPM), crisp articulation on the central historical paradox, "
+            "and steady authoritative intrigue."
         ),
         "en": (
-            "ACT 0 — COLD OPEN HOOK: Urgent, gripping investigative documentary hook in natural American English "
-            "(~150-160 WPM). Deliver sharp, deliberate suspense pauses before shocking contradictions, build dark intrigue "
-            "from the very first syllable, and land any closing question with a provocative rising interrogative inflection."
+            f"{NARRATOR_IDENTITY_LOCK_EN} "
+            "ACT 0 — COLD OPEN HOOK: Maintain the exact same studio baritone voice and pitch register with only "
+            "a subtle +4% focused opening pace (~143 WPM), crisp articulation on the central historical paradox, "
+            "and steady authoritative intrigue."
         ),
         "es": (
-            "ACT 0 — COLD OPEN HOOK: Urgent, gripping investigative documentary hook in neutral Latin American Spanish "
-            "(~150-160 WPM). Deliver sharp suspense pauses before shocking contradictions and land any closing question "
-            "with a provocative rising interrogative inflection."
+            f"{NARRATOR_IDENTITY_LOCK_ES} "
+            "ACT 0 — COLD OPEN HOOK: Maintain the exact same studio baritone voice and pitch register with only "
+            "a subtle +4% focused opening pace (~143 WPM), crisp articulation on the central historical paradox, "
+            "and steady authoritative intrigue."
         ),
     },
     "ACT_1_WORLD_BUILDING": {
         "pt": (
-            "ACT 1 — HISTORICAL WORLD BUILDING: Atmospheric, immersive historical chronicler in Super Histórico / "
-            "H2 History documentary style (natural Brazilian Portuguese, ~135-145 WPM). Deep vocal resonance, rich "
-            "baritone gravitas, vivid historical immersion, and unhurried authority that transports the listener into the era."
+            f"{NARRATOR_IDENTITY_LOCK_PT} "
+            "ACT 1 — HISTORICAL WORLD BUILDING: Maintain the exact same studio baritone voice and pitch register "
+            "at steady baseline documentary pace (~138 WPM), clear resonant authority, and unhurried historical clarity."
         ),
         "en": (
-            "ACT 1 — HISTORICAL WORLD BUILDING: Atmospheric, immersive historical chronicler in prestige History Channel "
-            "/ Netflix documentary style (~135-145 WPM). Deep vocal resonance, baritone gravitas, and vivid authority."
+            f"{NARRATOR_IDENTITY_LOCK_EN} "
+            "ACT 1 — HISTORICAL WORLD BUILDING: Maintain the exact same studio baritone voice and pitch register "
+            "at steady baseline documentary pace (~138 WPM), clear resonant authority, and unhurried historical clarity."
         ),
         "es": (
-            "ACT 1 — HISTORICAL WORLD BUILDING: Atmospheric, immersive historical chronicler in prestige documentary "
-            "style (~135-145 WPM). Deep vocal resonance, baritone gravitas, and vivid historical authority."
+            f"{NARRATOR_IDENTITY_LOCK_ES} "
+            "ACT 1 — HISTORICAL WORLD BUILDING: Maintain the exact same studio baritone voice and pitch register "
+            "at steady baseline documentary pace (~138 WPM), clear resonant authority, and unhurried historical clarity."
         ),
     },
     "ACT_2_DEEP_MECHANICS": {
         "pt": (
-            "ACT 2 — DEEP MECHANICS & FORENSIC INVESTIGATION: Forensic, tense investigative pacing in natural Brazilian "
-            "Portuguese (~142-152 WPM). Articulate secret mechanisms, historical dates, decrees, and hidden causal links "
-            "with crisp analytical emphasis and mounting investigative pressure."
+            f"{NARRATOR_IDENTITY_LOCK_PT} "
+            "ACT 2 — DEEP MECHANICS & FORENSIC INVESTIGATION: Maintain the exact same studio baritone voice and "
+            "pitch register with only a subtle +2% analytical pace (~141 WPM), articulating historical dates, "
+            "decrees, and causal links with measured precision."
         ),
         "en": (
-            "ACT 2 — DEEP MECHANICS & FORENSIC INVESTIGATION: Forensic, tense investigative pacing (~142-152 WPM). "
-            "Emphasize secret mechanisms, historical dates, forbidden decrees, and hidden causal links with sharp clarity."
+            f"{NARRATOR_IDENTITY_LOCK_EN} "
+            "ACT 2 — DEEP MECHANICS & FORENSIC INVESTIGATION: Maintain the exact same studio baritone voice and "
+            "pitch register with only a subtle +2% analytical pace (~141 WPM), articulating historical dates, "
+            "decrees, and causal links with measured precision."
         ),
         "es": (
-            "ACT 2 — DEEP MECHANICS & FORENSIC INVESTIGATION: Forensic, tense investigative pacing (~142-152 WPM). "
-            "Emphasize secret mechanisms, historical dates, and forbidden decrees with sharp investigative clarity."
+            f"{NARRATOR_IDENTITY_LOCK_ES} "
+            "ACT 2 — DEEP MECHANICS & FORENSIC INVESTIGATION: Maintain the exact same studio baritone voice and "
+            "pitch register with only a subtle +2% analytical pace (~141 WPM), articulating historical dates, "
+            "decrees, and causal links with measured precision."
         ),
     },
     "ACT_3_CLIMAX_REVELATION": {
         "pt": (
-            "ACT 3 — CLIMAX & DRAMATIC REVELATION: High-stakes dramatic revelation and intense narrative momentum in "
-            "natural Brazilian Portuguese (~148-158 WPM). Escalate vocal intensity and emotional urgency on turning points, "
-            "letting pivotal reveals strike with unmistakable cinematic weight."
+            f"{NARRATOR_IDENTITY_LOCK_PT} "
+            "ACT 3 — CLIMAX & REVELATION: Maintain the exact same studio baritone voice and pitch register with "
+            "only a subtle +5% forward momentum (~145 WPM) and grounded dramatic weight on historical turning points."
         ),
         "en": (
-            "ACT 3 — CLIMAX & DRAMATIC REVELATION: High-stakes dramatic revelation and intense narrative momentum "
-            "(~148-158 WPM). Escalate vocal intensity on turning points so pivotal historical reveals strike with cinematic weight."
+            f"{NARRATOR_IDENTITY_LOCK_EN} "
+            "ACT 3 — CLIMAX & REVELATION: Maintain the exact same studio baritone voice and pitch register with "
+            "only a subtle +5% forward momentum (~145 WPM) and grounded dramatic weight on historical turning points."
         ),
         "es": (
-            "ACT 3 — CLIMAX & DRAMATIC REVELATION: High-stakes dramatic revelation and intense narrative momentum "
-            "(~148-158 WPM). Escalate vocal intensity on turning points so pivotal reveals strike with cinematic weight."
+            f"{NARRATOR_IDENTITY_LOCK_ES} "
+            "ACT 3 — CLIMAX & REVELATION: Maintain the exact same studio baritone voice and pitch register with "
+            "only a subtle +5% forward momentum (~145 WPM) and grounded dramatic weight on historical turning points."
         ),
     },
     "ACT_4_ABRUPT_ENDING": {
         "pt": (
-            "ACT 4 — PHILOSOPHICAL RESOLUTION & ABRUPT ENDING: Slower (~110 WPM), deeply philosophical, intimate, and "
-            "haunting final reflection in natural Brazilian Portuguese. Lower your vocal cadence, give every clause room "
-            "to breathe, and land the final question or thesis with lingering emotional weight and stark finality."
+            f"{NARRATOR_IDENTITY_LOCK_PT} "
+            "ACT 4 — FINAL SYNTHESIS & RESOLUTION: Maintain the exact same studio baritone voice and full "
+            "conversational projection with only a subtle -6% reflective pace (~130 WPM), giving the closing "
+            "thesis or question poised documentary weight and clear finality."
         ),
         "en": (
-            "ACT 4 — PHILOSOPHICAL RESOLUTION & ABRUPT ENDING: Slower (~110 WPM), deeply philosophical, intimate, and "
-            "haunting final reflection. Lower vocal cadence, give every clause room to breathe, and land the final "
-            "question or thesis with lingering emotional weight and stark finality."
+            f"{NARRATOR_IDENTITY_LOCK_EN} "
+            "ACT 4 — FINAL SYNTHESIS & RESOLUTION: Maintain the exact same studio baritone voice and full "
+            "conversational projection with only a subtle -6% reflective pace (~130 WPM), giving the closing "
+            "thesis or question poised documentary weight and clear finality."
         ),
         "es": (
-            "ACT 4 — PHILOSOPHICAL RESOLUTION & ABRUPT ENDING: Slower (~110 WPM), deeply philosophical, intimate, and "
-            "haunting final reflection. Land the final question or thesis with lingering emotional weight and stark finality."
+            f"{NARRATOR_IDENTITY_LOCK_ES} "
+            "ACT 4 — FINAL SYNTHESIS & RESOLUTION: Maintain the exact same studio baritone voice and full "
+            "conversational projection with only a subtle -6% reflective pace (~130 WPM), giving the closing "
+            "thesis or question poised documentary weight and clear finality."
         ),
     },
 }
 
 _MOOD_TONE_OVERLAYS: Dict[str, str] = {
-    "dark_horror": "Vocal color: dark gothic suspense, hushed dread, magnetic low-baritone timber (A24 / Netflix dark documentary).",
-    "investigative_crime": "Vocal color: grounded forensic true-crime tension, crisp journalistic authority, coiled suspense.",
-    "epic_history": "Vocal color: sweeping prestige cinema historian, noble resonance, dramatic emotional gravitas.",
-    "corporate_thriller": "Vocal color: sharp investigative financial thriller (MagnatesMedia style), razor-crisp precision on numbers and twists.",
+    "dark_horror": (
+        "Subtle tonal nuance: serious dark-documentary gravity with steady full-voice studio baritone projection "
+        "(keep timbre consistent — zero breathy whisper or vocal fry)."
+    ),
+    "investigative_crime": (
+        "Subtle tonal nuance: grounded forensic documentary authority with steady studio baritone projection "
+        "and crisp journalistic clarity."
+    ),
+    "epic_history": (
+        "Subtle tonal nuance: dignified prestige cinema historian authority with steady resonant baritone projection."
+    ),
+    "corporate_thriller": (
+        "Subtle tonal nuance: calm investigative financial documentary precision with steady studio baritone projection."
+    ),
 }
 
 
@@ -501,13 +589,24 @@ def extract_interrogative_sentences(text: str) -> List[str]:
     return questions
 
 
+def _build_question_prosody_clause(interrogative_sentences: List[str]) -> str:
+    quoted_qs = " | ".join(f'"{q}"' for q in interrogative_sentences)
+    return (
+        "CRITICAL QUESTION PROSODY: The sentence(s) ending in '?' MUST be spoken with a "
+        "clear upward rising interrogative pitch inflection on the final tonic syllable before '?' "
+        "— NEVER flatten a question '?' into a falling declarative period. Hold a 0.30s deliberate pause "
+        "right before the final question phrase while maintaining steady full-voice baritone projection. "
+        f"Exact question sentence(s) to inflect interrogatively: {quoted_qs}."
+    )
+
+
 def build_punctuation_prosody_direction(
     clean_text: str,
     raw_text: str = "",
     lang: str = "pt_br",
 ) -> str:
     """Inspect punctuation & sentence structure and build an expressive prosody direction block
-    guaranteeing genuine interrogative pitch contours on '?' and theatrical pacing on ':', '—', '...'.
+    guaranteeing genuine upward rising interrogative inflection on '?' and steady documentary pacing on ':', '—', '...'.
     """
     src_text = clean_text or raw_text or ""
     combined_raw = f"{raw_text} {clean_text}"
@@ -518,27 +617,21 @@ def build_punctuation_prosody_direction(
     blocks: List[str] = []
 
     if interrogative_sentences:
-        quoted_qs = " | ".join(f'"{q}"' for q in interrogative_sentences)
-        blocks.append(
-            "CRITICAL QUESTION PROSODY: The sentence(s) ending in '?' MUST be spoken with a genuine, deep, "
-            "suspenseful INTERROGATIVE rising-falling pitch contour of doubt and provocation — NEVER flatten a "
-            "question '?' into a normal affirmative statement period. Hold a 0.35s dramatic pause right before "
-            f"the final question phrase. Exact question sentence(s) to inflect interrogatively: {quoted_qs}."
-        )
+        blocks.append(_build_question_prosody_clause(interrogative_sentences))
 
     has_dramatic_punct = any(tok in combined_raw for tok in (":", "—", "–", "...", "…"))
     blocks.append(
-        "Honor every comma (0.18s micro-pause), colon/dash (0.30s dramatic reveal pause before the key fact), "
-        "and period (0.35s resonant weight) with deep theatrical authority (Super Histórico / H2 History narrator style)."
+        "Honor every comma (0.18s micro-pause), colon/dash (0.28s deliberate pause before the key fact), "
+        "and period (0.32s grounded pause) with consistent studio documentary authority."
     )
     if has_dramatic_punct:
         blocks.append(
-            "Pause deliberately on every colon (:), em-dash (—), and ellipsis (...) so the key historical reveal "
-            "lands with palpable suspense and vocal depth."
+            "Pause cleanly on every colon (:), em-dash (—), and ellipsis (...) so the key historical detail "
+            "lands clearly without dropping into a whisper."
         )
     if "!" in src_text:
         blocks.append(
-            "Deliver exclamation sentences with controlled dramatic gravitas and resonant chest emphasis, never cartoonish shouting."
+            "Deliver exclamation sentences with grounded chest emphasis and steady projection, never shouting."
         )
 
     return " ".join(blocks)
@@ -550,9 +643,9 @@ def build_act_acting_direction(
     lang: str = "pt_br",
     text: str = "",
 ) -> str:
-    """Return a tailored Gemini TTS acting direction for any of the 5 documentary acts
-    (`ACT_0_COLD_OPEN_HOOK` through `ACT_4_ABRUPT_ENDING`), enriched with mood color and
-    punctuation/interrogative prosody rules when `text` is provided.
+    """Return a consistent Gemini TTS acting direction anchored to the Immutable Narrator Identity Lock
+    for any of the 5 documentary acts (`ACT_0_COLD_OPEN_HOOK` through `ACT_4_ABRUPT_ENDING`),
+    enriched with subtle mood nuance and punctuation/interrogative prosody rules when `text` is provided.
     """
     canonical_act = _normalize_act_id(act_id)
     lang_low = str(lang or "pt_br").strip().lower()
@@ -568,8 +661,8 @@ def build_act_acting_direction(
         parts.append(build_punctuation_prosody_direction(clean_t, raw_text=text, lang=lang))
     else:
         parts.append(
-            "Honor every comma (0.18s micro-pause), colon/dash (0.30s dramatic reveal pause before the key fact), "
-            "and period (0.35s resonant weight) with deep theatrical authority (Super Histórico / H2 History narrator style)."
+            "Honor every comma (0.18s micro-pause), colon/dash (0.28s deliberate pause before the key fact), "
+            "and period (0.32s grounded pause) with consistent studio documentary authority."
         )
     return " ".join(parts)
 
@@ -594,13 +687,7 @@ def build_gemini_tts_prompt(
     elif has_punct_block and "?" in clean_text and not has_q_block:
         # Caller had base punctuation rule (without text) — inject only the missing question prosody block!
         qs = extract_interrogative_sentences(clean_text) or extract_interrogative_sentences(text)
-        quoted_qs = " | ".join(f'"{q}"' for q in qs)
-        q_only = (
-            "CRITICAL QUESTION PROSODY: The sentence(s) ending in '?' MUST be spoken with a genuine, deep, "
-            "suspenseful INTERROGATIVE rising-falling pitch contour of doubt and provocation — NEVER flatten a "
-            "question '?' into a normal affirmative statement period. Hold a 0.35s dramatic pause right before "
-            f"the final question phrase. Exact question sentence(s) to inflect interrogatively: {quoted_qs}."
-        )
+        q_only = _build_question_prosody_clause(qs) if qs else ""
         enriched_direction = f"{base_dir} {q_only}".strip()
     else:
         enriched_direction = f"{base_dir} {prosody_block}".strip() if base_dir else prosody_block
@@ -614,7 +701,7 @@ def build_gemini_tts_prompt(
     return prompt, clean_text, enriched_direction
 
 
-def synthesize_gemini_tts_line(
+def synthesize_gemini_tts_line_with_meta(
     text: str,
     out_wav: Path,
     voice_name: str = "Puck",
@@ -622,60 +709,107 @@ def synthesize_gemini_tts_line(
     api_key: Optional[str] = None,
     lang: str = "pt_br",
     thermal_limit_c: float = 85.0,
-) -> Tuple[Path, float]:
-    """Synthesize a single expressive speech line using Google Gemini Native TTS (x-goog-api-key)."""
+    pinned_model: Optional[str] = None,
+    allowed_models: Optional[Sequence[str]] = None,
+    temperature: Optional[float] = GEMINI_TTS_DEFAULT_TEMPERATURE,
+    min_interval_s: float = GEMINI_TTS_MIN_INTERVAL_S,
+    timeout_s: float = GEMINI_TTS_HTTP_TIMEOUT_S,
+    max_attempts: int = GEMINI_TTS_MAX_ATTEMPTS,
+) -> Tuple[Path, float, str]:
+    """Synthesize a single expressive speech line using Google Gemini Native TTS (x-goog-api-key)
+    and return `(out_wav, dur_s, used_model)`.
+
+    - When `pinned_model` is set, NEVER silently fails over to another model in `GEMINI_TTS_MODELS`.
+    - Proactively paces requests (`min_interval_s = 4.5s`) via a module-level timestamp lock.
+    - Uses `90.0s` HTTP timeout, `max_attempts = 6`, retries empty `audio_b64` responses, and
+      applies exponential backoff up to `24.0s` on HTTP 429/503.
+    - Passes `"temperature": 0.28` in `generationConfig` and automatically strips it once seamlessly
+      if the REST endpoint rejects `temperature` with HTTP 400.
+    """
     key = (api_key or get_settings().get("gemini_api_key") or "").strip()
     if not key:
         raise RuntimeError("Chave Gemini API não configurada.")
 
     prompt, _, _ = build_gemini_tts_prompt(text=text, acting_direction=acting_direction, lang=lang)
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {
-                "voiceConfig": {
-                    "prebuiltVoiceConfig": {
-                        "voiceName": voice_name,
-                    }
-                }
-            },
-        },
-    }
+    candidate_models = _resolve_candidate_tts_models(pinned_model=pinned_model, allowed_models=allowed_models)
     headers = {"Content-Type": "application/json", "x-goog-api-key": key}
     last_err = "Gemini TTS indisponível"
-    max_attempts = 4
+    eff_max_attempts = max(1, int(max_attempts))
+    eff_timeout_s = max(10.0, float(timeout_s))
+    out_wav = Path(out_wav)
 
-    for model_id in GEMINI_TTS_MODELS:
+    for model_id in candidate_models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
-        for attempt in range(max_attempts):
+        use_temperature = temperature is not None
+        temp_stripped = False
+        attempt = 0
+
+        while attempt < eff_max_attempts:
+            gen_cfg: Dict[str, Any] = {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {
+                        "prebuiltVoiceConfig": {
+                            "voiceName": voice_name,
+                        }
+                    }
+                },
+            }
+            if use_temperature and temperature is not None:
+                gen_cfg["temperature"] = float(temperature)
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": gen_cfg,
+            }
+
             try:
-                r = httpx.post(url, json=payload, headers=headers, timeout=45.0)
+                _wait_for_tts_rpm_slot(min_interval_s=min_interval_s)
+                r = httpx.post(url, json=payload, headers=headers, timeout=eff_timeout_s)
+
+                if (
+                    r.status_code == 400
+                    and use_temperature
+                    and not temp_stripped
+                    and "temperature" in (r.text or "").lower()
+                ):
+                    use_temperature = False
+                    temp_stripped = True
+                    continue
+
                 if r.status_code in (429, 500, 502, 503):
                     last_err = f"Gemini TTS ({model_id}) HTTP {r.status_code}: {r.text[:160]}"
-                    if attempt < max_attempts - 1:
+                    if attempt < eff_max_attempts - 1:
                         wait_s = _compute_backoff_s(
                             attempt,
                             status_code=r.status_code,
                             retry_after=r.headers.get("Retry-After") if hasattr(r, "headers") else None,
                         )
                         time.sleep(wait_s)
+                        attempt += 1
                         continue
                     break
+
                 if r.status_code != 200:
                     last_err = f"Gemini TTS ({model_id}) HTTP {r.status_code}: {r.text[:160]}"
                     break
 
                 j = r.json()
-                parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                cands = j.get("candidates") or []
+                first_cand = cands[0] if isinstance(cands, list) and cands else {}
+                parts = (first_cand.get("content") or {}).get("parts") or []
                 audio_b64 = ""
                 for p in parts:
                     idata = p.get("inlineData") or p.get("inline_data")
                     if idata and idata.get("data"):
                         audio_b64 = idata["data"]
                         break
+
                 if not audio_b64:
                     last_err = f"Gemini TTS ({model_id}) retornou resposta sem áudio."
+                    if attempt < eff_max_attempts - 1:
+                        time.sleep(_compute_backoff_s(attempt, status_code=503))
+                        attempt += 1
+                        continue
                     break
 
                 pcm = base64.b64decode(audio_b64)
@@ -685,15 +819,50 @@ def synthesize_gemini_tts_line(
                 pt = int(meta.get("promptTokenCount", 40))
                 ct = int(meta.get("candidatesTokenCount", 120))
                 record_token_usage("gemini-tts", model_id, pt, ct, 0, round((pt * 0.5 + ct * 10.0) / 1_000_000.0, 5))
-                return out_wav, dur_s
+                return out_wav, dur_s, model_id
             except Exception as exc:
                 last_err = str(exc)
-                if attempt < max_attempts - 1:
+                if attempt < eff_max_attempts - 1:
                     time.sleep(_compute_backoff_s(attempt))
+                    attempt += 1
                     continue
                 break
 
     raise RuntimeError(last_err)
+
+
+def synthesize_gemini_tts_line(
+    text: str,
+    out_wav: Path,
+    voice_name: str = "Puck",
+    acting_direction: str = "Read aloud in Brazilian Portuguese with expressive, natural voice acting.",
+    api_key: Optional[str] = None,
+    lang: str = "pt_br",
+    thermal_limit_c: float = 85.0,
+    pinned_model: Optional[str] = None,
+    allowed_models: Optional[Sequence[str]] = None,
+    temperature: Optional[float] = GEMINI_TTS_DEFAULT_TEMPERATURE,
+    min_interval_s: float = GEMINI_TTS_MIN_INTERVAL_S,
+    timeout_s: float = GEMINI_TTS_HTTP_TIMEOUT_S,
+    max_attempts: int = GEMINI_TTS_MAX_ATTEMPTS,
+) -> Tuple[Path, float]:
+    """Synthesize a single expressive speech line using Google Gemini Native TTS (x-goog-api-key)."""
+    wav_p, dur_s, _ = synthesize_gemini_tts_line_with_meta(
+        text=text,
+        out_wav=out_wav,
+        voice_name=voice_name,
+        acting_direction=acting_direction,
+        api_key=api_key,
+        lang=lang,
+        thermal_limit_c=thermal_limit_c,
+        pinned_model=pinned_model,
+        allowed_models=allowed_models,
+        temperature=temperature,
+        min_interval_s=min_interval_s,
+        timeout_s=timeout_s,
+        max_attempts=max_attempts,
+    )
+    return wav_p, dur_s
 
 
 def synthesize_gemini_multispeaker_dialogue(
@@ -702,6 +871,12 @@ def synthesize_gemini_multispeaker_dialogue(
     out_wav: Path,
     direction: str = "TTS the following conversation in Brazilian Portuguese with comic, expressive voice acting:",
     api_key: Optional[str] = None,
+    pinned_model: Optional[str] = None,
+    allowed_models: Optional[Sequence[str]] = None,
+    temperature: Optional[float] = GEMINI_TTS_DEFAULT_TEMPERATURE,
+    min_interval_s: float = GEMINI_TTS_MIN_INTERVAL_S,
+    timeout_s: float = GEMINI_TTS_HTTP_TIMEOUT_S,
+    max_attempts: int = GEMINI_TTS_MAX_ATTEMPTS,
 ) -> Tuple[Path, float]:
     """Synthesize an entire multi-character conversation in ONE API call using multiSpeakerVoiceConfig."""
     key = (api_key or get_settings().get("gemini_api_key") or "").strip()
@@ -718,29 +893,52 @@ def synthesize_gemini_multispeaker_dialogue(
         for sp_name, v_name in speaker_voices.items()
     ]
 
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "responseModalities": ["AUDIO"],
-            "speechConfig": {
-                "multiSpeakerVoiceConfig": {
-                    "speakerVoiceConfigs": speaker_cfgs,
-                }
-            },
-        },
-    }
+    candidate_models = _resolve_candidate_tts_models(pinned_model=pinned_model, allowed_models=allowed_models)
     headers = {"Content-Type": "application/json", "x-goog-api-key": key}
     last_err = "Gemini Multi-Speaker TTS indisponível"
-    max_attempts = 4
+    eff_max_attempts = max(1, int(max_attempts))
+    eff_timeout_s = max(10.0, float(timeout_s))
+    out_wav = Path(out_wav)
 
-    for model_id in GEMINI_TTS_MODELS:
+    for model_id in candidate_models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
-        for attempt in range(max_attempts):
+        use_temperature = temperature is not None
+        temp_stripped = False
+        attempt = 0
+
+        while attempt < eff_max_attempts:
+            gen_cfg: Dict[str, Any] = {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "multiSpeakerVoiceConfig": {
+                        "speakerVoiceConfigs": speaker_cfgs,
+                    }
+                },
+            }
+            if use_temperature and temperature is not None:
+                gen_cfg["temperature"] = float(temperature)
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": gen_cfg,
+            }
+
             try:
-                r = httpx.post(url, json=payload, headers=headers, timeout=60.0)
+                _wait_for_tts_rpm_slot(min_interval_s=min_interval_s)
+                r = httpx.post(url, json=payload, headers=headers, timeout=eff_timeout_s)
+
+                if (
+                    r.status_code == 400
+                    and use_temperature
+                    and not temp_stripped
+                    and "temperature" in (r.text or "").lower()
+                ):
+                    use_temperature = False
+                    temp_stripped = True
+                    continue
+
                 if r.status_code in (429, 500, 502, 503):
                     last_err = f"Gemini Multi-Speaker TTS ({model_id}) HTTP {r.status_code}: {r.text[:160]}"
-                    if attempt < max_attempts - 1:
+                    if attempt < eff_max_attempts - 1:
                         time.sleep(
                             _compute_backoff_s(
                                 attempt,
@@ -748,6 +946,7 @@ def synthesize_gemini_multispeaker_dialogue(
                                 retry_after=r.headers.get("Retry-After") if hasattr(r, "headers") else None,
                             )
                         )
+                        attempt += 1
                         continue
                     break
                 if r.status_code != 200:
@@ -755,7 +954,9 @@ def synthesize_gemini_multispeaker_dialogue(
                     break
 
                 j = r.json()
-                parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                cands = j.get("candidates") or []
+                first_cand = cands[0] if isinstance(cands, list) and cands else {}
+                parts = (first_cand.get("content") or {}).get("parts") or []
                 audio_b64 = ""
                 for p in parts:
                     idata = p.get("inlineData") or p.get("inline_data")
@@ -764,6 +965,10 @@ def synthesize_gemini_multispeaker_dialogue(
                         break
                 if not audio_b64:
                     last_err = f"Gemini Multi-Speaker TTS ({model_id}) sem áudio."
+                    if attempt < eff_max_attempts - 1:
+                        time.sleep(_compute_backoff_s(attempt, status_code=503))
+                        attempt += 1
+                        continue
                     break
 
                 pcm = base64.b64decode(audio_b64)
@@ -775,8 +980,9 @@ def synthesize_gemini_multispeaker_dialogue(
                 return out_wav, dur_s
             except Exception as exc:
                 last_err = str(exc)
-                if attempt < max_attempts - 1:
+                if attempt < eff_max_attempts - 1:
                     time.sleep(_compute_backoff_s(attempt))
+                    attempt += 1
                     continue
                 break
 

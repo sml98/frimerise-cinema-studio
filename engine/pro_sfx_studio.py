@@ -33,7 +33,7 @@ SFX_DIR = ASSETS_DIR / "sfx"
 MUSIC_DIR = ASSETS_DIR / "music"
 
 SR = 48000
-PRO_SFX_VERSION = "pro_cinema_sfx_v7_tactile"
+PRO_SFX_VERSION = "pro_cinema_sfx_v8_organic"
 VERSION_STAMP_FILE = SFX_DIR / ".pro_cinema_sfx_version.json"
 
 ALL_SFX_NAMES: Tuple[str, ...] = (
@@ -524,93 +524,92 @@ def synth_whoosh_fast() -> np.ndarray:
 
 
 def synth_whoosh_deep() -> np.ndarray:
-    """Deep dark cinema transition swoosh (wide stereo L->R sweeping noise + massive Doppler sub swell)."""
+    """Organic dark cinema transition swoosh (warm <=2600 Hz, Q<=1.2 sweeping air + Doppler sub swell)."""
     rng = _rng(5001)
-    dur = 1.18
-    n = int(dur * SR)
+    dur = 1.05
+    n = int(round(dur * SR))
     t = np.arange(n, dtype=np.float64) / SR
-    peak_t = 0.48
+    peak_t = 0.42
 
     env = np.where(
         t < peak_t,
-        np.exp(-((t - peak_t) / 0.21) ** 2),
-        np.exp(-((t - peak_t) / 0.34) ** 2),
+        np.exp(-((t - peak_t) / 0.19) ** 2),
+        np.exp(-((t - peak_t) / 0.30) ** 2),
     )
 
-    f_low_band = 110.0 + 1350.0 * (env ** 1.25)
-    f_mid_band = 380.0 + 2400.0 * (env ** 1.55)
-    n1 = _pink_noise(n, rng) * 0.7 + _brown_noise(n, rng) * 0.5
+    # Organic low/mid dark air bands strictly <= 2600 Hz and Q <= 1.2 (zero metallic/white-noise hiss!)
+    f_low_band = 95.0 + 880.0 * (env ** 1.25)
+    f_mid_band = 260.0 + 1480.0 * (env ** 1.45)
+    n1 = _pink_noise(n, rng) * 0.65 + _brown_noise(n, rng) * 0.55
     n2 = _pink_noise(n, rng)
 
-    sw_low = _resonant_filter_sweep(n1, f_low_band, q_curve=1.7, mode="bandpass") * env
-    sw_mid = _resonant_filter_sweep(n2, f_mid_band, q_curve=2.1, mode="bandpass") * (env ** 1.3) * 0.60
+    sw_low = _resonant_filter_sweep(n1, f_low_band, q_curve=1.05, mode="bandpass") * env
+    sw_mid = _resonant_filter_sweep(n2, f_mid_band, q_curve=1.15, mode="bandpass") * (env ** 1.3) * 0.48
 
     # Deep LFE cinema pressure wave
-    f_sub = 34.0 + 62.0 * env
-    sub = _soft_saturate(np.sin(2.0 * math.pi * np.cumsum(f_sub) / SR) * (env ** 1.15), drive=1.9) * 0.90
+    f_sub = 34.0 + 54.0 * env
+    sub = _soft_saturate(np.sin(2.0 * math.pi * np.cumsum(f_sub) / SR) * (env ** 1.15), drive=1.55) * 0.92
 
-    pan_curve = np.tanh((t - peak_t) * 3.8) * 0.85
-    dry = _stereo_pan(sw_low * 1.1 + sw_mid, pan_curve) + _stereo_pan(sub, pan_curve * 0.45)
+    pan_curve = np.tanh((t - peak_t) * 3.6) * 0.78
+    dry = _stereo_pan(sw_low * 1.05 + sw_mid, pan_curve) + _stereo_pan(sub, pan_curve * 0.40)
 
-    wet = _dark_hall_reverb(dry, decay_s=1.25, predelay_ms=14.0, damp_hz=2400.0, mix=0.38, seed=5002)
-    return _master_stereo(wet, target_peak_db=-0.8, fade_in_ms=12.0, fade_out_ms=60.0, bus_drive=1.40)
+    wet = _dark_hall_reverb(dry, decay_s=1.05, predelay_ms=12.0, damp_hz=1800.0, mix=0.30, seed=5002)
+    wet = _butter(wet, 2400.0, "lowpass", order=3)
+    return _master_stereo(wet, target_peak_db=-1.0, fade_in_ms=14.0, fade_out_ms=65.0, bus_drive=1.18)
 
 
 def synth_riser_tension() -> np.ndarray:
-    """2.5s psychological thriller tension riser (rising filtered noise + Shepard harmonic swell + sharp cutoff)."""
+    """Short (0.95s) warm low-passed sub-swell (< 1100 Hz) for subtle chapter tension (zero dissonant Shepard siren)."""
     rng = _rng(6001)
-    build_s = 2.48
-    tail_s = 0.14
-    dur = build_s + tail_s
-    n = int(dur * SR)
-    nb = int(build_s * SR)
+    build_s = 0.87
+    tail_s = 0.08
+    dur = build_s + tail_s  # exact 0.95s
+    n = int(round(dur * SR))
+    nb = int(round(build_s * SR))
     t = np.arange(n, dtype=np.float64) / SR
     prog = np.clip(t / build_s, 0.0, 1.0)
 
-    # Sharp breathless cutoff right at 2.48s
+    # Smooth breath release right at 0.87s (zero click, zero bleed over speech)
     gate = np.ones(n, dtype=np.float64)
-    cut_fade = int(0.012 * SR)
-    gate[nb - cut_fade : nb] = np.linspace(1.0, 0.0, cut_fade)
+    cut_fade = max(32, int(round(0.028 * SR)))
+    gate[nb - cut_fade : nb] = 0.5 * (1.0 + np.cos(np.linspace(0.0, math.pi, cut_fade)))
     gate[nb:] = 0.0
 
-    # Accelerating exponential energy curve
-    rise_env = (0.08 + 0.92 * (prog ** 2.15)) * gate
+    # Smooth warm swell curve
+    rise_env = (0.06 + 0.94 * (prog ** 1.85)) * gate
 
-    # 1. Rising resonant noise sweep (180Hz -> 6800Hz, Q tightening 1.4 -> 5.2)
-    f_noise = 180.0 * ((6800.0 / 180.0) ** (prog ** 1.45))
-    q_noise = 1.4 + 3.8 * (prog ** 1.8)
-    n_l = _resonant_filter_sweep(_pink_noise(n, rng), f_noise, q_noise, mode="bandpass")
-    n_r = _resonant_filter_sweep(_pink_noise(n, rng), f_noise * 1.03, q_noise, mode="bandpass")
+    # 1. Warm sub-bass pressure swell (36 Hz -> 74 Hz + gentle octave warmth)
+    f_sub = 36.0 + 38.0 * (prog ** 1.35)
+    ph_sub = 2.0 * math.pi * np.cumsum(f_sub) / SR
+    sub_core = np.sin(ph_sub) + 0.28 * np.sin(2.0 * ph_sub + 0.2)
+    sub_warm = _butter(_soft_saturate(sub_core, drive=1.45, asym=0.04), 240.0, "lowpass", order=3)
 
-    # 2. Shepard-like overlapping eerie rising harmonic tones (dissonant thriller cluster)
-    shep_l = np.zeros(n, dtype=np.float64)
-    shep_r = np.zeros(n, dtype=np.float64)
-    base_octaves = [55.0, 110.0, 220.0, 440.0]
-    for idx, f0 in enumerate(base_octaves):
-        # Rise 1.5 octaves smoothly; bell-shaped spectral window over frequency
-        f_inst = f0 * (2.0 ** (1.65 * (prog ** 1.35)))
-        # Spectral bell centered near 320Hz
-        bell = np.exp(-0.5 * ((np.log2(f_inst / 320.0)) / 1.45) ** 2)
-        ph_l = 2.0 * math.pi * np.cumsum(f_inst) / SR
-        ph_r = 2.0 * math.pi * np.cumsum(f_inst * 1.006) / SR  # eerie stereo beating
-        # Minor-second tension harmonic near climax
-        f_tens = f_inst * 1.05946
-        ph_t = 2.0 * math.pi * np.cumsum(f_tens) / SR
-        shep_l += (np.sin(ph_l) + 0.45 * np.sin(2.0 * ph_l) + 0.30 * prog * np.sin(ph_t)) * bell
-        shep_r += (np.sin(ph_r) + 0.45 * np.sin(2.0 * ph_r) + 0.30 * prog * np.sin(ph_t + 0.7)) * bell
+    # 2. Muted low cello/horn open-fifth breath (D2 73.42 Hz + A2 110.0 Hz, zero minor-2nd dissonance!)
+    f_d2 = 73.42 * (1.0 + 0.025 * prog)
+    f_a2 = 110.00 * (1.0 + 0.025 * prog)
+    cello_l = (
+        0.55 * np.sin(2.0 * math.pi * np.cumsum(f_d2 * 0.998) / SR)
+        + 0.32 * np.sin(2.0 * math.pi * np.cumsum(f_a2 * 1.002) / SR)
+    )
+    cello_r = (
+        0.55 * np.sin(2.0 * math.pi * np.cumsum(f_d2 * 1.002) / SR + 0.3)
+        + 0.32 * np.sin(2.0 * math.pi * np.cumsum(f_a2 * 0.998) / SR + 0.6)
+    )
+    cello_l = _butter(cello_l, 420.0, "lowpass", order=3)
+    cello_r = _butter(cello_r, 420.0, "lowpass", order=3)
 
-    # 3. Accelerating psychological pulse tremor (3Hz -> 16Hz)
-    pulse_f = 3.0 + 13.0 * (prog ** 1.8)
-    trem = 0.72 + 0.28 * np.sin(2.0 * math.pi * np.cumsum(pulse_f) / SR)
-    sub_swell = np.sin(2.0 * math.pi * np.cumsum(42.0 + 46.0 * prog) / SR) * (prog ** 1.7) * 0.65
+    # 3. Warm dark air breath sweep strictly < 850 Hz, Q = 1.0
+    f_air = 110.0 + 640.0 * (prog ** 1.3)
+    air_l = _resonant_filter_sweep(_brown_noise(n, rng) * 0.65 + _pink_noise(n, rng) * 0.35, f_air, q_curve=1.0, mode="bandpass")
+    air_r = _resonant_filter_sweep(_brown_noise(n, rng) * 0.65 + _pink_noise(n, rng) * 0.35, f_air * 1.02, q_curve=1.0, mode="bandpass")
 
     dry = np.column_stack([
-        _soft_saturate((n_l * 0.75 + shep_l * 0.42 + sub_swell) * rise_env * trem, drive=1.9),
-        _soft_saturate((n_r * 0.75 + shep_r * 0.42 + sub_swell) * rise_env * trem, drive=1.9),
+        (sub_warm * 0.95 + cello_l * 0.42 + air_l * 0.48) * rise_env,
+        (sub_warm * 0.95 + cello_r * 0.42 + air_r * 0.48) * rise_env,
     ])
-    # Short room tail so the sharp cutoff still feels dramatic & airy
-    wet = _dark_hall_reverb(dry, decay_s=0.45, predelay_ms=10.0, damp_hz=3400.0, mix=0.22, seed=6002)
-    return _master_stereo(wet, target_peak_db=-0.7, fade_in_ms=25.0, fade_out_ms=25.0, bus_drive=1.40)
+    wet = _dark_hall_reverb(dry, decay_s=0.35, predelay_ms=8.0, damp_hz=850.0, mix=0.18, seed=6002)
+    wet = _butter(wet, 980.0, "lowpass", order=4)
+    return _master_stereo(wet, target_peak_db=-1.2, fade_in_ms=24.0, fade_out_ms=32.0, bus_drive=1.15)
 
 
 def synth_paper_flip() -> np.ndarray:
@@ -869,7 +868,7 @@ def synth_ui_click() -> np.ndarray:
 # 6 JSON v3.0.0 Tactile Mixed-Media Foley & Documentary SFX (48kHz Stereo)
 # ---------------------------------------------------------------------------
 def synth_marker_highlight_stroke() -> np.ndarray:
-    """Organic felt-tip brush marker stroke on archival paper (0.38s) for #FFD700 highlighter wipes (-12dB)."""
+    """Organic soft felt-tip brush stroke on archival paper (0.38s, <=2600 Hz, Q<=1.2, zero harsh hiss)."""
     rng = _rng(16001)
     dur = 0.38
     n = int(round(dur * SR))
@@ -879,37 +878,33 @@ def synth_marker_highlight_stroke() -> np.ndarray:
     dt_touch = np.maximum(0.0, t - 0.008)
     m_touch = (t >= 0.008).astype(np.float64)
     nib_touch = m_touch * (
-        _butter(_pink_noise(n, rng), (240.0, 1450.0), "bandpass", order=2) * np.exp(-dt_touch / 0.016) * 0.72
-        + np.sin(2.0 * math.pi * 310.0 * dt_touch) * np.exp(-dt_touch / 0.012) * 0.35
+        _butter(_pink_noise(n, rng), (180.0, 950.0), "bandpass", order=2) * np.exp(-dt_touch / 0.016) * 0.68
+        + np.sin(2.0 * math.pi * 240.0 * dt_touch) * np.exp(-dt_touch / 0.014) * 0.32
     )
 
-    # 2. Continuous felt-tip fiber friction sweep across paper tooth (0.018s -> 0.345s)
+    # 2. Continuous warm felt-tip fiber friction glide across parchment (strictly <= 2600 Hz, Q <= 1.2)
     prog = np.clip((t - 0.018) / 0.325, 0.0, 1.0)
-    stroke_win = np.where((t >= 0.018) & (t <= 0.345), np.sin(math.pi * prog) ** 0.68, 0.0)
-    # Organic paper grain micro-irregularity
+    stroke_win = np.where((t >= 0.018) & (t <= 0.345), np.sin(math.pi * prog) ** 0.72, 0.0)
     grain_mod = (
-        0.74
-        + 0.16 * np.sin(2.0 * math.pi * 54.0 * t + 1.3 * np.sin(2.0 * math.pi * 13.0 * t))
-        + 0.10 * np.sin(2.0 * math.pi * 118.0 * t)
+        0.78
+        + 0.14 * np.sin(2.0 * math.pi * 46.0 * t + 1.1 * np.sin(2.0 * math.pi * 11.0 * t))
+        + 0.08 * np.sin(2.0 * math.pi * 92.0 * t)
     )
-    f_brush = 1350.0 + 1650.0 * np.sin(math.pi * (prog ** 0.85))
-    brush_body = _resonant_filter_sweep(_pink_noise(n, rng), f_brush, q_curve=2.3, mode="bandpass") * stroke_win * grain_mod * 1.25
-    paper_tooth = _butter(_white_noise(n, rng), (2800.0, 7900.0), "bandpass", order=2) * stroke_win * grain_mod * 0.62
+    f_brush = 520.0 + 980.0 * np.sin(math.pi * (prog ** 0.85))
+    brush_body = _resonant_filter_sweep(_pink_noise(n, rng), f_brush, q_curve=1.10, mode="bandpass") * stroke_win * grain_mod * 1.15
+    paper_tooth = _butter(_pink_noise(n, rng), (850.0, 2300.0), "bandpass", order=2) * stroke_win * grain_mod * 0.42
 
-    # 3. Subtle warm wet-felt resonance whisper (never piercing)
-    f_felt = 2150.0 + 420.0 * prog
-    felt_whisp = np.sin(2.0 * math.pi * np.cumsum(f_felt) / SR) * stroke_win * grain_mod * 0.055
-
-    # 4. Crisp nib lift at end of highlight (0.325s)
+    # 3. Soft nib lift at end of highlight (0.322s, warm pink texture <= 2100 Hz)
     dt_lift = np.maximum(0.0, t - 0.322)
     m_lift = (t >= 0.322).astype(np.float64)
-    nib_lift = m_lift * _butter(_white_noise(n, rng), (1800.0, 6200.0), "bandpass", order=2) * np.exp(-dt_lift / 0.012) * 0.38
+    nib_lift = m_lift * _butter(_pink_noise(n, rng), (680.0, 2100.0), "bandpass", order=2) * np.exp(-dt_lift / 0.014) * 0.28
 
     # Left -> Right spatial glide matching visual #FFD700 wipe direction
-    pan = -0.52 + 1.04 * prog
-    dry = _stereo_pan(nib_touch + brush_body + paper_tooth + felt_whisp + nib_lift, pan)
-    wet = _dark_hall_reverb(dry, decay_s=0.24, predelay_ms=4.0, damp_hz=4200.0, mix=0.11, seed=16002)
-    return _master_stereo(wet, target_peak_db=-1.0, fade_in_ms=2.0, fade_out_ms=18.0, bus_drive=1.35)
+    pan = -0.48 + 0.96 * prog
+    dry = _stereo_pan(nib_touch + brush_body + paper_tooth + nib_lift, pan)
+    wet = _dark_hall_reverb(dry, decay_s=0.22, predelay_ms=4.0, damp_hz=2000.0, mix=0.10, seed=16002)
+    wet = _butter(wet, 2400.0, "lowpass", order=3)
+    return _master_stereo(wet, target_peak_db=-1.2, fade_in_ms=2.5, fade_out_ms=20.0, bus_drive=1.18)
 
 
 def synth_vector_draw_tick() -> np.ndarray:
@@ -950,40 +945,41 @@ def synth_vector_draw_tick() -> np.ndarray:
 
 
 def synth_pip_card_slide() -> np.ndarray:
-    """Crisp archival paper slide + low velvety air whoosh (0.48s) for Video-over-Video PiP card entrances (-13dB)."""
+    """Organic archival parchment card slide + warm velvety air whoosh (0.48s, <=2600 Hz, Q<=1.2)."""
     rng = _rng(18001)
     dur = 0.48
     n = int(round(dur * SR))
     t = np.arange(n, dtype=np.float64) / SR
     peak_t = 0.20
 
-    # 1. Low velvety air whoosh envelope
+    # 1. Low velvety air whoosh envelope (Q <= 1.2, warm <= 1000 Hz)
     env_air = np.where(
         t < peak_t,
         np.exp(-((t - peak_t) / 0.095) ** 2),
         np.exp(-((t - peak_t) / 0.145) ** 2),
     )
-    f_velvet = 145.0 + 1020.0 * (env_air ** 1.25)
-    velvet_air = _resonant_filter_sweep(_pink_noise(n, rng), f_velvet, q_curve=1.45, mode="bandpass") * env_air * 1.15
-    sub_glide = np.sin(2.0 * math.pi * np.cumsum(54.0 + 62.0 * env_air) / SR) * (env_air ** 1.3) * 0.48
+    f_velvet = 120.0 + 780.0 * (env_air ** 1.20)
+    velvet_air = _resonant_filter_sweep(_pink_noise(n, rng) * 0.70 + _brown_noise(n, rng) * 0.40, f_velvet, q_curve=1.10, mode="bandpass") * env_air * 1.10
+    sub_glide = np.sin(2.0 * math.pi * np.cumsum(50.0 + 48.0 * env_air) / SR) * (env_air ** 1.3) * 0.46
 
-    # 2. Crisp archival heavy-stock card friction glide (0.04s -> 0.36s)
+    # 2. Warm archival heavy-stock card friction glide (0.04s -> 0.35s, strictly <= 2400 Hz pink noise)
     c_prog = np.clip((t - 0.04) / 0.31, 0.0, 1.0)
-    card_win = np.where((t >= 0.04) & (t <= 0.35), np.sin(math.pi * c_prog) ** 0.75, 0.0)
-    card_satin = _butter(_white_noise(n, rng), (1400.0, 5800.0), "bandpass", order=2) * card_win * 0.65
-    card_body = _butter(_pink_noise(n, rng), (380.0, 1400.0), "bandpass", order=2) * card_win * 0.58
+    card_win = np.where((t >= 0.04) & (t <= 0.35), np.sin(math.pi * c_prog) ** 0.78, 0.0)
+    card_satin = _butter(_pink_noise(n, rng), (650.0, 2200.0), "bandpass", order=2) * card_win * 0.48
+    card_body = _butter(_pink_noise(n, rng), (240.0, 1050.0), "bandpass", order=2) * card_win * 0.56
 
-    # 3. Tactile settled paper-card landing thud (t = 0.33s)
+    # 3. Tactile muted paper-card landing thud (t = 0.33s)
     dt_land = np.maximum(0.0, t - 0.330)
     m_land = (t >= 0.330).astype(np.float64)
-    f_land = 92.0 + 115.0 * np.exp(-dt_land / 0.014)
-    land_thud = m_land * np.sin(2.0 * math.pi * np.cumsum(f_land * m_land) / SR) * np.exp(-dt_land / 0.036) * 0.52
-    land_snap = m_land * _butter(_white_noise(n, rng), (1100.0, 4400.0), "bandpass", order=2) * np.exp(-dt_land / 0.011) * 0.36
+    f_land = 82.0 + 95.0 * np.exp(-dt_land / 0.015)
+    land_thud = m_land * np.sin(2.0 * math.pi * np.cumsum(f_land * m_land) / SR) * np.exp(-dt_land / 0.038) * 0.52
+    land_snap = m_land * _butter(_pink_noise(n, rng), (480.0, 2050.0), "bandpass", order=2) * np.exp(-dt_land / 0.012) * 0.26
 
-    pan_slide = np.clip(-0.58 + 0.82 * (t / 0.36), -0.58, 0.24)
-    dry = _stereo_pan(velvet_air + sub_glide + card_satin + card_body, pan_slide) + _stereo_pan(land_thud + land_snap, 0.16)
-    wet = _dark_hall_reverb(dry, decay_s=0.40, predelay_ms=7.0, damp_hz=3200.0, mix=0.18, seed=18002)
-    return _master_stereo(wet, target_peak_db=-1.0, fade_in_ms=3.0, fade_out_ms=28.0, bus_drive=1.35)
+    pan_slide = np.clip(-0.52 + 0.76 * (t / 0.36), -0.52, 0.24)
+    dry = _stereo_pan(velvet_air + sub_glide + card_satin + card_body, pan_slide) + _stereo_pan(land_thud + land_snap, 0.14)
+    wet = _dark_hall_reverb(dry, decay_s=0.34, predelay_ms=6.0, damp_hz=2000.0, mix=0.15, seed=18002)
+    wet = _butter(wet, 2400.0, "lowpass", order=3)
+    return _master_stereo(wet, target_peak_db=-1.2, fade_in_ms=3.0, fade_out_ms=28.0, bus_drive=1.18)
 
 
 def synth_scene_cut_sub_pulse() -> np.ndarray:
@@ -1364,9 +1360,14 @@ def ensure_pro_cinema_sfx(force: bool = False, thermal_limit_c: float = 85.0) ->
         sfx_map[fname] = str(fpath)
 
     dark_music = MUSIC_DIR / "dark_mystery_horror.mp3"
-    if need_upgrade or not dark_music.exists() or dark_music.stat().st_size < 2_500_000:
+    if force or not dark_music.exists() or dark_music.stat().st_size < 2_500_000:
         synthesize_dark_mystery_horror_music(dark_music, duration_s=174.545, thermal_limit_c=thermal_limit_c)
         generated.append("dark_mystery_horror.mp3")
+
+    try:
+        dark_music_rel = str(dark_music.resolve().relative_to(BASE_DIR.resolve()))
+    except Exception:
+        dark_music_rel = str(dark_music)
 
     VERSION_STAMP_FILE.write_text(
         json.dumps(
@@ -1375,7 +1376,7 @@ def ensure_pro_cinema_sfx(force: bool = False, thermal_limit_c: float = 85.0) ->
                 "sample_rate": SR,
                 "channels": 2,
                 "sfx_count": len(sfx_map),
-                "dark_music": str(dark_music),
+                "dark_music": dark_music_rel,
             },
             indent=2,
             ensure_ascii=False,
