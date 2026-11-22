@@ -78,6 +78,35 @@ OPEN_LOOP_MARKERS_RE = re.compile(
 OPEN_LOOP_SPACING_S = 24.0
 SPEECH_WORDS_PER_SEC = 2.05
 
+# Forbidden YouTube ending CTAs banned in ACT_4_ABRUPT_ENDING (v3.0.0 zero-CTA rule)
+FORBIDDEN_TRAILING_CTA_RE = re.compile(
+    r"(?:"
+    r"\b(?:n[aã]o\s+se\s+esque[cç]a\s+de\s+)?(?:deix[ae]r?\s+(?:(?:o|a)\s+)?(?:seu\s+)?like|"
+    r"se\s+inscrev(?:a|er)\s+no\s+canal|inscreva-se\s+no\s+canal|"
+    r"ativ[ae]r?\s+o\s+sininho|coment[ae]\s+(?:aqui\s+)?embaixo|"
+    r"obrigado\s+por\s+assistir|at[eé]\s+o\s+pr[oó]ximo\s+v[ií]deo|"
+    r"don'?t\s+forget\s+to\s+subscribe|hit\s+the\s+like\s+button|"
+    r"subscribe\s+to\s+(?:the|our)\s+channel|ring\s+the\s+bell|"
+    r"thanks\s+for\s+watching|see\s+you\s+in\s+the\s+next\s+video|"
+    r"suscr[ií]bete\s+al\s+canal|dale\s+like|gracias\s+por\s+ver)"
+    r")[^.!?]*[.!?]*",
+    re.IGNORECASE,
+)
+
+
+def strip_abrupt_ending_ctas(text: str) -> Tuple[str, List[str]]:
+    """Strip any YouTube outro CTAs from ACT_4_ABRUPT_ENDING narration so the film ends abruptly."""
+    cleaned = str(text or "").strip()
+    removed: List[str] = []
+    for m in FORBIDDEN_TRAILING_CTA_RE.finditer(cleaned):
+        hit = m.group(0).strip()
+        if hit:
+            removed.append(hit)
+    if removed:
+        cleaned = FORBIDDEN_TRAILING_CTA_RE.sub("", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned, removed
+
 OPEN_LOOP_BRIDGES_PT = [
     "Mas espera: por que quase todo mundo erra exatamente no próximo passo?",
     "Só que ninguém esperava o que aconteceria logo em seguida: olha só.",
@@ -433,6 +462,8 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
             since_last_loop_s += intro_dur
 
     # Audit scene-by-scene narration
+    ctas_removed: List[str] = []
+    total_word_count = 0
     if isinstance(scenes, list) and scenes:
         n_scenes = len(scenes)
         for idx, sc in enumerate(scenes):
@@ -444,11 +475,17 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
 
             clean_txt, rem = sanitize_robotic_line(sc[target_key])
             cliches_removed.extend(rem)
+
+            is_last_scene = n_scenes > 1 and idx == n_scenes - 1
+            if is_last_scene or str(sc.get("act_id") or "") == "ACT_4_ABRUPT_ENDING":
+                clean_txt, cta_rem = strip_abrupt_ending_ctas(clean_txt)
+                ctas_removed.extend(cta_rem)
+                cliches_removed.extend(cta_rem)
+
             sc_dur = float(sc.get("duration_s") or _estimate_line_seconds(clean_txt))
             elapsed_s += sc_dur
             since_last_loop_s += sc_dur
 
-            is_last_scene = n_scenes > 1 and idx == n_scenes - 1
             if "?" in clean_txt or OPEN_LOOP_MARKERS_RE.search(clean_txt):
                 open_loops_found += 1
                 since_last_loop_s = 0.0
@@ -462,6 +499,7 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
                 elapsed_s += max(0.0, new_sc_dur - sc_dur)
                 sc["duration_s"] = new_sc_dur
 
+            total_word_count += len(clean_txt.split())
             sc[target_key] = clean_txt
             if not is_dict and hasattr(plan, "scenes") and idx < len(getattr(plan, "scenes", [])):
                 obj_sc = plan.scenes[idx]
@@ -509,20 +547,26 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
             open_loops_found += 1
 
     all_examples = list(dict.fromkeys([*prev_examples, *cliches_removed]))[:5]
+    pi_triggers = [240, 480, 720] if elapsed_s >= 760.0 else ([t_pi for t_pi in (240, 480, 720) if elapsed_s >= t_pi + 30.0])
     report = {
-        "doctor": "RetentionDoctor v2",
+        "doctor": "RetentionDoctor v3",
+        "schema_version": "3.0.0",
         "engine_style": "netflix_doc",
         "passed": True,
         "lang": resolved_lang,
         "cliches_blocked": prev_cliches + len(cliches_removed),
         "cliches_examples": all_examples,
+        "ctas_stripped": len(ctas_removed),
+        "abrupt_ending_clean": True,
+        "total_words": total_word_count,
         "open_loops_total": max(
             open_loops_found,
             int(existing_audit.get("open_loops_total", 0)) if existing_audit else 0,
         ),
         "open_loops_injected": prev_injected + open_loops_injected,
         "estimated_duration_s": round(max(1.0, elapsed_s), 1),
-        "interval_rule": "24s open_loop_spacing (natural-question preserving)",
+        "pattern_interrupt_triggers_s": pi_triggers,
+        "interval_rule": "24s open_loop_spacing + 240s pattern_interrupts + zero-CTA abrupt ending",
     }
     plan_dict["retention_audit"] = report
     if not is_dict:
