@@ -8586,6 +8586,17 @@ async def render_netflix_documentary(
         cursor_t = round(cursor_t + audio_scene_dur, 3)
 
     # 2. ZERO-REPETITION ERA-LOCKED MEDIA ORCHESTRATOR
+    base_scenes_mp4 = work_dir / "base_scenes.mp4"
+    expected_full_dur_s = round(cursor_t + tail_pad_s, 3)
+    reuse_base_scenes_mp4 = bool(
+        resume
+        and _is_valid_cached_scene_mp4(base_scenes_mp4, w, h, fps, expected_full_dur_s, tol_s=1.5)
+    )
+    if reuse_base_scenes_mp4:
+        already_rendered_mask = [True] * n_scenes
+        for rec in scene_records:
+            rec["already_rendered"] = True
+
     skip_scene_indices: Set[int] = {idx_r for idx_r, is_done in enumerate(already_rendered_mask) if is_done}
     total_planned_shots = sum(
         cnt for idx_c, cnt in enumerate(scene_shot_counts) if idx_c not in skip_scene_indices
@@ -8593,20 +8604,28 @@ async def render_netflix_documentary(
     if progress_cb:
         progress_cb(
             30,
-            f"♻️ Reaproveitando {len(skip_scene_indices)}/{n_scenes} cenas já renderizadas e mídias em cache..."
-            if (resume and skip_scene_indices)
-            else f"Gerando {total_planned_shots} planos históricos sem anacronismos (Wikimedia Commons + Google Flow Pro + Gemini Vision)...",
+            f"♻️ Reaproveitando base_scenes.mp4 já montado ({n_scenes}/{n_scenes} cenas + xfade)..."
+            if reuse_base_scenes_mp4
+            else (
+                f"♻️ Reaproveitando {len(skip_scene_indices)}/{n_scenes} cenas já renderizadas e mídias em cache..."
+                if (resume and skip_scene_indices)
+                else f"Gerando {total_planned_shots} planos históricos sem anacronismos (Wikimedia Commons + Google Flow Pro + Gemini Vision)..."
+            ),
         )
-    scene_media_list, media_telemetry = await asyncio.to_thread(
-        _prefetch_scene_media_sync,
-        plan_obj.scenes,
-        work_dir,
-        plan_obj.aspect_ratio,
-        doc_mood,
-        resume,
-        scene_shot_counts,
-        skip_scene_indices,
-    )
+    if reuse_base_scenes_mp4:
+        scene_media_list = [SceneMediaAssets() for _ in plan_obj.scenes]
+        media_telemetry = {}
+    else:
+        scene_media_list, media_telemetry = await asyncio.to_thread(
+            _prefetch_scene_media_sync,
+            plan_obj.scenes,
+            work_dir,
+            plan_obj.aspect_ratio,
+            doc_mood,
+            resume,
+            scene_shot_counts,
+            skip_scene_indices,
+        )
     for idx_m, rec in enumerate(scene_records):
         if idx_m < len(scene_media_list):
             rec["media_assets"] = scene_media_list[idx_m]
@@ -8624,7 +8643,8 @@ async def render_netflix_documentary(
         is_last_scene = s_idx == (n_scenes - 1)
         sc_cad = float(getattr(sc, "cut_cadence_s", None) or default_cad)
 
-        if bool(getattr(sc, "pattern_interrupt", False)) and sc_start_t >= 30.0:
+        is_pi_scene = bool(getattr(sc, "pattern_interrupt", False)) and sc_start_t >= 30.0
+        if is_pi_scene:
             computed_pi_times.append(round(sc_start_t, 2))
             _add_sfx(sc_start_t + 0.02, 0.34, "pattern_interrupt_shutter.wav", "camera_shutter.wav", "ui_click.wav")
 
@@ -8639,7 +8659,8 @@ async def render_netflix_documentary(
             elif s_idx % 2 == 0:
                 _add_sfx(max(0.0, sc_start_t - 0.04), 0.24, "scene_cut_sub_pulse.wav", "sub_boom.wav")
 
-        if chapter_intro_s > 0.0:
+        # Skip long chapter boom/braam stings on Pattern Interrupt scenes so the 1.25s silence drop rings pure!
+        if chapter_intro_s > 0.0 and not is_pi_scene:
             # Varied chapter stings (avoid repeating identical horror_braam 5x!)
             if s_idx % 3 == 0:
                 _add_sfx(sc_start_t + 0.04, 0.32, "sub_boom.wav", "scene_cut_sub_pulse.wav")
@@ -8703,37 +8724,41 @@ async def render_netflix_documentary(
     if not computed_pi_times and cursor_t >= 280.0:
         computed_pi_times = [float(tp) for tp in (240.0, 480.0, 720.0) if tp < cursor_t - 20.0]
 
-    # Concatenate full narration WAV and master Broadcast Audio (-14 LUFS + -23/-28 dB music + PI mutes + 0.50s abrupt ending)
-    concat_audio_txt = work_dir / "doc_audio_concat.txt"
-    concat_audio_txt.write_text("\n".join(f"file '{p.resolve()}'" for p in audio_parts), encoding="utf-8")
-    raw_full_wav = work_dir / "doc_narration_full.wav"
-    run_ffmpeg_safe(
-        ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(concat_audio_txt), "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(raw_full_wav)],
-        thermal_limit_c=thermal_limit_c,
-    )
-
     master_audio = work_dir / "doc_master_audio.m4a"
-    master_kwargs: Dict[str, Any] = {"thermal_limit_c": thermal_limit_c}
-    try:
-        mba_params = inspect.signature(master_broadcast_audio).parameters
-        if "pattern_interrupt_times" in mba_params:
-            master_kwargs["pattern_interrupt_times"] = computed_pi_times
-        if "abrupt_ending_cut" in mba_params:
-            master_kwargs["abrupt_ending_cut"] = True
-    except Exception:
-        pass
+    cached_master_audio_dur = _probe_video_duration(master_audio) if (resume and master_audio.exists() and master_audio.stat().st_size > 16_384) else 0.0
+    if resume and cached_master_audio_dur > 0.5 and abs(cached_master_audio_dur - (cursor_t + tail_pad_s)) <= 1.5:
+        final_dur = round(cached_master_audio_dur, 3)
+    else:
+        # Concatenate full narration WAV and master Broadcast Audio (-14 LUFS + -23/-28 dB music + PI mutes + 0.50s abrupt ending)
+        concat_audio_txt = work_dir / "doc_audio_concat.txt"
+        concat_audio_txt.write_text("\n".join(f"file '{p.resolve()}'" for p in audio_parts), encoding="utf-8")
+        raw_full_wav = work_dir / "doc_narration_full.wav"
+        run_ffmpeg_safe(
+            ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", str(concat_audio_txt), "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "2", str(raw_full_wav)],
+            thermal_limit_c=thermal_limit_c,
+        )
 
-    master_audio, final_dur = await asyncio.to_thread(
-        master_broadcast_audio,
-        raw_full_wav,
-        resolved_music_mp3,
-        sfx_events,
-        master_audio,
-        cursor_t,
-        eff_music_vol,
-        tail_pad_s,
-        **master_kwargs,
-    )
+        master_kwargs: Dict[str, Any] = {"thermal_limit_c": thermal_limit_c}
+        try:
+            mba_params = inspect.signature(master_broadcast_audio).parameters
+            if "pattern_interrupt_times" in mba_params:
+                master_kwargs["pattern_interrupt_times"] = computed_pi_times
+            if "abrupt_ending_cut" in mba_params:
+                master_kwargs["abrupt_ending_cut"] = True
+        except Exception:
+            pass
+
+        master_audio, final_dur = await asyncio.to_thread(
+            master_broadcast_audio,
+            raw_full_wav,
+            resolved_music_mp3,
+            sfx_events,
+            master_audio,
+            cursor_t,
+            eff_music_vol,
+            tail_pad_s,
+            **master_kwargs,
+        )
 
     if scene_records:
         actual_tail_delta = max(0.0, round(final_dur - cursor_t, 3))
@@ -8759,80 +8784,94 @@ async def render_netflix_documentary(
     # 3. Render each scene to disk one-by-one (zero-copy BGRA Skia + VAAPI 65+ FPS -> flat RAM!)
     scene_mp4_paths: List[Path] = []
     u2netp_25d_used = False
-    for rec in scene_records:
-        s_idx = rec["s_idx"]
-        sc: NetflixDocScene = rec["scene"]
-        out_sc_mp4 = work_dir / f"doc_scene_{s_idx:03d}.mp4"
-        is_last_scene = s_idx == (n_scenes - 1)
-        if resume and (rec.get("already_rendered") or _is_valid_cached_scene_mp4(out_sc_mp4, w, h, fps, rec["render_dur"], tol_s=0.35)):
+    if reuse_base_scenes_mp4:
+        u2netp_25d_used = any(rec["scene"].visual_mode == "parallax_25d_photo" for rec in scene_records)
+        if progress_cb:
+            progress_cb(88, "♻️ Reaproveitando base_scenes.mp4 íntegro — muxando áudio master -14 LUFS em master.mp4...")
+        xfade_active = True
+    else:
+        for rec in scene_records:
+            s_idx = rec["s_idx"]
+            sc: NetflixDocScene = rec["scene"]
+            out_sc_mp4 = work_dir / f"doc_scene_{s_idx:03d}.mp4"
+            is_last_scene = s_idx == (n_scenes - 1)
+            if resume and (rec.get("already_rendered") or _is_valid_cached_scene_mp4(out_sc_mp4, w, h, fps, rec["render_dur"], tol_s=0.35)):
+                if progress_cb:
+                    pct = 45 + int(40 * ((s_idx + 1) / float(max(1, n_scenes))))
+                    progress_cb(
+                        pct,
+                        f"♻️ Reaproveitando cena já renderizada {s_idx + 1}/{n_scenes} [{sc.visual_mode}] ({w}x{h} @ {fps}fps)...",
+                    )
+                if sc.visual_mode == "parallax_25d_photo":
+                    u2netp_25d_used = True
+                scene_mp4_paths.append(out_sc_mp4)
+                continue
+
             if progress_cb:
                 pct = 45 + int(40 * ((s_idx + 1) / float(max(1, n_scenes))))
                 progress_cb(
                     pct,
-                    f"♻️ Reaproveitando cena já renderizada {s_idx + 1}/{n_scenes} [{sc.visual_mode}] ({w}x{h} @ {fps}fps)...",
+                    f"Renderizando cena Skia C++ Zero-Copy {s_idx + 1}/{n_scenes} [{sc.visual_mode}] ({w}x{h} @ {fps}fps)...",
                 )
-            if sc.visual_mode == "parallax_25d_photo":
-                u2netp_25d_used = True
-            scene_mp4_paths.append(out_sc_mp4)
-            continue
-
-        if progress_cb:
-            pct = 45 + int(40 * ((s_idx + 1) / float(max(1, n_scenes))))
-            progress_cb(
-                pct,
-                f"Renderizando cena Skia C++ Zero-Copy {s_idx + 1}/{n_scenes} [{sc.visual_mode}] ({w}x{h} @ {fps}fps)...",
+            prev_lt_title = plan_obj.scenes[s_idx - 1].lower_third_title if s_idx > 0 else None
+            sc_cad = float(getattr(sc, "cut_cadence_s", None) or default_cad)
+            abrupt_cut_t = (
+                round(float(rec["speech_end_local_t"]) + 0.45, 3)
+                if (is_last_scene and sc.act_id == "ACT_4_ABRUPT_ENDING")
+                else None
             )
-        prev_lt_title = plan_obj.scenes[s_idx - 1].lower_third_title if s_idx > 0 else None
-        sc_cad = float(getattr(sc, "cut_cadence_s", None) or default_cad)
-        abrupt_cut_t = (
-            round(float(rec["speech_end_local_t"]) + 0.45, 3)
-            if (is_last_scene and sc.act_id == "ACT_4_ABRUPT_ENDING")
-            else None
-        )
-        rendered_p, did_u2netp = await asyncio.to_thread(
-            _render_single_doc_scene_to_disk,
-            sc,
-            s_idx,
-            rec["render_dur"],
-            rec["chapter_intro_s"],
-            rec["local_words"],
-            rec["start_t"],
-            final_dur,
-            out_sc_mp4,
-            w,
-            h,
-            fps,
-            lut_path,
-            title_tf,
-            ui_tf,
-            caption_tf,
-            thermal_limit_c,
-            rec["media_assets"],
-            plan_obj.lang,
-            eff_caption_style,
-            sc_cad,
-            prev_lt_title,
-            abrupt_cut_t,
-        )
-        if did_u2netp:
-            u2netp_25d_used = True
-        scene_mp4_paths.append(rendered_p)
+            rendered_p, did_u2netp = await asyncio.to_thread(
+                _render_single_doc_scene_to_disk,
+                sc,
+                s_idx,
+                rec["render_dur"],
+                rec["chapter_intro_s"],
+                rec["local_words"],
+                rec["start_t"],
+                final_dur,
+                out_sc_mp4,
+                w,
+                h,
+                fps,
+                lut_path,
+                title_tf,
+                ui_tf,
+                caption_tf,
+                thermal_limit_c,
+                rec["media_assets"],
+                plan_obj.lang,
+                eff_caption_style,
+                sc_cad,
+                prev_lt_title,
+                abrupt_cut_t,
+            )
+            if did_u2netp:
+                u2netp_25d_used = True
+            scene_mp4_paths.append(rendered_p)
 
-    # 4. Join rendered scenes with smooth 0.40s FFmpeg `xfade` cinema transitions + mux master broadcast audio
-    if progress_cb:
-        progress_cb(88, "Aplicando transições cinema FFmpeg xfade (0.40s) e mixagem master -14 LUFS...")
-    base_scenes_mp4 = work_dir / "base_scenes.mp4"
-    base_scenes_mp4, xfade_active = await asyncio.to_thread(
-        _concat_scenes_with_xfade,
-        scene_mp4_paths,
-        transitions_plan,
-        xfade_dur,
-        fps,
-        base_scenes_mp4,
-        work_dir,
-        thermal_limit_c,
-        [float(rec["scene_dur"]) for rec in scene_records],
-    )
+        # 4. Join rendered scenes with smooth 0.40s FFmpeg `xfade` cinema transitions + mux master broadcast audio
+        if progress_cb:
+            progress_cb(88, "Aplicando transições cinema FFmpeg xfade (0.40s) e mixagem master -14 LUFS...")
+        base_scenes_mp4, xfade_active = await asyncio.to_thread(
+            _concat_scenes_with_xfade,
+            scene_mp4_paths,
+            transitions_plan,
+            xfade_dur,
+            fps,
+            base_scenes_mp4,
+            work_dir,
+            thermal_limit_c,
+            [float(rec["scene_dur"]) for rec in scene_records],
+        )
+
+        # Free intermediate per-scene & batch MP4s immediately once base_scenes.mp4 is verified valid (cuts peak SSD usage ~65%)
+        if _is_valid_cached_scene_mp4(base_scenes_mp4, w, h, fps, final_dur, tol_s=1.5):
+            for temp_glob in ("doc_scene_*.mp4", "_xfade_batch_*.mp4", "_fallback_trim_*.mp4"):
+                for tmp_f in work_dir.glob(temp_glob):
+                    try:
+                        tmp_f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
     run_ffmpeg_safe(
         [
@@ -8847,6 +8886,14 @@ async def render_netflix_documentary(
         ],
         thermal_limit_c=thermal_limit_c,
     )
+
+    # Free base_scenes.mp4 immediately after master.mp4 is safely muxed so ShadowHash/CapCut/Shorts have full SSD headroom
+    master_dur_verified = _probe_video_duration(out_master_mp4)
+    if out_master_mp4.exists() and out_master_mp4.stat().st_size > 16_384 and master_dur_verified > 0.3:
+        try:
+            base_scenes_mp4.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     chapters_used = [sc.chapter_card for sc in plan_obj.scenes if sc.chapter_card]
     modes_used = [sc.visual_mode for sc in plan_obj.scenes]

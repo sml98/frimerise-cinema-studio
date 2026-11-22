@@ -1660,11 +1660,11 @@ def master_broadcast_audio(
         if abrupt_ending_cut:
             cut_fade_st = max(0.0, final_dur - 0.15)
             master_chain_parts.append(f"afade=t=out:st={cut_fade_st:.3f}:d=0.15")
-        # 4x oversampled True-Peak ceiling at 0.85 (-1.41 dBFS) guarantees AAC 192k output <= -1.0 dBTP!
+        # 4x oversampled True-Peak ceiling at 0.79 (-2.05 dBFS) guarantees AAC 192k output <= -1.0 dBTP!
         master_chain_parts.extend(
             [
                 "aresample=192000",
-                "alimiter=limit=0.85:level=false:attack=2:release=35:latency=true",
+                "alimiter=limit=0.79:level=false:attack=2:release=35:latency=true",
                 "aresample=48000",
             ]
         )

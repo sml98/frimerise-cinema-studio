@@ -1376,6 +1376,7 @@ _EUROPE_LANDMASS_POLYS: List[List[Tuple[float, float]]] = [
 
 _CITY_GEO_COORDS: List[Tuple[Tuple[str, ...], Tuple[float, float], str]] = [
     (("CANTERBURY", "KENT"), (0.292, 0.288), "51°16'N 01°04'E"),
+    (("AMSTERDÃ", "AMSTERDA", "AMSTERDAM", "HOLANDA", "PAÍSES BAIXOS", "NETHERLANDS", "DUTCH"), (0.352, 0.258), "52°22'N 04°54'E"),
     (("VATICANO", "VATICAN", "SANTA SÉ"), (0.463, 0.562), "41°54'N 12°27'E"),
     (("ROMA", "ROME", "ITÁLIA", "ITALY", "SATURNALIA", "SATURNÁLIA", "TRASIMENO"), (0.465, 0.565), "41°54'N 12°29'E"),
     (("MIRA", "MYRA", "DEMRE", "ÁSIA MENOR", "ASIA MINOR", "ANATÓLIA", "ANATOLIA", "LÍCIA", "LICIA"), (0.785, 0.675), "36°15'N 29°59'E"),
