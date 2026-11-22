@@ -18,6 +18,7 @@ Public API:
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -195,6 +196,11 @@ def _is_emoji(ch: str) -> bool:
     return 0x1F300 <= cp <= 0x1FAFF or 0x2600 <= cp <= 0x27BF or 0x1F1E6 <= cp <= 0x1F1FF
 
 
+def _has_alnum_or_emoji(txt: str) -> bool:
+    """Return True if token contains at least one alphanumeric character or emoji (rejects '-', '—', '–', '...')."""
+    return any(ch.isalnum() or _is_emoji(ch) for ch in txt)
+
+
 def _sanitize_word_text(raw: str, typeface: Optional[skia.Typeface], uppercase: bool = True) -> str:
     txt = str(raw or "").strip()
     if not txt:
@@ -216,7 +222,61 @@ def _sanitize_word_text(raw: str, typeface: Optional[skia.Typeface], uppercase: 
                 except Exception:
                     out_chars.append(ch)
         txt = "".join(out_chars)
-    return txt.strip()
+    cleaned = txt.strip()
+    if not cleaned or not _has_alnum_or_emoji(cleaned):
+        return ""
+    return cleaned
+
+
+def group_words_into_chunks(words: List[Dict[str, Any]], max_words: int = 3) -> List[Dict[str, Any]]:
+    """Split multi-word tokens, strip standalone pure-punctuation tokens (e.g. '-', '—', '–', '...'),
+    and group into crisp 2-3 word kinetic caption chunks so a lone [-] neon pill can NEVER render.
+    """
+    clean_words: List[Dict[str, Any]] = []
+    global_idx = 0
+    for w in words or []:
+        raw = str(w.get("word", w.get("text", ""))).strip()
+        parts = [p for p in re.split(r"\s+", raw) if p and _has_alnum_or_emoji(p)]
+        if not parts:
+            continue
+        st = float(w.get("start", 0.0))
+        en = float(w.get("end", st + 0.06))
+        step = max(0.06, (en - st) / float(len(parts)))
+        for j, part in enumerate(parts):
+            clean_words.append(
+                {
+                    "word": part,
+                    "start": round(st + j * step, 3),
+                    "end": round(st + (j + 1) * step, 3),
+                    "g_idx": global_idx,
+                }
+            )
+            global_idx += 1
+
+    chunks: List[Dict[str, Any]] = []
+    buf: List[Dict[str, Any]] = []
+    for w in clean_words:
+        buf.append(w)
+        txt = w["word"]
+        end_punct = txt.endswith((".", "!", "?", ";", ":"))
+        char_len = sum(len(x["word"]) for x in buf) + max(0, len(buf) - 1)
+        if len(buf) >= max_words or end_punct or char_len >= 16:
+            chunks.append(
+                {
+                    "start": buf[0]["start"],
+                    "end": buf[-1]["end"],
+                    "words": list(buf),
+                }
+            )
+            buf = []
+    if buf:
+        chunks.append({"start": buf[0]["start"], "end": buf[-1]["end"], "words": buf})
+
+    for i in range(len(chunks) - 1):
+        gap = chunks[i + 1]["start"] - chunks[i]["end"]
+        if 0 < gap <= 0.30:
+            chunks[i]["end"] = chunks[i + 1]["start"]
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +374,11 @@ def _prepare_tokens(
         )
 
     if not tokens:
+        return [], None
+
+    # If a stripped leading punctuation token left chunk["start"] earlier than the first real word,
+    # do not render the chunk prematurely during that dead gap.
+    if t < tokens[0]["start"] - 0.05:
         return [], None
 
     # Strictly ONE active word per frame:
