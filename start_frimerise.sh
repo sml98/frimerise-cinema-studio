@@ -4,6 +4,7 @@ set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
 
+export PATH="$HOME/.local/bin:$PATH"
 export LIBVA_DRIVER_NAME=iHD
 export LIBVA_DRIVERS_PATH="$DIR/vendor/syslibs/usr/lib/x86_64-linux-gnu/dri:/usr/lib/x86_64-linux-gnu/dri"
 export LD_LIBRARY_PATH="$DIR/vendor/syslibs/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
