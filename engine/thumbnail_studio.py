@@ -966,31 +966,147 @@ def _acquire_hero_assets(
     work_dir: Path,
     art_dir: Dict[str, Any],
 ) -> Tuple[List[Tuple[Path, np.ndarray, str]], str]:
-    """Acquire up to 3 high-resolution cinematic hero images using the required priority chain:
-      1. Bespoke Gemini Image API (`gemini-2.5-flash-image` -> `gemini-3.1-flash-image`)
-      2. Pixabay / Wikimedia HD editorial photos via `engine.doc_media_engine.fetch_doc_real_photo`
-      3. Best crisp video frames from `video_path`
+    """Acquire up to 5 high-resolution cinematic hero images prioritizing era-validated
+    project hero plates BEFORE generic stock fallbacks:
+      1. Era-validated project hero plates in `_work/` (`flow_sc*`, `wiki_*`, `wikimedia_*`, `archival_*`)
+      2. Wikimedia Commons free archival plates (`fetch_wikimedia_commons_archival_photo`, if available)
+      3. Bespoke Gemini Image API (`gemini-2.5-flash-image` -> `gemini-3.1-flash-image`)
+      4. Sharpest clean frames from the rendered project `video_path`
+      5. Last-resort generic stock fallback (`fetch_doc_real_photo` / remaining `_work/photo_*.jpg`)
     """
     assets: List[Tuple[Path, np.ndarray, str]] = []
     sources_used: List[str] = []
+    existing_sigs: Set[str] = set()
 
-    # 1. Try LIVE Gemini Image API for bespoke zero-text hero artwork
-    gemini_prompts = art_dir.get("gemini_prompts") or []
-    for idx, g_prompt in enumerate(gemini_prompts[:3], start=1):
-        out_p = work_dir / f"_gemini_hero_{idx}.jpg"
-        got = _generate_gemini_hero_image(title, g_prompt, out_p)
-        if got is not None and got.exists():
-            bgr = cv2.imread(str(got), cv2.IMREAD_COLOR)
-            if _validate_decoded_bgr(bgr):
-                assets.append((got, bgr, "gemini_image"))
-                if "gemini_image" not in sources_used:
-                    sources_used.append("gemini_image")
-        else:
-            # If the first Gemini call failed/429'd, immediately drop to Fallback (a)
-            if idx == 1:
+    def _try_add_asset(p: Path, bgr: Optional[np.ndarray], src_tag: str, summary_tag: str, min_w: int = 480, min_h: int = 320) -> bool:
+        if not _validate_decoded_bgr(bgr, min_w=min_w, min_h=min_h):
+            return False
+        assert bgr is not None
+        h_sig = hashlib.md5(cv2.resize(bgr, (32, 18)).tobytes()).hexdigest()
+        if h_sig in existing_sigs:
+            return False
+        existing_sigs.add(h_sig)
+        assets.append((Path(p), bgr, src_tag))
+        if summary_tag not in sources_used:
+            sources_used.append(summary_tag)
+        return True
+
+    # 1. PRIORITY 1: Harvest era-validated project hero plates from _work/ (flow_sc* + Wikimedia archival plates)
+    search_dirs: List[Path] = []
+    if work_dir.exists():
+        search_dirs.append(work_dir)
+    if video_path is not None:
+        vp_work = Path(video_path).parent / "_work"
+        if vp_work.exists() and vp_work.resolve() not in {d.resolve() for d in search_dirs}:
+            search_dirs.append(vp_work)
+
+    if search_dirs:
+        validated_cands: List[Tuple[int, Path, str]] = []
+        seen_paths: Set[Path] = set()
+        pattern_tiers = [
+            ("flow_sc*_shot00.*", 3, "project_hero_flow"),
+            ("flow_sc*.*", 2, "project_hero_flow"),
+            ("flow_*_shot00.*", 2, "project_hero_flow"),
+            ("flow_*.*", 2, "project_hero_flow"),
+            ("wiki_*.*", 2, "wikimedia_archival"),
+            ("wikimedia_*.*", 2, "wikimedia_archival"),
+            ("archival_*.*", 2, "wikimedia_archival"),
+        ]
+        for sdir in search_dirs:
+            for pat, tier_pri, src_prefix in pattern_tiers:
+                for cand_p in sorted(sdir.glob(pat)):
+                    if (
+                        cand_p.is_file()
+                        and cand_p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+                        and cand_p.stat().st_size > 8_000
+                        and cand_p.resolve() not in seen_paths
+                    ):
+                        seen_paths.add(cand_p.resolve())
+                        validated_cands.append((tier_pri, cand_p, src_prefix))
+
+        scored_project: List[Tuple[int, int, float, Path, np.ndarray, str, str]] = []
+        for tier_pri, cand_p, src_prefix in validated_cands[:36]:
+            bgr_w = cv2.imread(str(cand_p), cv2.IMREAD_COLOR)
+            if not _validate_decoded_bgr(bgr_w, min_w=480, min_h=340):
+                continue
+            is_landscape = 1 if bgr_w.shape[1] >= bgr_w.shape[0] else 0
+            drama = _score_cinema_drama_bgr(bgr_w)
+            scored_project.append(
+                (tier_pri, is_landscape, drama, cand_p, bgr_w, f"{src_prefix}:{cand_p.name}", src_prefix)
+            )
+
+        # Diversify across distinct scenes (flow_sc00, flow_sc03, flow_sc07...) so A, B, C get distinct era plates
+        scored_project.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        picked_scene_prefixes: Set[str] = set()
+        deferred: List[Tuple[int, int, float, Path, np.ndarray, str, str]] = []
+        for item in scored_project:
+            if len(assets) >= 5:
                 break
+            _, _, _, cand_p, bgr_w, src_lbl, sum_lbl = item
+            m_sc = re.match(r"^(flow_sc\d+)", cand_p.name.lower())
+            sc_key = m_sc.group(1) if m_sc else ""
+            if sc_key and sc_key in picked_scene_prefixes:
+                deferred.append(item)
+                continue
+            if _try_add_asset(cand_p, bgr_w, src_lbl, sum_lbl):
+                if sc_key:
+                    picked_scene_prefixes.add(sc_key)
+        for item in deferred:
+            if len(assets) >= 5:
+                break
+            _, _, _, cand_p, bgr_w, src_lbl, sum_lbl = item
+            _try_add_asset(cand_p, bgr_w, src_lbl, sum_lbl)
 
-    # 2. Fallback (a): High-Resolution Editorial Photography via engine.doc_media_engine.fetch_doc_real_photo
+    # 2. PRIORITY 2: Wikimedia Commons Archival Plates (when < 3 era-validated assets exist)
+    if len(assets) < 3:
+        try:
+            import engine.doc_media_engine as _dme
+
+            wiki_fn = getattr(_dme, "fetch_wikimedia_commons_archival_photo", None)
+            if callable(wiki_fn):
+                queries = list(art_dir.get("photo_queries") or [])
+                for q_idx, query in enumerate(queries[:3], start=1):
+                    if len(assets) >= 3:
+                        break
+                    wp = wiki_fn(
+                        query_en=query,
+                        out_dir=work_dir,
+                        prefix=f"wiki_thumb_{q_idx}",
+                        is_wide=True,
+                        topic_context=title,
+                        mood=str(art_dir.get("mood") or "dark_horror"),
+                    )
+                    if wp is not None and Path(wp).exists():
+                        bgr_wk = cv2.imread(str(wp), cv2.IMREAD_COLOR)
+                        _try_add_asset(Path(wp), bgr_wk, f"wikimedia_archival:{query}", "wikimedia_archival", min_w=600, min_h=340)
+        except Exception as exc:
+            print(f"[ThumbStudio] Wikimedia archival fallback notice: {exc}", flush=True)
+
+    # 3. PRIORITY 3: Bespoke Gemini Image API for remaining slots (up to 3 total)
+    if len(assets) < 3:
+        gemini_prompts = art_dir.get("gemini_prompts") or []
+        for idx, g_prompt in enumerate(gemini_prompts[:3], start=1):
+            if len(assets) >= 3:
+                break
+            out_p = work_dir / f"_gemini_hero_{idx}.jpg"
+            got = _generate_gemini_hero_image(title, g_prompt, out_p)
+            if got is not None and got.exists():
+                bgr = cv2.imread(str(got), cv2.IMREAD_COLOR)
+                _try_add_asset(got, bgr, "gemini_image", "gemini_image", min_w=400, min_h=220)
+            else:
+                if idx == 1:
+                    break
+
+    # 4. PRIORITY 4: Crisp rendered project frames from video_path (guaranteed era-accurate!)
+    if len(assets) < 3 and video_path is not None and Path(video_path).exists():
+        v_frames = _pick_best_video_frames(video_path, work_dir)
+        for vf in v_frames:
+            if len(assets) >= 3:
+                break
+            bgr = cv2.imread(str(vf), cv2.IMREAD_COLOR)
+            _try_add_asset(vf, bgr, "video_frame", "video_frame", min_w=320, min_h=200)
+
+    # 5. PRIORITY 5 (Last Resort): Generic Stock Photos via fetch_doc_real_photo ONLY if < 3 assets exist
     if len(assets) < 3:
         try:
             from engine.doc_media_engine import fetch_doc_real_photo
@@ -1009,59 +1125,19 @@ def _acquire_hero_assets(
                 )
                 if p is not None and Path(p).exists():
                     bgr = cv2.imread(str(p), cv2.IMREAD_COLOR)
-                    if _validate_decoded_bgr(bgr, min_w=600, min_h=340):
-                        # Avoid duplicate identical image bytes
-                        h_sig = hashlib.md5(cv2.resize(bgr, (32, 18)).tobytes()).hexdigest()
-                        if not any(
-                            hashlib.md5(cv2.resize(existing_bgr, (32, 18)).tobytes()).hexdigest() == h_sig
-                            for _, existing_bgr, _ in assets
-                        ):
-                            assets.append((Path(p), bgr, f"editorial_photo:{query}"))
-                            if "doc_media_photo" not in sources_used:
-                                sources_used.append("doc_media_photo")
+                    _try_add_asset(Path(p), bgr, f"stock_fallback:{query}", "doc_media_photo", min_w=600, min_h=340)
         except Exception as exc:
             print(f"[ThumbStudio] Editorial photo fallback notice: {exc}", flush=True)
 
-    # 2b. Harvest distinct existing cinema hero stills from _work/ (flow_*.jpg, photo_thumb_hero_*, photo_*.jpg)
-    # up to 5 candidates so _select_hero_roles can reject any boxy door/window stock cutout in favor of bespoke plates!
-    if len(assets) < 5 and work_dir.exists():
-        existing_sigs = {
-            hashlib.md5(cv2.resize(existing_bgr, (32, 18)).tobytes()).hexdigest()
-            for _, existing_bgr, _ in assets
-        }
-        work_photo_cands: List[Path] = []
-        for pat in ("flow_*_shot00.jpg", "photo_thumb_hero_*.jpg", "flow_*.jpg", "photo_*.jpg"):
+    # 5b. Last-resort local _work/photo_*.jpg if still < 3
+    if len(assets) < 3 and work_dir.exists():
+        for pat in ("photo_thumb_hero_*.jpg", "photo_*.jpg"):
             for cand_p in sorted(work_dir.glob(pat)):
-                if cand_p.is_file() and cand_p.stat().st_size > 8_000 and cand_p not in work_photo_cands:
-                    work_photo_cands.append(cand_p)
-        scored_work: List[Tuple[int, float, Path, np.ndarray, str]] = []
-        for cand_p in work_photo_cands[:18]:
-            bgr_w = cv2.imread(str(cand_p), cv2.IMREAD_COLOR)
-            if not _validate_decoded_bgr(bgr_w, min_w=480, min_h=340):
-                continue
-            h_sig = hashlib.md5(cv2.resize(bgr_w, (32, 18)).tobytes()).hexdigest()
-            if h_sig in existing_sigs:
-                continue
-            existing_sigs.add(h_sig)
-            is_flow_or_landscape = 1 if (cand_p.name.startswith("flow_") or bgr_w.shape[1] >= bgr_w.shape[0]) else 0
-            scored_work.append((is_flow_or_landscape, _score_cinema_drama_bgr(bgr_w), cand_p, bgr_w, f"work_photo:{cand_p.name}"))
-        scored_work.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        for _, _, cand_p, bgr_w, src_lbl in scored_work:
-            if len(assets) >= 5:
-                break
-            assets.append((cand_p, bgr_w, src_lbl))
-            if "work_photo" not in sources_used:
-                sources_used.append("work_photo")
-
-    # 3. Fallback (b): Sharpest clean video frame from video_path
-    if len(assets) < 1:
-        v_frames = _pick_best_video_frames(video_path, work_dir)
-        for vf in v_frames:
-            bgr = cv2.imread(str(vf), cv2.IMREAD_COLOR)
-            if _validate_decoded_bgr(bgr, min_w=320, min_h=200):
-                assets.append((vf, bgr, "video_frame"))
-                if "video_frame" not in sources_used:
-                    sources_used.append("video_frame")
+                if len(assets) >= 3:
+                    break
+                if cand_p.is_file() and cand_p.stat().st_size > 8_000:
+                    bgr_w = cv2.imread(str(cand_p), cv2.IMREAD_COLOR)
+                    _try_add_asset(cand_p, bgr_w, f"stock_fallback:{cand_p.name}", "work_photo", min_w=480, min_h=340)
 
     # Emergency obsidian cinematic atmospheric fallback (never crashes even on missing video + offline)
     if not assets:
@@ -1766,6 +1842,23 @@ def _save_surface_jpeg(surface: skia.Surface, out_path: Path, quality: int = 94)
 # ---------------------------------------------------------------------------
 # Role Selector Across Acquired Hero Candidates
 # ---------------------------------------------------------------------------
+def _hero_source_priority_bonus(src: str, path: Optional[Path] = None) -> float:
+    """Strongly prioritize era-validated project hero plates (`_work/flow_sc*` or Wikimedia
+    archival plates) and bespoke Gemini covers before generic stock fallbacks.
+    """
+    s = str(src or "").lower()
+    fname = str(path.name).lower() if path is not None else ""
+    if s.startswith("project_hero_flow") or fname.startswith("flow_sc") or fname.startswith("flow_"):
+        return 260.0
+    if s.startswith("wikimedia_archival") or fname.startswith(("wiki_", "wikimedia_", "archival_")):
+        return 240.0
+    if s.startswith("gemini_image"):
+        return 220.0
+    if s.startswith("video_frame"):
+        return 150.0
+    return 0.0
+
+
 def _select_hero_roles(
     assets: List[Tuple[Path, np.ndarray, str]],
     work_dir: Path,
@@ -1778,6 +1871,7 @@ def _select_hero_roles(
         mask = _predict_u2netp_mask(bgr)
         drama_score = _score_cinema_drama_bgr(bgr)
         focal = _detect_focal_point(bgr, mask=mask)
+        src_bonus = _hero_source_priority_bonus(src, path=path)
 
         # Evaluate cutout suitability (clean prominent organic portrait silhouette covering 8%..78% of frame,
         # strictly rejecting boxy/rectangular wooden doors or windows with fill_ratio >= 0.82!)
@@ -1803,14 +1897,16 @@ def _select_hero_roles(
             )
             edge_bonus = 1.0 if edge_touches <= 2 else (0.78 if edge_touches == 3 else 0.55)
             organic_bonus = 1.12 if fill_ratio < 0.76 else 1.0
-            cutout_score = drama_score * (0.65 + 0.55 * cov_fit) * edge_bonus * organic_bonus
+            cutout_score = drama_score * (0.65 + 0.55 * cov_fit) * edge_bonus * organic_bonus + src_bonus
 
         analyzed.append({
             "idx": idx,
             "path": path,
             "bgr": bgr,
             "src": src,
+            "src_bonus": src_bonus,
             "drama_score": drama_score,
+            "rank_score": drama_score + src_bonus,
             "focal": focal,
             "cutout_bgra": cutout_bgra,
             "cutout_meta": cut_meta,
@@ -1820,44 +1916,40 @@ def _select_hero_roles(
             "fill_ratio": fill_ratio,
         })
 
-    # Variant A (Dark Cinema / Editorial Mystery): strongly prefer idx=0 (our primary art-directed iconic
-    # portrait/hero subject for the topic) whenever it meets cinema quality, avoiding random side-props.
+    # Variant A (Dark Cinema / Editorial Mystery): strongly prefer era-validated hero plate (idx=0)
     best_a = max(
         analyzed,
-        key=lambda x: x["drama_score"] + (95.0 if x["idx"] == 0 and x["drama_score"] >= 45.0 else 0.0),
+        key=lambda x: x["rank_score"] + (65.0 if x["idx"] == 0 and x["drama_score"] >= 40.0 else 0.0),
     )
 
-    # Variant B Cutout Subject: ALWAYS select a DIFFERENT hero from thumb_A whenever >=2 assets exist
-    # (preferring photo_thumb_hero_2 / 2nd distinct photo with clean u2netp cutout so thumb_B NEVER duplicates thumb_A!).
+    # Variant B Cutout Subject: ALWAYS select a DIFFERENT era-validated hero from thumb_A whenever >=2 assets exist
     distinct_from_a = [x for x in analyzed if x["idx"] != best_a["idx"]]
     if distinct_from_a:
         distinct_cutouts = [x for x in distinct_from_a if x["cutout_bgra"] is not None and x["cutout_score"] > 0]
         if distinct_cutouts:
             best_b_subj = max(
                 distinct_cutouts,
-                key=lambda x: x["cutout_score"]
-                + (35.0 if "thumb_hero_2" in str(x["path"].name).lower() or x["idx"] == 1 else 0.0),
+                key=lambda x: x["cutout_score"] + (25.0 if x["idx"] == 1 else 0.0),
             )
         else:
             any_distinct_cutouts = [x for x in distinct_from_a if x["cutout_bgra"] is not None]
             if any_distinct_cutouts:
-                best_b_subj = max(any_distinct_cutouts, key=lambda x: x["drama_score"])
+                best_b_subj = max(any_distinct_cutouts, key=lambda x: x["rank_score"])
             else:
-                best_b_subj = max(distinct_from_a, key=lambda x: x["drama_score"])
+                best_b_subj = max(distinct_from_a, key=lambda x: x["rank_score"])
     else:
         best_b_subj = best_a
 
-    # Variant B Atmospheric Defocused Backdrop: prefer a distinct environment scene if available
+    # Variant B Atmospheric Defocused Backdrop: prefer a distinct era-validated environment scene if available
     distinct_for_b_bg = [x for x in analyzed if x["idx"] != best_b_subj["idx"]]
     non_a_b_bg = [x for x in distinct_for_b_bg if x["idx"] != best_a["idx"]]
-    best_b_bg = max(non_a_b_bg or distinct_for_b_bg, key=lambda x: x["drama_score"]) if distinct_for_b_bg else best_a
+    best_b_bg = max(non_a_b_bg or distinct_for_b_bg, key=lambda x: x["rank_score"]) if distinct_for_b_bg else best_a
 
-    # Variant C (Intense 1.32x Close-Up Chiaroscuro): prefer a distinct dramatic scene different from BOTH A and B
-    # when 3+ assets exist, otherwise distinct from A, falling back to A zoomed into focal detail.
-    distinct_for_c = [x for x in analyzed if x["idx"] != best_a["idx"] and x["drama_score"] >= best_a["drama_score"] * 0.55]
+    # Variant C (Intense 1.32x Close-Up Chiaroscuro): prefer a distinct era-validated scene different from BOTH A and B
+    distinct_for_c = [x for x in analyzed if x["idx"] != best_a["idx"] and x["drama_score"] >= best_a["drama_score"] * 0.45]
     if distinct_for_c:
         unused_c = [x for x in distinct_for_c if x["idx"] != best_b_subj["idx"]]
-        best_c = max(unused_c or distinct_for_c, key=lambda x: x["drama_score"])
+        best_c = max(unused_c or distinct_for_c, key=lambda x: x["rank_score"])
     else:
         best_c = best_a
 

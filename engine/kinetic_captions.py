@@ -19,14 +19,20 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import skia
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+FONTS_DIR = BASE_DIR / "assets" / "fonts"
 EMOJI_FONT_PATH = Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf")
 _EMOJI_TF_LOADED = False
 _EMOJI_TF_CACHE: Optional[skia.Typeface] = None
+_COURIER_BOLD_TF_LOADED = False
+_COURIER_BOLD_TF_CACHE: Optional[skia.Typeface] = None
+_SELECTIVE_CHUNKS_CACHE: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
 
 # Default 3-color neon rotation: (accent_bg_hex, contrast_text_hex, glow_rgba)
 DEFAULT_CAPTION_PALETTE: List[Tuple[str, str, Tuple[int, int, int, int]]] = [
@@ -119,11 +125,19 @@ CAPTION_STYLES: Dict[str, Dict[str, Any]] = {
         "accent": "#FF2E93",
         "best_for": ["cinematic_broll", "hooks", "shorts"],
     },
+    "selective_emphasis": {
+        "id": "selective_emphasis",
+        "label": "Selective Emphasis (Doc 16:9 Keyword Stamp)",
+        "badge": "Vox / Fern",
+        "desc": "Dispara apenas em datas, anos, séculos, nomes históricos e verbos de impacto em Courier Prime Bold 64px.",
+        "accent": "#EAB308",
+        "best_for": ["netflix_doc", "documentary", "youtube", "16:9"],
+    },
     "cinema_minimal": {
         "id": "cinema_minimal",
-        "label": "Cinema Minimal (Netflix Blur)",
+        "label": "Cinema Minimal (Netflix Blur / 16:9 Selective)",
         "badge": "Netflix Doc",
-        "desc": "Entrada suave blur-para-nítido (6->0px) com brilho dourado editorial e zero caixas bloqueando a imagem.",
+        "desc": "Modo Selective Emphasis em 16:9 (Courier Prime 64px em palavras-chave) e blur-reveal elegante em 9:16.",
         "accent": "#FFD166",
         "best_for": ["netflix_doc", "documentary", "youtube"],
     },
@@ -165,6 +179,12 @@ _STYLE_ALIASES: Dict[str, str] = {
     "slam": "word_slam",
     "impact_slam": "word_slam",
     "impact": "word_slam",
+    "selective_emphasis": "selective_emphasis",
+    "selective": "selective_emphasis",
+    "keyword_kinetic": "selective_emphasis",
+    "keyword_kinetic_captions": "selective_emphasis",
+    "keyword_emphasis": "selective_emphasis",
+    "doc_selective": "selective_emphasis",
     "cinema_minimal": "cinema_minimal",
     "cinema": "cinema_minimal",
     "netflix": "cinema_minimal",
@@ -251,6 +271,24 @@ def _get_emoji_typeface() -> Optional[skia.Typeface]:
     return _EMOJI_TF_CACHE
 
 
+def _get_courier_prime_bold_typeface(fallback: Optional[skia.Typeface] = None) -> Optional[skia.Typeface]:
+    """Load and cache authentic Google Fonts CourierPrime-Bold.ttf for 16:9 Selective Emphasis."""
+    global _COURIER_BOLD_TF_LOADED, _COURIER_BOLD_TF_CACHE
+    if not _COURIER_BOLD_TF_LOADED:
+        _COURIER_BOLD_TF_LOADED = True
+        for fname in ("CourierPrime-Bold.ttf", "CourierPrime-Regular.ttf"):
+            fpath = FONTS_DIR / fname
+            if fpath.exists() and fpath.stat().st_size > 20_000:
+                try:
+                    tf = skia.Typeface.MakeFromFile(str(fpath))
+                    if tf is not None:
+                        _COURIER_BOLD_TF_CACHE = tf
+                        break
+                except Exception:
+                    pass
+    return _COURIER_BOLD_TF_CACHE if _COURIER_BOLD_TF_CACHE is not None else fallback
+
+
 def _is_emoji(ch: str) -> bool:
     cp = ord(ch)
     return 0x1F300 <= cp <= 0x1FAFF or 0x2600 <= cp <= 0x27BF or 0x1F1E6 <= cp <= 0x1F1FF
@@ -261,6 +299,11 @@ def _has_alnum_or_emoji(txt: str) -> bool:
     return any(ch.isalnum() or _is_emoji(ch) for ch in txt)
 
 
+def _strip_accents_upper(text: str) -> str:
+    nfd = unicodedata.normalize("NFD", str(text or ""))
+    return "".join(ch for ch in nfd if unicodedata.category(ch) != "Mn").upper()
+
+
 def _sanitize_word_text(raw: str, typeface: Optional[skia.Typeface], uppercase: bool = True) -> str:
     txt = str(raw or "").strip()
     if not txt:
@@ -269,7 +312,13 @@ def _sanitize_word_text(raw: str, typeface: Optional[skia.Typeface], uppercase: 
         if src in txt:
             txt = txt.replace(src, dst)
     if uppercase:
-        txt = txt.upper()
+        # Preserve canonical 'a.C.' / 'd.C.' notation in uppercase stamps
+        m_era = re.match(r"^(\d{1,4})\s*([ad]\.?\s*c\.?)([.,!?;:]*)$", txt, flags=re.IGNORECASE)
+        if m_era:
+            era = "a.C." if m_era.group(2).lower().startswith("a") else "d.C."
+            txt = f"{m_era.group(1)} {era}{m_era.group(3)}"
+        else:
+            txt = txt.upper()
     if typeface is not None:
         out_chars: List[str] = []
         for ch in txt:
@@ -288,12 +337,314 @@ def _sanitize_word_text(raw: str, typeface: Optional[skia.Typeface], uppercase: 
     return cleaned
 
 
-def group_words_into_chunks(words: List[Dict[str, Any]], max_words: int = 3) -> List[Dict[str, Any]]:
-    """Split multi-word tokens, strip standalone pure-punctuation tokens (e.g. '-', '—', '–', '...'),
-    and group into crisp 2-3 word kinetic caption chunks so a lone [-] neon pill can NEVER render.
+# ---------------------------------------------------------------------------
+# Spelled-Out PT-BR Number / Date / Century Compaction & Selective Emphasis
+# ---------------------------------------------------------------------------
+_PT_UNITS: Dict[str, int] = {
+    "ZERO": 0, "UM": 1, "UMA": 1, "DOIS": 2, "DUAS": 2, "TRES": 3,
+    "QUATRO": 4, "CINCO": 5, "SEIS": 6, "SETE": 7, "OITO": 8, "NOVE": 9,
+}
+_PT_TEENS: Dict[str, int] = {
+    "DEZ": 10, "ONZE": 11, "DOZE": 12, "TREZE": 13, "CATORZE": 14, "QUATORZE": 14,
+    "QUINZE": 15, "DEZESSEIS": 16, "DEZESSETE": 17, "DEZOITO": 18, "DEZENOVE": 19,
+}
+_PT_TENS: Dict[str, int] = {
+    "VINTE": 20, "TRINTA": 30, "QUARENTA": 40, "CINQUENTA": 50,
+    "SESSENTA": 60, "SETENTA": 70, "OITENTA": 80, "NOVENTA": 90,
+}
+_PT_HUNDREDS: Dict[str, int] = {
+    "CEM": 100, "CENTO": 100, "DUZENTOS": 200, "DUZENTAS": 200,
+    "TREZENTOS": 300, "TREZENTAS": 300, "QUATROCENTOS": 400, "QUATROCENTAS": 400,
+    "QUINHENTOS": 500, "QUINHENTAS": 500, "SEISCENTOS": 600, "SEISCENTAS": 600,
+    "SETECENTOS": 700, "SETECENTAS": 700, "OITOCENTOS": 800, "OITOCENTAS": 800,
+    "NOVECENTOS": 900, "NOVECENTAS": 900,
+}
+_PT_CENTURY_ORDINALS: Dict[Tuple[str, ...], str] = {
+    ("PRIMEIRO",): "I", ("UM",): "I", ("I",): "I", ("1",): "I",
+    ("SEGUNDO",): "II", ("DOIS",): "II", ("II",): "II", ("2",): "II",
+    ("TERCEIRO",): "III", ("TRES",): "III", ("III",): "III", ("3",): "III",
+    ("QUARTO",): "IV", ("QUATRO",): "IV", ("IV",): "IV", ("4",): "IV",
+    ("QUINTO",): "V", ("CINCO",): "V", ("V",): "V", ("5",): "V",
+    ("SEXTO",): "VI", ("SEIS",): "VI", ("VI",): "VI", ("6",): "VI",
+    ("SETIMO",): "VII", ("SETE",): "VII", ("VII",): "VII", ("7",): "VII",
+    ("OITAVO",): "VIII", ("OITO",): "VIII", ("VIII",): "VIII", ("8",): "VIII",
+    ("NONO",): "IX", ("NOVE",): "IX", ("IX",): "IX", ("9",): "IX",
+    ("DECIMO",): "X", ("DEZ",): "X", ("X",): "X", ("10",): "X",
+    ("DECIMO", "PRIMEIRO"): "XI", ("ONZE",): "XI", ("XI",): "XI", ("11",): "XI",
+    ("DECIMO", "SEGUNDO"): "XII", ("DOZE",): "XII", ("XII",): "XII", ("12",): "XII",
+    ("DECIMO", "TERCEIRO"): "XIII", ("TREZE",): "XIII", ("XIII",): "XIII", ("13",): "XIII",
+    ("DECIMO", "QUARTO"): "XIV", ("CATORZE",): "XIV", ("QUATORZE",): "XIV", ("XIV",): "XIV", ("14",): "XIV",
+    ("DECIMO", "QUINTO"): "XV", ("QUINZE",): "XV", ("XV",): "XV", ("15",): "XV",
+    ("DECIMO", "SEXTO"): "XVI", ("DEZESSEIS",): "XVI", ("XVI",): "XVI", ("16",): "XVI",
+    ("DECIMO", "SETIMO"): "XVII", ("DEZESSETE",): "XVII", ("XVII",): "XVII", ("17",): "XVII",
+    ("DECIMO", "OITAVO"): "XVIII", ("DEZOITO",): "XVIII", ("XVIII",): "XVIII", ("18",): "XVIII",
+    ("DECIMO", "NONO"): "XIX", ("DEZENOVE",): "XIX", ("XIX",): "XIX", ("19",): "XIX",
+    ("VIGESIMO",): "XX", ("VINTE",): "XX", ("XX",): "XX", ("20",): "XX",
+    ("VIGESIMO", "PRIMEIRO"): "XXI", ("VINTE", "E", "UM"): "XXI", ("XXI",): "XXI", ("21",): "XXI",
+}
+_DANGLING_CONJUNCTIONS = {
+    "E", "OU", "DE", "DA", "DO", "DAS", "DOS", "EM", "NO", "NA", "NOS", "NAS",
+    "O", "A", "OS", "AS", "UM", "UMA", "COM", "POR", "PARA", "QUE", "SE",
+}
+
+# Multi-word secret code names, historical entities, and dates for Selective Emphasis
+_SELECTIVE_MULTIWORD_PHRASES: Dict[Tuple[str, ...], Tuple[str, str]] = {
+    ("SOL", "INVICTUS"): ("SOL INVICTUS", "entity"),
+    ("PAPAI", "NOEL"): ("PAPAI NOEL", "entity"),
+    ("SANTA", "CLAUS"): ("SANTA CLAUS", "entity"),
+    ("SAO", "NICOLAU"): ("SÃO NICOLAU", "entity"),
+    ("BISPO", "NICOLAU"): ("BISPO NICOLAU", "entity"),
+    ("OLIVER", "CROMWELL"): ("OLIVER CROMWELL", "entity"),
+    ("CARLOS", "SEGUNDO"): ("CARLOS II", "entity"),
+    ("CARLOS", "II"): ("CARLOS II", "entity"),
+    ("REI", "CARLOS", "II"): ("REI CARLOS II", "entity"),
+    ("RAINHA", "VITORIA"): ("RAINHA VITÓRIA", "entity"),
+    ("PRINCIPE", "ALBERT"): ("PRÍNCIPE ALBERT", "entity"),
+    ("CHARLES", "DICKENS"): ("CHARLES DICKENS", "entity"),
+    ("EBENEZER", "SCROOGE"): ("SCROOGE", "entity"),
+    ("THOMAS", "NAST"): ("THOMAS NAST", "entity"),
+    ("HADDON", "SUNDBLOM"): ("HADDON SUNDBLOM", "entity"),
+    ("CLEMENT", "MOORE"): ("CLEMENT MOORE", "entity"),
+    ("CACADA", "SELVAGEM"): ("CAÇADA SELVAGEM", "danger"),
+    ("WILD", "HUNT"): ("WILD HUNT", "danger"),
+    ("PUDIM", "DE", "AMEIXA"): ("PUDIM DE AMEIXA", "entity"),
+    ("PLUM", "PUDDING"): ("PLUM PUDDING", "entity"),
+    ("CONTO", "DE", "NATAL"): ("CONTO DE NATAL", "entity"),
+    ("COCA", "COLA"): ("COCA-COLA", "entity"),
+    ("NOVA", "YORK"): ("NOVA YORK", "entity"),
+    ("NOVA", "IORQUE"): ("NOVA YORK", "entity"),
+    ("TEMPLO", "DE", "ARTEMIS"): ("TEMPLO DE ÁRTEMIS", "entity"),
+    ("CONCILIO", "DE", "NICEIA"): ("CONCÍLIO DE NICEIA", "entity"),
+    ("SOLSTICIO", "DE", "INVERNO"): ("SOLSTÍCIO DE INVERNO", "entity"),
+    ("LAGO", "TRASIMENO"): ("LAGO TRASIMENO", "entity"),
+    ("CRONOGRAFO", "DE", "354"): ("CRONÓGRAFO DE 354", "date_num"),
+    ("ABADE", "DA", "DESORDEM"): ("ABADE DA DESORDEM", "danger"),
+    ("NATAL", "MACABRO"): ("NATAL MACABRO", "danger"),
+    ("25", "DE", "DEZEMBRO"): ("25 DE DEZEMBRO", "date_num"),
+    ("5", "DE", "DEZEMBRO"): ("5 DE DEZEMBRO", "date_num"),
+    ("17", "DE", "DEZEMBRO"): ("17 DE DEZEMBRO", "date_num"),
+}
+
+_SELECTIVE_HISTORICAL_NOUNS: Dict[str, str] = {
+    "SATURNALIA": "entity",
+    "KRAMPUS": "danger",
+    "KRAMPUSNACHT": "danger",
+    "CROMWELL": "entity",
+    "CANTERBURY": "entity",
+    "NATAL": "entity",
+    "YULE": "entity",
+    "ODIN": "entity",
+    "SLEIPNIR": "entity",
+    "SINTERKLAAS": "entity",
+    "NICOLAU": "entity",
+    "CONSTANTINO": "entity",
+    "AURELIANO": "entity",
+    "DICKENS": "entity",
+    "SCROOGE": "entity",
+    "VITORIA": "entity",
+    "WINDSOR": "entity",
+    "PURITANOS": "entity",
+    "PURITANO": "entity",
+    "SOLSTICIO": "entity",
+    "PAGAOS": "entity",
+    "PAGAO": "entity",
+    "ROMA": "entity",
+    "LONDRES": "entity",
+    "MIRA": "entity",
+    "ALPES": "entity",
+    "BOSTON": "entity",
+    "MASSACHUSETTS": "entity",
+    "ANIBAL": "entity",
+    "TRASIMENO": "entity",
+    "WASSAILING": "entity",
+    "SIGILLARIA": "entity",
+    "BAVIERA": "entity",
+    "VATICANO": "entity",
+    "PARLAMENTO": "entity",
+    "MOTIM": "danger",
+    "REVOLTA": "danger",
+    "PROIBICAO": "danger",
+    "INQUISICAO": "danger",
+    "SACRIFICIO": "danger",
+    "SACRIFICIOS": "danger",
+    "SANGUE": "danger",
+    "SOMBRA": "danger",
+    "FOGUEIRA": "entity",
+    "IMPERADOR": "entity",
+    "EXERCITO": "danger",
+    "HERESIA": "danger",
+    "CAOS": "danger",
+    "ORGIAS": "danger",
+    "ESCRAVOS": "entity",
+    "PROPAGANDA": "danger",
+    "COCA-COLA": "entity",
+    "DECRETOS": "danger",
+    "DECRETO": "danger",
+    "GUERRA": "danger",
+    "PRISAO": "danger",
+    "CORRENTES": "danger",
+    "DEMONIOS": "danger",
+    "DEMONIO": "danger",
+    "ESCURIDAO": "danger",
+}
+
+_SELECTIVE_IMPACT_VERBS = {
+    "PROIBIRAM", "PROIBIU", "PROIBIDO", "PROIBIR",
+    "INVADIAM", "INVADIRAM", "INVADIU", "INVADIR",
+    "DEMOLIA", "DEMOLIU", "DEMOLIR", "DEMOLIRAM",
+    "EXPLODIU", "EXPLODIRAM", "EXPLODIR",
+    "APAGAR", "APAGARAM", "APAGOU",
+    "MORREU", "MORRER", "MORRIAM",
+    "MATAVA", "MATARAM", "MATOU",
+    "DESTRUIU", "DESTRUIRAM", "DESTRUIR",
+    "REESCRITO", "REESCREVEU", "REESCREVERAM",
+    "TERRORIZAVA", "ATERRORIZAVA", "ATERRORIZAVAM",
+    "BANIU", "BANIRAM", "BANIDO",
+    "QUEIMARAM", "QUEIMOU", "QUEIMAVAM",
+    "PRENDIAM", "PRENDERAM", "PRENDEU",
+    "ARRASTAVAM", "ARRASTARAM",
+    "DOMESTICOU", "DOMESTICARAM", "DOMESTICANDO",
+    "DECRETOU", "DECRETARAM", "DECRETAVA",
+    "ESCONDERAM", "OCULTARAM", "OCULTOU",
+    "TOMARAM", "REVOLTOU", "REVOLTARAM",
+    "SOBREVIVEU", "MASSACROU", "CAIU", "RENASCEU",
+    "ASSOMBRA", "DEVORAVA", "PERSEGUIAM", "FORCOU",
+    "FORCAVA", "ESMAGOU", "EXTINGUIU", "REVOGOU",
+}
+
+
+def _strip_word_punct(word: str) -> Tuple[str, str]:
+    """Split a token into (core_without_edge_punct, trailing_punct)."""
+    raw = str(word or "").strip()
+    m = re.match(r"^[\"'(«\[]*(.*?)([.,!?;:»\])\"']*)$", raw)
+    if not m:
+        return raw, ""
+    return m.group(1), m.group(2)
+
+
+def _parse_pt_number_sequence(tokens: List[Dict[str, Any]], start_idx: int) -> Optional[Tuple[int, int, str]]:
+    """Parse a spelled-out Portuguese number starting at `start_idx`.
+    Returns `(end_idx_exclusive, value, trailing_punct)` or None.
+    Safely avoids converting standalone articles like 'um' / 'uma' into '1'.
     """
-    clean_words: List[Dict[str, Any]] = []
-    global_idx = 0
+    n = len(tokens)
+    if start_idx >= n:
+        return None
+
+    def _norm_at(idx: int) -> Tuple[str, str]:
+        core, punct = _strip_word_punct(tokens[idx]["word"])
+        return _strip_accents_upper(core), punct
+
+    first_norm, first_punct = _norm_at(start_idx)
+    if first_norm not in _PT_UNITS and first_norm not in _PT_TEENS and first_norm not in _PT_TENS and first_norm not in _PT_HUNDREDS and first_norm != "MIL":
+        return None
+
+    i = start_idx
+    total = 0
+    current = 0
+    matched_words = 0
+    last_punct = ""
+    has_thousand = False
+    has_hundred = False
+    has_ten = False
+
+    while i < n:
+        norm, punct = _norm_at(i)
+        if norm == "E" and matched_words > 0 and (i + 1) < n:
+            nxt_norm, _ = _norm_at(i + 1)
+            if nxt_norm in _PT_UNITS or nxt_norm in _PT_TEENS or nxt_norm in _PT_TENS or nxt_norm in _PT_HUNDREDS or nxt_norm == "MIL":
+                i += 1
+                continue
+            break
+
+        if norm == "MIL" and not has_thousand:
+            total += (current if current > 0 else 1) * 1000
+            current = 0
+            has_thousand = True
+            matched_words += 1
+            last_punct = punct
+            i += 1
+            if punct and punct not in (",",):
+                break
+            continue
+
+        if norm in _PT_HUNDREDS and not has_hundred and not has_ten:
+            current += _PT_HUNDREDS[norm]
+            has_hundred = True
+            matched_words += 1
+            last_punct = punct
+            i += 1
+            if punct and punct not in (",",):
+                break
+            continue
+
+        if norm in _PT_TEENS and not has_ten:
+            current += _PT_TEENS[norm]
+            has_ten = True
+            matched_words += 1
+            last_punct = punct
+            i += 1
+            break
+
+        if norm in _PT_TENS and not has_ten:
+            current += _PT_TENS[norm]
+            has_ten = True
+            matched_words += 1
+            last_punct = punct
+            i += 1
+            if punct and punct not in (",",):
+                break
+            continue
+
+        if norm in _PT_UNITS:
+            # Avoid chaining two raw units like "um dois"
+            if matched_words > 0 and not (has_thousand or has_hundred or has_ten):
+                break
+            current += _PT_UNITS[norm]
+            matched_words += 1
+            last_punct = punct
+            i += 1
+            # Peek if followed by "mil" (e.g., "dois mil")
+            if i < n and _norm_at(i)[0] == "MIL" and not has_thousand and not punct:
+                continue
+            break
+
+        break
+
+    val = total + current
+    if matched_words == 0 or val <= 0:
+        return None
+
+    # Guard against turning lone articles/small prose words ("um conto", "uma noite", "dois lados") into digits
+    if matched_words == 1:
+        if first_norm in ("UM", "UMA", "DOIS", "DUAS", "TRES", "QUATRO", "CINCO", "SEIS", "SETE", "OITO", "NOVE"):
+            # Only convert lone small number if directly followed by era ("a.C."/"d.C."/"antes de cristo") or "%"/"por cento"
+            next_is_qual = False
+            if i < n:
+                n1 = _norm_at(i)[0]
+                if n1 in ("POR", "MILHOES", "BILHOES", "ANTES", "DEPOIS", "AC", "DC"):
+                    next_is_qual = True
+            if not next_is_qual:
+                return None
+        if first_norm in ("MIL", "CEM", "DEZ", "VINTE", "TRINTA", "QUARENTA", "CINQUENTA", "SESSENTA", "SETENTA", "OITENTA", "NOVENTA"):
+            # Convert lone round numbers >= 100 or when followed by "de" / "anos" / "por cento" / era
+            if val < 100:
+                if i < n and _norm_at(i)[0] in ("POR", "ANOS", "DE", "MIL", "MILHOES", "BILHOES"):
+                    pass
+                else:
+                    return None
+
+    return i, val, last_punct
+
+
+def compact_spelled_numbers_in_words(words: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize raw word timestamps and compact PT-BR spelled-out years, numbers, and centuries
+    into crisp numerals/dates (e.g. 'mil seiscentos e quarenta e sete' -> '1647',
+    'trezentos e trinta e seis' -> '336', 'duzentos e dezessete antes de cristo' -> '217 a.C.',
+    'século décimo primeiro' -> 'SÉC. XI').
+    """
+    # 1. Split multi-word entries & drop standalone pure punctuation
+    flat: List[Dict[str, Any]] = []
     for w in words or []:
         raw = str(w.get("word", w.get("text", ""))).strip()
         parts = [p for p in re.split(r"\s+", raw) if p and _has_alnum_or_emoji(p)]
@@ -303,24 +654,288 @@ def group_words_into_chunks(words: List[Dict[str, Any]], max_words: int = 3) -> 
         en = float(w.get("end", st + 0.06))
         step = max(0.06, (en - st) / float(len(parts)))
         for j, part in enumerate(parts):
-            clean_words.append(
+            flat.append(
                 {
                     "word": part,
                     "start": round(st + j * step, 3),
                     "end": round(st + (j + 1) * step, 3),
-                    "g_idx": global_idx,
                 }
             )
-            global_idx += 1
+
+    out: List[Dict[str, Any]] = []
+    n = len(flat)
+    i = 0
+    while i < n:
+        core_i, punct_i = _strip_word_punct(flat[i]["word"])
+        norm_i = _strip_accents_upper(core_i)
+
+        # A) Century expressions: "século quarto" / "século décimo primeiro" / "século XIX" / "séc. IV"
+        if norm_i in ("SECULO", "SEC", "SEC.") and (i + 1) < n:
+            matched_cent = None
+            for span_len in (3, 2, 1):
+                if i + 1 + span_len <= n:
+                    cand_tuple = tuple(
+                        _strip_accents_upper(_strip_word_punct(flat[i + 1 + k]["word"])[0])
+                        for k in range(span_len)
+                    )
+                    if cand_tuple in _PT_CENTURY_ORDINALS:
+                        _, end_p = _strip_word_punct(flat[i + span_len]["word"])
+                        matched_cent = (i + 1 + span_len, f"SÉC. {_PT_CENTURY_ORDINALS[cand_tuple]}{end_p}")
+                        break
+            if matched_cent is not None:
+                end_idx, cent_str = matched_cent
+                out.append(
+                    {
+                        "word": cent_str,
+                        "start": flat[i]["start"],
+                        "end": flat[end_idx - 1]["end"],
+                        "g_idx": len(out),
+                    }
+                )
+                i = end_idx
+                continue
+
+        # B) Already-numeric token followed by "antes de cristo" / "depois de cristo" / "a.C." / "d.C."
+        if re.fullmatch(r"\d{1,4}", core_i):
+            era_suffix = ""
+            advance = 1
+            if i + 3 < n:
+                t1 = _strip_accents_upper(_strip_word_punct(flat[i + 1]["word"])[0])
+                t2 = _strip_accents_upper(_strip_word_punct(flat[i + 2]["word"])[0])
+                t3, p3 = _strip_word_punct(flat[i + 3]["word"])
+                t3_n = _strip_accents_upper(t3)
+                if t1 == "ANTES" and t2 == "DE" and t3_n == "CRISTO":
+                    era_suffix = f" a.C.{p3}"
+                    advance = 4
+                elif t1 == "DEPOIS" and t2 == "DE" and t3_n == "CRISTO":
+                    era_suffix = f" d.C.{p3}"
+                    advance = 4
+            if not era_suffix and i + 1 < n:
+                c1, p1 = _strip_word_punct(flat[i + 1]["word"])
+                n1 = _strip_accents_upper(c1).replace(".", "")
+                if n1 == "AC":
+                    era_suffix = f" a.C.{p1}"
+                    advance = 2
+                elif n1 == "DC":
+                    era_suffix = f" d.C.{p1}"
+                    advance = 2
+            if era_suffix:
+                out.append(
+                    {
+                        "word": f"{core_i}{era_suffix}",
+                        "start": flat[i]["start"],
+                        "end": flat[i + advance - 1]["end"],
+                        "g_idx": len(out),
+                    }
+                )
+                i += advance
+                continue
+
+        # C) Spelled-out Portuguese number / year sequence
+        parsed = _parse_pt_number_sequence(flat, i)
+        if parsed is not None:
+            end_idx, val, trail_p = parsed
+            text_val = str(val)
+            # Check for trailing "antes de cristo" / "depois de cristo" / "a.C." / "d.C." / "por cento"
+            if end_idx + 2 < n:
+                t1 = _strip_accents_upper(_strip_word_punct(flat[end_idx]["word"])[0])
+                t2 = _strip_accents_upper(_strip_word_punct(flat[end_idx + 1]["word"])[0])
+                t3_raw, p3 = _strip_word_punct(flat[end_idx + 2]["word"])
+                t3 = _strip_accents_upper(t3_raw)
+                if t1 == "ANTES" and t2 == "DE" and t3 == "CRISTO":
+                    text_val = f"{val} a.C."
+                    trail_p = p3
+                    end_idx += 3
+                elif t1 == "DEPOIS" and t2 == "DE" and t3 == "CRISTO":
+                    text_val = f"{val} d.C."
+                    trail_p = p3
+                    end_idx += 3
+            if end_idx + 1 < n and "C." not in text_val:
+                t1 = _strip_accents_upper(_strip_word_punct(flat[end_idx]["word"])[0])
+                t2_raw, p2 = _strip_word_punct(flat[end_idx + 1]["word"])
+                t2 = _strip_accents_upper(t2_raw)
+                if t1 == "POR" and t2 == "CENTO":
+                    text_val = f"{val}%"
+                    trail_p = p2
+                    end_idx += 2
+            if end_idx < n and "C." not in text_val and "%" not in text_val:
+                c_next, p_next = _strip_word_punct(flat[end_idx]["word"])
+                n_next = _strip_accents_upper(c_next).replace(".", "")
+                if n_next == "AC":
+                    text_val = f"{val} a.C."
+                    trail_p = p_next
+                    end_idx += 1
+                elif n_next == "DC":
+                    text_val = f"{val} d.C."
+                    trail_p = p_next
+                    end_idx += 1
+
+            out.append(
+                {
+                    "word": f"{text_val}{trail_p}",
+                    "start": flat[i]["start"],
+                    "end": flat[end_idx - 1]["end"],
+                    "g_idx": len(out),
+                }
+            )
+            i = end_idx
+            continue
+
+        item = dict(flat[i])
+        item["g_idx"] = len(out)
+        out.append(item)
+        i += 1
+
+    return out
+
+
+def build_selective_emphasis_chunks(
+    words: List[Dict[str, Any]],
+    min_display_s: float = 0.72,
+    max_display_s: float = 1.65,
+) -> List[Dict[str, Any]]:
+    """Build 16:9 Documentary Selective Emphasis keyword triggers (NO continuous karaoke!).
+    Triggers ONLY on:
+      - numbers, dates, years, centuries ('217 a.C.', '336', '1647', '1843', 'SÉC. IV', 'SÉC. XI')
+      - secret code names & key historical nouns ('SATURNÁLIA', 'SOL INVICTUS', 'KRAMPUS', 'PAPAI NOEL', 'CROMWELL', 'CANTERBURY')
+      - dramatic impact verbs ('PROIBIRAM', 'INVADIAM', 'DEMOLIA', 'EXPLODIU', 'APAGAR', 'MORREU')
+    """
+    compacted = compact_spelled_numbers_in_words(words)
+    if not compacted:
+        return []
+
+    triggers: List[Dict[str, Any]] = []
+    n = len(compacted)
+    i = 0
+    while i < n:
+        # 1. Check multi-word historical / date phrases first (up to 3 words)
+        phrase_hit = None
+        for span in (3, 2):
+            if i + span <= n:
+                key_t = tuple(
+                    _strip_accents_upper(_strip_word_punct(compacted[i + k]["word"])[0])
+                    for k in range(span)
+                )
+                if key_t in _SELECTIVE_MULTIWORD_PHRASES:
+                    disp_txt, cat = _SELECTIVE_MULTIWORD_PHRASES[key_t]
+                    phrase_hit = (i + span, disp_txt, cat)
+                    break
+
+        if phrase_hit is not None:
+            end_i, disp_txt, cat = phrase_hit
+            st = float(compacted[i]["start"])
+            en = float(compacted[end_i - 1]["end"])
+            triggers.append(
+                {
+                    "start": st,
+                    "end": max(en, st + min_display_s),
+                    "selective": True,
+                    "category": cat,
+                    "accent_hex": "#D9381E" if cat in ("verb", "danger") else "#EAB308",
+                    "words": [
+                        {
+                            "word": disp_txt,
+                            "start": st,
+                            "end": max(en, st + min_display_s),
+                            "g_idx": len(triggers),
+                        }
+                    ],
+                }
+            )
+            i = end_i
+            continue
+
+        # 2. Check single compacted token
+        core, _ = _strip_word_punct(compacted[i]["word"])
+        norm = _strip_accents_upper(core)
+        cat = ""
+        disp = ""
+
+        # Numbers, years, dates, centuries (e.g. '217 a.C.', '336', '1647', '1843', 'SÉC. IV', 'SÉC. XI')
+        if norm.startswith("SEC.") or re.search(r"\d", core):
+            # Preserve 'a.C.' / 'd.C.' formatting cleanly
+            m_era = re.match(r"^(\d{1,4})\s*([ad]\.?\s*c\.?)$", core, flags=re.IGNORECASE)
+            if m_era:
+                era = "a.C." if m_era.group(2).lower().startswith("a") else "d.C."
+                disp = f"{m_era.group(1)} {era}"
+            else:
+                disp = unicodedata.normalize("NFC", core).upper()
+            cat = "date_num"
+        elif norm in _SELECTIVE_HISTORICAL_NOUNS:
+            disp = unicodedata.normalize("NFC", core).upper()
+            cat = _SELECTIVE_HISTORICAL_NOUNS[norm]
+        elif norm in _SELECTIVE_IMPACT_VERBS:
+            disp = unicodedata.normalize("NFC", core).upper()
+            cat = "verb"
+
+        if cat and disp:
+            st = float(compacted[i]["start"])
+            en = float(compacted[i]["end"])
+            dur_end = min(st + max_display_s, max(en + 0.25, st + min_display_s))
+            triggers.append(
+                {
+                    "start": st,
+                    "end": dur_end,
+                    "selective": True,
+                    "category": cat,
+                    "accent_hex": "#D9381E" if cat in ("verb", "danger") else "#EAB308",
+                    "words": [
+                        {
+                            "word": disp,
+                            "start": st,
+                            "end": dur_end,
+                            "g_idx": len(triggers),
+                        }
+                    ],
+                }
+            )
+        i += 1
+
+    # Ensure strictly non-overlapping display windows
+    for idx in range(len(triggers) - 1):
+        nxt_st = float(triggers[idx + 1]["start"])
+        if float(triggers[idx]["end"]) > nxt_st - 0.04:
+            new_end = max(float(triggers[idx]["start"]) + 0.18, nxt_st - 0.04)
+            triggers[idx]["end"] = round(new_end, 3)
+            triggers[idx]["words"][0]["end"] = round(new_end, 3)
+        else:
+            triggers[idx]["end"] = round(min(float(triggers[idx]["end"]), float(triggers[idx]["start"]) + max_display_s), 3)
+            triggers[idx]["words"][0]["end"] = triggers[idx]["end"]
+
+    return triggers
+
+
+def group_words_into_chunks(
+    words: List[Dict[str, Any]],
+    max_words: int = 3,
+    selective: bool = False,
+) -> List[Dict[str, Any]]:
+    """Split multi-word tokens, compact spelled-out numbers/years/centuries into numerals,
+    strip standalone pure-punctuation tokens (e.g. '-', '—', '–', '...'), prevent orphaned
+    conjunction chunks ('E TRINTA E', 'E QUARENTA E'), and group into crisp 2-3 word chunks.
+    When `selective=True`, returns only Selective Emphasis keyword triggers.
+    """
+    if selective:
+        return build_selective_emphasis_chunks(words)
+
+    clean_words = compact_spelled_numbers_in_words(words)
 
     chunks: List[Dict[str, Any]] = []
     buf: List[Dict[str, Any]] = []
-    for w in clean_words:
+    n_clean = len(clean_words)
+    for idx_w, w in enumerate(clean_words):
         buf.append(w)
         txt = w["word"]
         end_punct = txt.endswith((".", "!", "?", ";", ":"))
         char_len = sum(len(x["word"]) for x in buf) + max(0, len(buf) - 1)
-        if len(buf) >= max_words or end_punct or char_len >= 16:
+        last_norm = _strip_accents_upper(_strip_word_punct(txt)[0])
+        is_dangling_end = (last_norm in _DANGLING_CONJUNCTIONS) and (not end_punct) and ((idx_w + 1) < n_clean)
+
+        should_flush = (len(buf) >= max_words or end_punct or char_len >= 16)
+        # Never end a chunk on a dangling conjunction ('E', 'DE', 'DA', 'DO') if we can absorb 1 more word
+        if should_flush and is_dangling_end and len(buf) <= max_words:
+            should_flush = False
+        if should_flush:
             chunks.append(
                 {
                     "start": buf[0]["start"],
@@ -330,7 +945,17 @@ def group_words_into_chunks(words: List[Dict[str, Any]], max_words: int = 3) -> 
             )
             buf = []
     if buf:
-        chunks.append({"start": buf[0]["start"], "end": buf[-1]["end"], "words": buf})
+        # Avoid a 1-word orphaned conjunction trailing chunk by merging into previous chunk if close
+        if (
+            len(buf) == 1
+            and chunks
+            and _strip_accents_upper(_strip_word_punct(buf[0]["word"])[0]) in _DANGLING_CONJUNCTIONS
+            and (buf[0]["start"] - chunks[-1]["end"]) <= 0.35
+        ):
+            chunks[-1]["words"].append(buf[0])
+            chunks[-1]["end"] = buf[0]["end"]
+        else:
+            chunks.append({"start": buf[0]["start"], "end": buf[-1]["end"], "words": buf})
 
     for i in range(len(chunks) - 1):
         gap = chunks[i + 1]["start"] - chunks[i]["end"]
@@ -1430,6 +2055,200 @@ def _render_typewriter_highlight(
 
 
 # ---------------------------------------------------------------------------
+# Style 6: selective_emphasis (16:9 Documentary Keyword Emphasis — Courier Prime Bold 64px)
+# ---------------------------------------------------------------------------
+def _cubic_bezier_doc_snap(x: float, x1: float = 0.22, y1: float = 1.0, x2: float = 0.36, y2: float = 1.0) -> float:
+    """Exact CSS cubic-bezier(0.22, 1, 0.36, 1) ease-out quint-like snap."""
+    t_target = _clamp01(x)
+    if t_target <= 0.0:
+        return 0.0
+    if t_target >= 1.0:
+        return 1.0
+    lo, hi = 0.0, 1.0
+    for _ in range(12):
+        mid = 0.5 * (lo + hi)
+        inv = 1.0 - mid
+        bx = 3.0 * inv * inv * mid * x1 + 3.0 * inv * mid * mid * x2 + mid * mid * mid
+        if bx < t_target:
+            lo = mid
+        else:
+            hi = mid
+    u = 0.5 * (lo + hi)
+    inv = 1.0 - u
+    return 3.0 * inv * inv * u * y1 + 3.0 * inv * u * u * y2 + u * u * u
+
+
+def _ensure_selective_chunks(chunk_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return cached Selective Emphasis keyword chunks whether the caller passed pre-filtered
+    selective chunks or raw continuous word chunks.
+    """
+    if not chunk_list:
+        return []
+    if all(bool(ch.get("selective")) for ch in chunk_list):
+        return chunk_list
+
+    first_ch = chunk_list[0]
+    last_ch = chunk_list[-1]
+    first_ws = first_ch.get("words") or []
+    last_ws = last_ch.get("words") or []
+    cache_key = (
+        len(chunk_list),
+        round(float(first_ch.get("start", 0.0)), 3),
+        round(float(last_ch.get("end", 0.0)), 3),
+        str(first_ws[0].get("word", "")) if first_ws else "",
+        str(last_ws[-1].get("word", "")) if last_ws else "",
+    )
+    cached = _SELECTIVE_CHUNKS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    flat_words: List[Dict[str, Any]] = []
+    for ch in chunk_list:
+        for wd in ch.get("words") or []:
+            flat_words.append(wd)
+    selective = build_selective_emphasis_chunks(flat_words)
+    if len(_SELECTIVE_CHUNKS_CACHE) >= 32:
+        _SELECTIVE_CHUNKS_CACHE.clear()
+    _SELECTIVE_CHUNKS_CACHE[cache_key] = selective
+    return selective
+
+
+def _render_selective_emphasis(
+    canvas: skia.Canvas,
+    chunk: Dict[str, Any],
+    chunk_idx: int,
+    t: float,
+    w: int,
+    h: int,
+    typeface: skia.Typeface,
+    base_size: float,
+    lower_third_active: bool = False,
+) -> None:
+    """Render JSON v3.0.0 `keyword_kinetic_captions` in Selective Emphasis mode:
+    - Courier Prime Bold 64px (`#FFFFFF`)
+    - Drop shadow `0px 4px 16px rgba(0,0,0,0.85)`
+    - `#EAB308` / `#D9381E` tactical bracket & animated underline accent
+    - Positioned at `bottom_right` (`x = w - 96 - text_w, y = h - 92`) when lower-left date stamp is active,
+      or centered at `y = h - 108` otherwise.
+    """
+    words = chunk.get("words") or []
+    if not words:
+        return
+
+    cp_tf = _get_courier_prime_bold_typeface(fallback=typeface) or typeface
+    raw_label = " ".join(str(wd.get("word", wd.get("text", ""))).strip() for wd in words).strip()
+    label = _sanitize_word_text(raw_label, typeface=cp_tf, uppercase=True)
+    if not label:
+        return
+
+    chunk_start = float(chunk.get("start", words[0].get("start", 0.0)))
+    chunk_end = float(chunk.get("end", words[-1].get("end", chunk_start + 0.8)))
+    age = max(0.0, t - chunk_start)
+    rem = max(0.0, chunk_end - t)
+
+    ent = _cubic_bezier_doc_snap(_clamp01(age / 0.24))
+    exit_p = _ease_out_cubic(_clamp01(rem / 0.16)) if rem < 0.16 else 1.0
+    alpha = int(round(255.0 * min(ent, exit_p)))
+    if alpha <= 6:
+        return
+
+    is_wide = w >= h
+    scale_ref = (float(w) / 1920.0) if is_wide else (float(w) / 1080.0)
+    eff_size = float(base_size) if (base_size > 10.0) else (64.0 * scale_ref)
+
+    max_avail_w = float(w) * (0.44 if (is_wide and lower_third_active) else 0.80)
+    font = skia.Font(cp_tf, eff_size)
+    font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
+    text_w = float(font.measureText(label))
+    if text_w > max_avail_w and text_w > 1.0:
+        eff_size = max(28.0, eff_size * (max_avail_w / text_w))
+        font = skia.Font(cp_tf, eff_size)
+        font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
+        text_w = float(font.measureText(label))
+
+    fm = font.getMetrics()
+    ascent = abs(float(fm.fAscent))
+    descent = abs(float(fm.fDescent))
+
+    margin_x = 96.0 * (float(w) / 1920.0) if is_wide else 56.0
+    if is_wide and lower_third_active:
+        text_x = max(float(w) * 0.48, float(w) - margin_x - text_w)
+        baseline_y = float(h) - 92.0 * (float(h) / 1080.0)
+    elif is_wide:
+        text_x = (float(w) - text_w) * 0.5
+        baseline_y = float(h) - 108.0 * (float(h) / 1080.0)
+    else:
+        text_x = (float(w) - text_w) * 0.5
+        baseline_y = float(h) * 0.82
+
+    accent_hex = str(chunk.get("accent_hex") or "")
+    if not accent_hex:
+        cat = str(chunk.get("category") or "")
+        accent_hex = "#D9381E" if cat in ("verb", "danger") else "#EAB308"
+    ar, ag, ab = _hex_to_rgb(accent_hex)
+
+    slide_y = (1.0 - ent) * 14.0
+    draw_y = baseline_y + slide_y
+
+    # Subtle translucent slate tactical frame behind keyword (zero bulky cartoon box)
+    pad_x = max(14.0, eff_size * 0.28)
+    pad_top = max(10.0, eff_size * 0.20)
+    pad_bot = max(12.0, eff_size * 0.24)
+    box_l = text_x - pad_x
+    box_t = draw_y - ascent - pad_top
+    box_w = text_w + pad_x * 2.0
+    box_h = ascent + descent + pad_top + pad_bot
+
+    # Clip left-to-right reveal on entrance for snappy Vox/Johnny Harris kinetic feel
+    canvas.save()
+    reveal_w = (box_w + 48.0) * max(0.05, ent)
+    canvas.clipRect(skia.Rect.MakeXYWH(box_l - 24.0, box_t - 24.0, reveal_w, box_h + 64.0))
+
+    bg_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(int(alpha * 0.48), 18, 20, 23))
+    canvas.drawRoundRect(skia.Rect.MakeXYWH(box_l, box_t, box_w, box_h), 6.0, 6.0, bg_p)
+
+    # Tactical left & right square brackets `[` `]` in #EAB308 / #D9381E
+    brk_len = max(12.0, eff_size * 0.24)
+    brk_p = skia.Paint(
+        AntiAlias=True,
+        Style=skia.Paint.kStroke_Style,
+        StrokeWidth=max(2.5, eff_size * 0.055),
+        StrokeCap=skia.Paint.kSquare_Cap,
+        Color=skia.ColorSetARGB(alpha, ar, ag, ab),
+    )
+    # Left bracket `[`
+    canvas.drawLine(box_l, box_t, box_l + brk_len, box_t, brk_p)
+    canvas.drawLine(box_l, box_t, box_l, box_t + box_h, brk_p)
+    canvas.drawLine(box_l, box_t + box_h, box_l + brk_len, box_t + box_h, brk_p)
+    # Right bracket `]`
+    box_r = box_l + box_w
+    canvas.drawLine(box_r - brk_len, box_t, box_r, box_t, brk_p)
+    canvas.drawLine(box_r, box_t, box_r, box_t + box_h, brk_p)
+    canvas.drawLine(box_r - brk_len, box_t + box_h, box_r, box_t + box_h, brk_p)
+
+    # Animated sweeping underline bar beneath baseline (`#EAB308` or `#D9381E`)
+    ul_prog = _cubic_bezier_doc_snap(_clamp01(age / 0.30))
+    ul_y = draw_y + descent + 5.0
+    ul_h = max(3.5, eff_size * 0.065)
+    ul_rect = skia.Rect.MakeXYWH(text_x, ul_y, max(6.0, text_w * ul_prog), ul_h)
+    canvas.drawRoundRect(ul_rect, 2.0, 2.0, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(alpha, ar, ag, ab)))
+
+    # Pure #FFFFFF Courier Prime Bold 64px text with drop_shadow: 0px 4px 16px rgba(0,0,0,0.85)
+    txt_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(alpha, 255, 255, 255))
+    txt_p.setImageFilter(
+        skia.ImageFilters.DropShadow(
+            0.0,
+            4.0,
+            8.0,
+            8.0,
+            skia.ColorSetARGB(int(round(alpha * 0.85)), 0, 0, 0),
+        )
+    )
+    canvas.drawString(label, text_x, draw_y, font, txt_p)
+    canvas.restore()
+
+
+# ---------------------------------------------------------------------------
 # Unified Public Entry Point
 # ---------------------------------------------------------------------------
 def draw_kinetic_captions(
@@ -1445,22 +2264,61 @@ def draw_kinetic_captions(
     palette: Optional[List[Tuple[str, str, Tuple[int, int, int, int]]]] = None,
     mood: str = "",
     caption_style: Optional[str] = None,
+    lower_third_active: Optional[bool] = None,
+    selective_mode: Optional[bool] = None,
+    scene_local_t: Optional[float] = None,
+    **kwargs: Any,
 ) -> None:
     """Render studio-grade frame-by-frame kinetic captions onto any Skia Canvas.
 
-    Supports 5 animated presets (`hormozi_neon`, `karaoke_glow`, `word_slam`,
-    `cinema_minimal`, `typewriter_highlight`) plus `dark_cinema` and `none`, smoothly
-    across 30fps/60fps and all aspect ratios (9:16, 16:9, 4:5, 1:1).
-    Automatically selects `DARK_CINEMA_PILL_PALETTE` (Blood Crimson `#9E1B24`,
-    Antique Gold `#FFD166`, Torch Amber `#D97706`) whenever `mood` is dark/historical/investigative
-    or `style`/`caption_style` is `'dark_cinema'`.
+    Supports 6 animated presets (`hormozi_neon`, `karaoke_glow`, `word_slam`,
+    `cinema_minimal`, `typewriter_highlight`, `selective_emphasis`) plus `dark_cinema` and `none`.
+    In 16:9 widescreen (`w >= h`), `selective_emphasis` is the default for `selective_emphasis`
+    and `cinema_minimal` documentary renders (triggering ONLY on numbers/dates/centuries,
+    historical entities, and dramatic impact verbs in Courier Prime Bold 64px — NEVER continuous karaoke).
     """
     raw_style = caption_style if caption_style is not None else style
     resolved_style = resolve_caption_style(raw_style)
     if resolved_style == "none" or not chunks or w <= 0 or h <= 0:
         return
 
+    is_wide = int(w) >= int(h)
+    use_selective = (
+        resolved_style == "selective_emphasis"
+        or (selective_mode is True)
+        or (is_wide and resolved_style == "cinema_minimal" and selective_mode is not False)
+    )
+
     chunk_list: List[Dict[str, Any]] = [chunks] if isinstance(chunks, dict) else list(chunks)
+    if use_selective:
+        sel_chunks = _ensure_selective_chunks(chunk_list)
+        chunk, chunk_idx = _find_active_chunk(sel_chunks, float(t))
+        if chunk is None:
+            return
+        if lower_third_active is None:
+            lt_active = bool(chunk.get("lower_third_active", False))
+            if not lt_active and scene_local_t is not None:
+                lt_active = 0.0 <= float(scene_local_t) < 3.8
+        else:
+            lt_active = bool(lower_third_active)
+        # Default to exact 64px Courier Prime Bold at 1920x1080 (ignore legacy 58px cinema_minimal default)
+        if font_size is None or (is_wide and abs(float(font_size) - 58.0) < 0.5):
+            sel_size = 64.0 * (float(w) / 1920.0) if is_wide else 56.0 * (float(w) / 1080.0)
+        else:
+            sel_size = float(font_size)
+        _render_selective_emphasis(
+            canvas,
+            chunk,
+            chunk_idx,
+            float(t),
+            int(w),
+            int(h),
+            typeface,
+            sel_size,
+            lower_third_active=lt_active,
+        )
+        return
+
     chunk, chunk_idx = _find_active_chunk(chunk_list, float(t))
     if chunk is None:
         return
