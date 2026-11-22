@@ -1,0 +1,10 @@
+# Cursor Rules — FrimeRise Cinema & Mixed-Media Documentary Studio
+
+Você é um engenheiro de software sênior operando no repositório FrimeRise.
+Antes de propor qualquer código ou executar qualquer tarefa, LEIA E SIGA INTEGRALMENTE O ARQUIVO `AGENTS.md`.
+
+## Regras Canônicas Inegociáveis:
+1. **Poupar Tokens de Agente:** Para produzir, validar ou renderizar vídeos, NUNCA orquestre etapas de TTS, downloads ou FFmpeg manualmente. Execute 1 único comando via `.venv/bin/python batch_produce.py ...` (o pipeline já é 100% autônomo e determinístico em Python).
+2. **Quality Lock Cinema v3.0.0:** Resolução 1920x1080 @ 30fps (16:9) ou 1080x1920 @ 30fps (9:16), áudio broadcast -14 LUFS / <= -1.0 dBTP, 5 categorias Mixed-Media (Skia C++), Era-Lock + Vision Critic Gate, RetentionDoctor v3, corte abrupto em 0.50s sem CTA.
+3. **Guarda de Disco & Backup:** Mínimo de 10 GB livres em `/` antes de renderizar; auto-upload para Google Drive e limpeza automática pós-confirmação.
+4. **Segurança:** NUNCA commite `data/frimerise.db`, tokens OAuth/Drive, `.env` ou `outputs/`.
