@@ -1,0 +1,320 @@
+{
+  "schema_version": "3.0.0",
+  "pipeline_name": "Mixed_Media_High_Retention_Documentary_Engine",
+  "target_format": {
+    "platform": "YouTube_Long_Form_Documentary",
+    "aspect_ratio": "16:9",
+    "resolution": {
+      "width": 1920,
+      "height": 1080
+    },
+    "fps": 30,
+    "duration_seconds": {
+      "min": 900,
+      "ideal": 1020,
+      "max": 1200
+    },
+    "target_minutes": {
+      "min": 15.0,
+      "ideal": 17.0,
+      "max": 18.0
+    },
+    "codec_pipeline": {
+      "zero_copy_surface": true,
+      "pixel_format": "bgra",
+      "encoder": "h264_vaapi",
+      "direct_hw_suffix": "format=nv12,hwupload",
+      "cpu_lut3d_blend_bypassed": true
+    }
+  },
+  "editorial_style_dna": {
+    "narrative_references": [
+      "Super Histórico",
+      "H2 History",
+      "Mega Curioso"
+    ],
+    "visual_references": [
+      "Vox",
+      "Johnny Harris",
+      "MagnatesMedia",
+      "Fern",
+      "Elementar"
+    ],
+    "storytelling_rules": {
+      "strict_forward_chronology": true,
+      "topic_keyword_in_first_sentence": true,
+      "fact_check_standard": "BBC_Netflix_Standards_and_Practices",
+      "zero_cta_abrupt_ending": true,
+      "never_open_scene_on_weak_stock_broll": true
+    }
+  },
+  "narrative_architecture": {
+    "total_scenes_target": 25,
+    "words_target_range": [2250, 2450],
+    "words_per_scene_range": [90, 98],
+    "acts": [
+      {
+        "act_id": "ACT_0_COLD_OPEN_HOOK",
+        "label": "COLD OPEN",
+        "scene_indices": [0, 1],
+        "time_range_seconds": [0, 75],
+        "cut_cadence_seconds": 2.2,
+        "narration_wpm_target": 148,
+        "acting_direction": "Urgent, gripping investigative hook; sharp micro-pauses; provocative rising interrogative inflection at the end of Scene 1.",
+        "rules": [
+          "Name the core topic keyword in the very first sentence.",
+          "Establish the central historical paradox immediately.",
+          "End Scene 1 with a haunting direct investigative question."
+        ]
+      },
+      {
+        "act_id": "ACT_1_WORLD_BUILDING",
+        "label": "CAPÍTULO I",
+        "scene_indices": [2, 3, 4, 5, 6],
+        "time_range_seconds": [75, 270],
+        "cut_cadence_seconds": 4.0,
+        "narration_wpm_target": 138,
+        "acting_direction": "Atmospheric, immersive historical chronicler (Super Histórico / H2 History style); deep resonance and gravitas.",
+        "rules": [
+          "Establish deep historical context and geographical setting.",
+          "Progress strictly forward in chronological time with primary dates and verifiable primary sources."
+        ]
+      },
+      {
+        "act_id": "ACT_2_DEEP_MECHANICS",
+        "label": "CAPÍTULO II & III",
+        "scene_indices": [7, 8, 9, 10, 11, 12, 13, 14, 15],
+        "time_range_seconds": [270, 675],
+        "cut_cadence_seconds": 3.5,
+        "narration_wpm_target": 142,
+        "acting_direction": "Forensic, tense investigative pacing; emphasizing secret mechanisms, dates, causal links, and forbidden decrees.",
+        "pattern_interrupt_every_240s": {
+          "enabled": true,
+          "interval_seconds": 240,
+          "triggers_at_seconds": [240, 480, 720],
+          "music_mute_seconds": 1.25,
+          "sfx_trigger": "pattern_interrupt_shutter.wav",
+          "visual_shift": "Hard transition into stark archival plate or 3D schematic reveal"
+        }
+      },
+      {
+        "act_id": "ACT_3_CLIMAX_REVELATION",
+        "label": "CAPÍTULO IV",
+        "scene_indices": [16, 17, 18, 19, 20, 21],
+        "time_range_seconds": [675, 930],
+        "cut_cadence_seconds": 2.7,
+        "narration_wpm_target": 146,
+        "acting_direction": "High-stakes dramatic revelation and intense narrative momentum building toward the modern transformation.",
+        "rules": [
+          "Accelerate cut cadence to 2.7s as historical mechanisms converge.",
+          "Maintain strict chronological progression across 19th- and 20th-century turning points."
+        ]
+      },
+      {
+        "act_id": "ACT_4_ABRUPT_ENDING",
+        "label": "EPÍLOGO",
+        "scene_indices": [22, 23, 24],
+        "time_range_seconds": [930, 1020],
+        "cut_cadence_seconds": 4.5,
+        "narration_wpm_target": 110,
+        "acting_direction": "Slower (~110 WPM), deeply philosophical and haunting final reflection, landing the closing question with genuine rising-falling interrogative weight.",
+        "rules": [
+          "Forensic synthesis connecting all historical fossils to the present.",
+          "ZERO YouTube CTA (no like, subscribe, bell, or outro filler).",
+          "Abrupt cut to black 0.50s after the final spoken syllable."
+        ],
+        "abrupt_cut_to_black_after_final_word_seconds": 0.5
+      }
+    ]
+  },
+  "mixed_media_visual_matrix": {
+    "visual_categories": [
+      "2.5D_Parallax",
+      "2D_Infographic_Over_Realism",
+      "Video_Over_Video_PiP",
+      "Dark_3D_Reconstruction",
+      "Atmospheric_B_Roll"
+    ],
+    "layer_1_photorealistic_2_5d_parallax": {
+      "visual_category": "2.5D_Parallax",
+      "segmentation_model": "u2netp_onnx_guided_filter",
+      "background_dof_blur_px": 3.0,
+      "background_gaussian_kernel": [7, 7],
+      "background_gaussian_sigma": 2.8,
+      "counter_directional_motion": {
+        "foreground_scale_start": 1.0,
+        "foreground_scale_end": 1.14,
+        "background_scale_start": 1.06,
+        "background_scale_end": 1.0
+      },
+      "depth_title_behind_subject": {
+        "shot_index_only": 0,
+        "pass_fg_alpha_mask": true,
+        "min_unoccluded_text_ratio": 0.88,
+        "rule_of_thirds_negative_space": true
+      }
+    },
+    "layer_2_2d_infographic_over_realism": {
+      "visual_category": "2D_Infographic_Over_Realism",
+      "modes": [
+        "2d_schematic_over_realism",
+        "dark_map_route",
+        "sliding_timeline"
+      ],
+      "backdrop_brightness": 0.65,
+      "accent_colors": ["#EAB308", "#D9381E", "#F8FAFC"],
+      "map_route_requires_distinct_origin_dest": true,
+      "timeline_era_matched_global_hero_plates": true
+    },
+    "layer_3_video_over_video_collage": {
+      "visual_category": "Video_Over_Video_PiP",
+      "modes": [
+        "video_over_video_collage",
+        "newspaper_highlighter",
+        "red_string_board",
+        "video_pip_evidence",
+        "broll_video_pip"
+      ],
+      "background_blur_px": 15,
+      "background_opacity": 0.4,
+      "pip_card_scale_range": [0.55, 0.75],
+      "pip_card_border": "2px solid rgba(255,255,255,0.18)",
+      "pip_card_shadow": "0px 20px 50px rgba(0,0,0,0.85)",
+      "pip_card_rotation_deg_range": [-2.0, 2.0],
+      "highlighter_color": "#FFD700",
+      "string_board_complete_by_progress": 0.35,
+      "board_era_matched_global_hero_plates": true
+    },
+    "layer_4_dark_3d_reconstruction": {
+      "visual_category": "Dark_3D_Reconstruction",
+      "modes": ["fern_3d_reconstruction"],
+      "void_background_hex": "#121417",
+      "accent_colors": ["#D9381E", "#EAB308", "#38BDF8"],
+      "volumetric_spotlight": true,
+      "backlit_silhouette_from_fg_alpha": true
+    },
+    "layer_5_atmospheric_broll": {
+      "visual_category": "Atmospheric_B_Roll",
+      "playback_speed": 0.85,
+      "min_luminance_v": 24.0,
+      "max_luminance_v": 130.0,
+      "ban_generic_mood_fallback": true,
+      "reject_modern_electric_lights_and_aerials": true,
+      "fallback_on_vision_reject": "use_scene_2_5d_parallax_plates"
+    }
+  },
+  "visual_cohesion_unifier_stack": {
+    "master_color_grade": {
+      "contrast_pct": 12.0,
+      "saturation_pct": -22.0,
+      "shadows_tint": "#0D1B2A",
+      "highlights_tint": "#E0C097",
+      "applied_via": "skia_cpp_color_matrix_pre_ui"
+    },
+    "vignette_intensity": 0.35,
+    "Master_35mm_Film_Grain": 0.14,
+    "Atmospheric_Dust_Motes": 0.16,
+    "top_progress_bar": {
+      "height_px": 3,
+      "gradient_colors": ["#D9381E", "#EAB308"],
+      "alpha": 170
+    }
+  },
+  "typography_and_overlays": {
+    "fonts": {
+      "display_serif": "Cinzel-Bold.ttf",
+      "forensic_mono": "CourierPrime-Bold.ttf",
+      "fallback_title": "Montserrat-Black.ttf",
+      "fallback_ui": "PlusJakartaSans-ExtraBold.ttf"
+    },
+    "date_and_location_stamp": {
+      "position_16x9": "bottom_left",
+      "margin_px_16x9": {"x": 96, "y": 84},
+      "primary_size_px": 42,
+      "primary_color": "#F8FAFC",
+      "subtitle_size_px": 24,
+      "subtitle_color": "#E0C097",
+      "accent_bar": {"color": "#EAB308", "width_px": 4},
+      "mask_reveal_seconds": 0.4
+    },
+    "keyword_kinetic_captions": {
+      "mode_16x9": "selective_emphasis",
+      "font_size_px": 64,
+      "color": "#FFFFFF",
+      "accent_colors": ["#EAB308", "#D9381E"]
+    }
+  },
+  "archival_media_sourcing": {
+    "priority_1_wikimedia_commons": {
+      "api_endpoint": "https://commons.wikimedia.org/w/api.php",
+      "allowed_mimes": ["image/jpeg", "image/png"],
+      "min_width_px": 900,
+      "allowed_licenses": ["Public domain", "CC0", "CC-BY", "CC-BY-SA"],
+      "vision_critic_gate": true,
+      "perceptual_dhash_dedup": true
+    },
+    "priority_2_google_flow_bespoke": {
+      "era_prompt_lock_mandatory": true,
+      "vision_anachronism_screening_mandatory": true,
+      "replace_rejected_with_wikimedia": true
+    },
+    "priority_3_stock_broll": {
+      "strict_vision_gate": true,
+      "allow_generic_mood_fallback": false,
+      "playback_speed": 0.85
+    }
+  },
+  "tactile_sound_design_engine": {
+    "track_1_voiceover": {
+      "target_lufs": -14.0,
+      "eq": {
+        "highpass_hz": 80,
+        "warmth_boost_hz": 120,
+        "warmth_boost_db": 2.0,
+        "presence_boost_hz": 4500,
+        "presence_boost_db": 3.0
+      },
+      "compression": {
+        "ratio": 3.0,
+        "attack_ms": 12,
+        "release_ms": 140
+      },
+      "max_internal_silence_seconds": 0.35,
+      "interrogative_prosody_enforcement": true
+    },
+    "track_2_music_bed": {
+      "music_bed_db": -23.0,
+      "music_auto_ducking_db": -5.0,
+      "under_speech_lufs": -28.0,
+      "target_voice_to_bgm_snr_db": 14.0,
+      "ducking_attack_ms": 150,
+      "ducking_release_ms": 400,
+      "vocal_pocket_carve_hz": [700, 2500],
+      "vocal_pocket_carve_db": -4.5,
+      "pattern_interrupt_mute_seconds": 1.25,
+      "genre_progression": [
+        "Movement_1_Cold_Open_Ticking_Clockwork_Drone",
+        "Movement_2_Historical_Acoustic_Cello_Contrabass",
+        "Movement_3_Investigative_Minimalist_Pulse_Brass",
+        "Movement_4_Climax_Strings_to_Solo_Cello_Piano_Coda"
+      ]
+    },
+    "track_3_tactile_foley": {
+      "marker_highlight_stroke": {"file": "marker_highlight_stroke.wav", "gain_db": -12.0},
+      "vector_draw_tick": {"file": "vector_draw_tick.wav", "gain_db": -15.0},
+      "pip_card_slide": {"file": "pip_card_slide.wav", "gain_db": -13.0},
+      "scene_cut_sub_pulse": {"file": "scene_cut_sub_pulse.wav", "gain_db": -18.0},
+      "pattern_interrupt_shutter": {"file": "pattern_interrupt_shutter.wav", "gain_db": -11.0},
+      "room_tone_bed": {"file": "room_tone_bed.wav", "gain_db": -26.0}
+    },
+    "master_bus": {
+      "integrated_lufs": -14.0,
+      "true_peak_dbtp": -1.0,
+      "min_lra_lu": 4.5
+    }
+  },
+  "exports": {
+    "script_json": "outputs/<job_id>/script.json",
+    "edl_timeline_json": "outputs/<job_id>/edl_timeline.json"
+  }
+}

@@ -1,0 +1,261 @@
+{
+  "schema_version": "3.0.0",
+  "edl_specification": "Reverse_Engineered_Documentary_Benchmarks_EDL",
+  "benchmarks": [
+    {
+      "benchmark_id": "vox_will_we_survive_mars",
+      "channel_style": "Vox - Editorial Mixed-Media Explainer & Archival Broadsheets",
+      "reference_source_url": "https://www.youtube.com/watch?v=vox-will-we-survive-mars",
+      "hook_metrics_00_to_45s": {
+        "total_cuts": 18,
+        "average_shot_duration_sec": 2.5,
+        "opening_hook_mechanic": "Visual paradox contrast followed by primary-source highlight sweep and direct thesis question within 12 seconds."
+      },
+      "timeline_breakdown": [
+        {
+          "timestamp_start": "00:00.0",
+          "timestamp_end": "00:04.2",
+          "duration_sec": 4.2,
+          "visual_category": "Atmospheric_B_Roll",
+          "layer_composition": {
+            "background": "Desaturated 0.85x slow-motion planetary/archival plate graded at -22% saturation",
+            "midground_animation": "Subtle floating atmospheric dust motes and soft vignette",
+            "foreground_overlay": "Bottom-left Cinzel + Courier Prime location/date stamp with 0.4s left-to-right mask reveal"
+          },
+          "camera_motion": "Slow push-in 1.00 -> 1.06",
+          "transition_in": "Hard cut",
+          "audio_sync": {
+            "music_state": "Low atmospheric drone entering at -23 dB, auto-ducked to -28 dB under voice",
+            "sfx_triggers": ["scene_cut_sub_pulse.wav"]
+          }
+        },
+        {
+          "timestamp_start": "00:04.2",
+          "timestamp_end": "00:10.5",
+          "duration_sec": 6.3,
+          "visual_category": "2D_Infographic_Over_Realism",
+          "layer_composition": {
+            "background": "Realistic archival photograph dimmed to 65% brightness",
+            "midground_animation": "Animated dashed vector callout lines, target reticles, and timeline/bar breakdown in #EAB308 and #D9381E",
+            "foreground_overlay": "Selective emphasis Courier Prime keyword stamp on key numbers"
+          },
+          "camera_motion": "Locked tripod plate with micro-drift 1.02 -> 1.04",
+          "transition_in": "Whip pan",
+          "audio_sync": {
+            "music_state": "Minimalist investigative pulse under speech (-28 dB)",
+            "sfx_triggers": ["vector_draw_tick.wav"]
+          }
+        },
+        {
+          "timestamp_start": "00:10.5",
+          "timestamp_end": "00:17.0",
+          "duration_sec": 6.5,
+          "visual_category": "Video_Over_Video_PiP",
+          "layer_composition": {
+            "background": "Dark archival grid surface with 15px blurred B-roll at 40% opacity",
+            "midground_animation": "Floating archival broadsheet clipping sliding in at -1.5 deg rotation",
+            "foreground_overlay": "Multiply #FFD700 brush-stroke highlighter wiping synced to key phrase"
+          },
+          "camera_motion": "Slight horizontal pan following highlighter sweep",
+          "transition_in": "Hard cut",
+          "audio_sync": {
+            "music_state": "Sustained investigative pulse",
+            "sfx_triggers": ["pip_card_slide.wav", "marker_highlight_stroke.wav"]
+          }
+        }
+      ],
+      "reproducible_style_rules": [
+        "Dim realistic photographic plates to 65% before drawing 2D schematic vectors so #EAB308/#D9381E callouts stay razor-sharp.",
+        "Pair every archival newspaper highlight wipe with an organic felt-tip brush SFX (-12 dB).",
+        "Trigger selective-emphasis captions strictly on dates, quantities, and decisive historical verbs."
+      ]
+    },
+    {
+      "benchmark_id": "johnny_harris_tactical_maps_pip",
+      "channel_style": "Johnny Harris - Cartographic Maps, Tactile Pins & Floating PiP",
+      "reference_source_url": "https://www.youtube.com/watch?v=johnny-harris-tactical-maps",
+      "hook_metrics_00_to_45s": {
+        "total_cuts": 16,
+        "average_shot_duration_sec": 2.8,
+        "opening_hook_mechanic": "Geographic mystery anchor with zooming tactical route arc connecting two distinct historical cities."
+      },
+      "timeline_breakdown": [
+        {
+          "timestamp_start": "00:00.0",
+          "timestamp_end": "00:07.8",
+          "duration_sec": 7.8,
+          "visual_category": "2D_Infographic_Over_Realism",
+          "layer_composition": {
+            "background": "Dark tactile parchment/slate cartographic map with subtle topographic contour lines",
+            "midground_animation": "Glowing Bezier migration arc launching from Origin City A to Destination City B with radar ping rings",
+            "foreground_overlay": "Coordinate telemetry header and Courier Prime location labels"
+          },
+          "camera_motion": "Smooth virtual camera pan and zoom tracking arc tip from origin to destination",
+          "transition_in": "Hard cut",
+          "audio_sync": {
+            "music_state": "Low cello ostinato + brushed pulse at -28 dB under voice",
+            "sfx_triggers": ["vector_draw_tick.wav", "ui_click.wav"]
+          }
+        },
+        {
+          "timestamp_start": "00:07.8",
+          "timestamp_end": "00:14.2",
+          "duration_sec": 6.4,
+          "visual_category": "Video_Over_Video_PiP",
+          "layer_composition": {
+            "background": "Blurred slow-motion atmospheric B-roll (15px blur, 40% opacity)",
+            "midground_animation": "1 to 3 floating PiP archival evidence frames (scale 55%-75%, 2px translucent border, deep drop shadow)",
+            "foreground_overlay": "Date/location lower-left stamp + crimson pin connectors"
+          },
+          "camera_motion": "Counter-drifting cards with +/-1.8 deg spring tilt",
+          "transition_in": "Light leak",
+          "audio_sync": {
+            "music_state": "Ducked investigative bed",
+            "sfx_triggers": ["pip_card_slide.wav", "paper_flip.wav"]
+          }
+        }
+      ],
+      "reproducible_style_rules": [
+        "Use cartographic route animations ONLY when origin and destination are genuinely distinct historical geographies.",
+        "Never obscure map labels with PiP windows; anchor PiP windows cleanly into opposing quadrant negative space.",
+        "Sync map arc milestones with subtle tactile ticks and soft camera whooshes."
+      ]
+    },
+    {
+      "benchmark_id": "magnatesmedia_extreme_25d_parallax",
+      "channel_style": "MagnatesMedia - Extreme 2.5D Parallax & Depth Typography",
+      "reference_source_url": "https://www.youtube.com/watch?v=magnatesmedia-25d-parallax",
+      "hook_metrics_00_to_45s": {
+        "total_cuts": 20,
+        "average_shot_duration_sec": 2.25,
+        "opening_hook_mechanic": "High-contrast 2.5D separated historical portrait with giant 3D serif depth title sandwiched behind the subject's silhouette."
+      },
+      "timeline_breakdown": [
+        {
+          "timestamp_start": "00:00.0",
+          "timestamp_end": "00:03.6",
+          "duration_sec": 3.6,
+          "visual_category": "2.5D_Parallax",
+          "layer_composition": {
+            "background": "Inpainted archival background with 3px Gaussian depth-of-field blur scaling 1.06 -> 1.00",
+            "midground_animation": "Giant 3D gold/crimson depth title placed in rule-of-thirds negative space (>=88% unoccluded) + floating gold embers",
+            "foreground_overlay": "u2netp + Guided Filter subject cutout scaling counter-directionally 1.00 -> 1.14"
+          },
+          "camera_motion": "Counter-directional dolly-zoom parallax (BG pulls out while FG pushes in)",
+          "transition_in": "Hard cut",
+          "audio_sync": {
+            "music_state": "Clockwork ticking + rising sub-bass tension",
+            "sfx_triggers": ["scene_cut_sub_pulse.wav"]
+          }
+        },
+        {
+          "timestamp_start": "00:03.6",
+          "timestamp_end": "00:06.8",
+          "duration_sec": 3.2,
+          "visual_category": "2.5D_Parallax",
+          "layer_composition": {
+            "background": "Full-bleed chiaroscuro archival painting with 35mm film grain (14%) and vignette (35%)",
+            "midground_animation": "Warm anamorphic bokeh orbs drifting across shadow edges",
+            "foreground_overlay": "Clean frame (depth title suppressed on Shot 1+ to prevent repetition)"
+          },
+          "camera_motion": "Slow lateral drift + subtle zoom 1.00 -> 1.07",
+          "transition_in": "Light leak",
+          "audio_sync": {
+            "music_state": "Continuous tension bed (-28 dB under voice)",
+            "sfx_triggers": ["whoosh_fast.wav"]
+          }
+        }
+      ],
+      "reproducible_style_rules": [
+        "Always open every scene on its strongest hero 2.5D plate, never weak generic stock B-roll.",
+        "Apply 3px Gaussian DOF blur to separated backgrounds and counter-directional scale (FG 1.00->1.14 vs BG 1.06->1.00).",
+        "Fire 3D Depth Title strictly on Shot 0 of a scene and enforce >=88% unoccluded legibility via foreground alpha mask analysis."
+      ]
+    },
+    {
+      "benchmark_id": "fern_dark_minimalist_3d_reconstructions",
+      "channel_style": "Fern - Dark Minimalist 3D Spatial Reconstructions & Silhouettes",
+      "reference_source_url": "https://www.youtube.com/watch?v=fern-dark-3d-reconstructions",
+      "hook_metrics_00_to_45s": {
+        "total_cuts": 14,
+        "average_shot_duration_sec": 3.2,
+        "opening_hook_mechanic": "Stark #121417 obsidian 3D wireframe environment illuminated by volumetric spotlight cones over backlit silhouettes."
+      },
+      "timeline_breakdown": [
+        {
+          "timestamp_start": "00:00.0",
+          "timestamp_end": "00:06.5",
+          "duration_sec": 6.5,
+          "visual_category": "Dark_3D_Reconstruction",
+          "layer_composition": {
+            "background": "Slate void #121417 with perspective-projected 3D architectural floor grid and columns",
+            "midground_animation": "Volumetric spotlight cones sweeping over backlit dark human silhouette",
+            "foreground_overlay": "Glowing tactical target circles (#D9381E, #EAB308, #38BDF8) and minimal forensic telemetry callouts"
+          },
+          "camera_motion": "Smooth orbiting 3D virtual camera matrix with slow elevation tilt",
+          "transition_in": "Hard cut",
+          "audio_sync": {
+            "music_state": "Sparse sub-drone + hollow room tone (-26 dB)",
+            "sfx_triggers": ["scene_cut_sub_pulse.wav", "vector_draw_tick.wav"]
+          }
+        }
+      ],
+      "reproducible_style_rules": [
+        "Use Dark 3D Reconstructions to explain abstract power structures, imperial decrees, or contested historical spaces without anachronistic footage.",
+        "Keep void palette strictly constrained to #121417 slate, #F8FAFC crisp lines, and #D9381E/#EAB308/#38BDF8 focal rings.",
+        "Pair spotlight sweeps with subtle atmospheric room tone and low sub pulses."
+      ]
+    },
+    {
+      "benchmark_id": "fern_digital_ui_pattern_interrupts",
+      "channel_style": "Fern / Elementar - Digital Forensic UI & 240s Pattern Interrupts",
+      "reference_source_url": "https://www.youtube.com/watch?v=fern-digital-ui-pattern-interrupts",
+      "hook_metrics_00_to_45s": {
+        "total_cuts": 15,
+        "average_shot_duration_sec": 3.0,
+        "opening_hook_mechanic": "Abrupt music drop into dead silence + mechanical shutter strike resetting viewer attention every 240 seconds."
+      },
+      "timeline_breakdown": [
+        {
+          "timestamp_start": "04:00.0",
+          "timestamp_end": "04:01.3",
+          "duration_sec": 1.3,
+          "visual_category": "Dark_3D_Reconstruction",
+          "layer_composition": {
+            "background": "Instant hard cut to dark slate #121417 archival dossier reset frame",
+            "midground_animation": "Crisp reticle lock-on + chronological chapter stamp",
+            "foreground_overlay": "Bold Courier Prime year stamp with gold accent underline"
+          },
+          "camera_motion": "Snap zoom 1.08 -> 1.00 over 0.35s",
+          "transition_in": "Hard cut",
+          "audio_sync": {
+            "music_state": "Hard mute to absolute silence for 1.25s (Pattern Interrupt @ 240s / 480s / 720s)",
+            "sfx_triggers": ["pattern_interrupt_shutter.wav"]
+          }
+        },
+        {
+          "timestamp_start": "04:01.3",
+          "timestamp_end": "04:07.8",
+          "duration_sec": 6.5,
+          "visual_category": "Video_Over_Video_PiP",
+          "layer_composition": {
+            "background": "Dark cork/slate forensic string board over dimmed archival texture",
+            "midground_animation": "4 era-matched historical hero plates connected pin-to-pin with catenary red strings completing within first 35% of shot",
+            "foreground_overlay": "Forensic exhibit badges clear of string paths"
+          },
+          "camera_motion": "Slow investigative drift across connected evidence nodes",
+          "transition_in": "Whip pan",
+          "audio_sync": {
+            "music_state": "New movement enters cleanly at -28 dB under resumed narration",
+            "sfx_triggers": ["pip_card_slide.wav", "paper_flip.wav"]
+          }
+        }
+      ],
+      "reproducible_style_rules": [
+        "Trigger a 1.25s hard music mute + mechanical camera-shutter/typewriter strike every 240 seconds (240s, 480s, 720s) to shatter mid-video fatigue.",
+        "Populate forensic string boards and timelines exclusively with era-matched hero plates from the corresponding historical scenes.",
+        "Complete all red catenary pin-to-pin animations within the first 35% of the graphic window so no strings hang severed mid-air."
+      ]
+    }
+  ]
+}

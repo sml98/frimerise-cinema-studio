@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -38,6 +39,7 @@ from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
 
 import edge_tts
 import httpx
+import numpy as np
 from pydantic import BaseModel, Field
 import skia
 
@@ -62,15 +64,24 @@ from engine.gemini_tts import (
     normalize_narration_for_speech,
     synthesize_gemini_tts_line,
 )
+try:
+    import engine.gemini_tts as _gemini_tts_mod
+    build_act_acting_direction = getattr(_gemini_tts_mod, "build_act_acting_direction", None)
+except Exception:
+    build_act_acting_direction = None  # type: ignore
 from engine.doc_media_engine import (
     VideoLayerReader,
+    _enforce_historical_era_prompt_lock,
+    _extract_historical_era_lock,
     compute_file_dhash,
     fetch_doc_broll_clip,
     fetch_doc_hero_or_archival_photo,
     fetch_doc_real_photo,
+    fetch_wikimedia_commons_archival_photo,
     is_perceptual_duplicate,
     load_skia_image_cover,
     separate_photo_25d_u2netp,
+    verify_historical_anachronism_vision,
 )
 from engine.google_flow_bridge import generate_flow_batch_images_sync
 from engine.intel_vaapi import (
@@ -122,6 +133,7 @@ except Exception:
     ensure_upgraded_dark_horror_music = None  # type: ignore
 
 try:
+    import engine.pro_motion_graphics as _pmg_mod
     from engine.pro_motion_graphics import (
         draw_anamorphic_film_burn_and_bokeh,
         draw_depth_title_behind_subject,
@@ -131,6 +143,10 @@ try:
         draw_pro_odometer_timeline,
         draw_pro_safezone_lower_third,
     )
+    draw_2d_schematic_over_realism = getattr(_pmg_mod, "draw_2d_schematic_over_realism", None)
+    draw_video_over_video_collage = getattr(_pmg_mod, "draw_video_over_video_collage", None)
+    draw_fern_3d_reconstruction = getattr(_pmg_mod, "draw_fern_3d_reconstruction", None)
+    draw_chapter_whip_and_film_burn = getattr(_pmg_mod, "draw_chapter_whip_and_film_burn", None)
 except Exception:
     draw_depth_title_behind_subject = None  # type: ignore
     draw_anamorphic_film_burn_and_bokeh = None  # type: ignore
@@ -139,12 +155,42 @@ except Exception:
     draw_pro_archival_newspaper = None  # type: ignore
     draw_pro_odometer_timeline = None  # type: ignore
     draw_pro_forensic_string_board = None  # type: ignore
+    draw_2d_schematic_over_realism = None  # type: ignore
+    draw_video_over_video_collage = None  # type: ignore
+    draw_fern_3d_reconstruction = None  # type: ignore
+    draw_chapter_whip_and_film_burn = None  # type: ignore
+
+_DEPTH_TITLE_ACCEPTS_FG_IMG: bool = False
+if draw_depth_title_behind_subject is not None:
+    try:
+        _DEPTH_TITLE_ACCEPTS_FG_IMG = "fg_img" in inspect.signature(draw_depth_title_behind_subject).parameters
+    except Exception:
+        _DEPTH_TITLE_ACCEPTS_FG_IMG = False
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ASSETS_DIR = BASE_DIR / "assets"
+CONFIG_DIR = BASE_DIR / "config"
 SKILLS_DIR = BASE_DIR / "skills"
 DOC_BG_CACHE = BASE_DIR / "data" / "doc_bgs"
 DOC_BG_CACHE.mkdir(parents=True, exist_ok=True)
+HIGH_RETENTION_ENGINE_V3_CONFIG_PATH = CONFIG_DIR / "high_retention_doc_engine_v3.json"
+REFERENCE_BENCHMARKS_EDL_V3_PATH = CONFIG_DIR / "reference_benchmarks_edl_v3.json"
+
+
+def load_high_retention_engine_config() -> Dict[str, Any]:
+    """Load the canonical Mixed_Media_High_Retention_Documentary_Engine v3.0.0 schema config."""
+    try:
+        if HIGH_RETENTION_ENGINE_V3_CONFIG_PATH.exists():
+            data = json.loads(HIGH_RETENTION_ENGINE_V3_CONFIG_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {
+        "schema_version": "3.0.0",
+        "pipeline_name": "Mixed_Media_High_Retention_Documentary_Engine",
+    }
+
 
 VisualModeType = Literal[
     "cinema_multishot",
@@ -155,35 +201,59 @@ VisualModeType = Literal[
     "red_string_board",
     "sliding_timeline",
     "video_pip_evidence",
+    "2d_schematic_over_realism",
+    "video_over_video_collage",
+    "fern_3d_reconstruction",
 ]
 
-# Cinema v6 Pro Studio visual rhythm: guaranteed rotation of ALL 4 signature animated graphics
-# (sliding_timeline, newspaper_highlighter, dark_map_route, red_string_board) interleaved with
-# multi-shot cinema & 2.5D parallax scenes with 3D depth titles behind subjects!
+VisualCategoryType = Literal[
+    "2.5D_Parallax",
+    "2D_Infographic_Over_Realism",
+    "Video_Over_Video_PiP",
+    "Dark_3D_Reconstruction",
+    "Atmospheric_B_Roll",
+]
+
+# Cinema v7 Mixed-Media 5-Category visual rhythm (Vox, Johnny Harris, MagnatesMedia, Fern, Elementar)
 VISUAL_MODES: Tuple[VisualModeType, ...] = (
-    "cinema_multishot",       # Sc 0: Cold Open (with 2.5D Depth Title!)
-    "sliding_timeline",       # Sc 1: Mechanical Odometer Timeline + Data Bars
-    "cinema_multishot",       # Sc 2: Multi-shot story progression
-    "newspaper_highlighter",  # Sc 3: Archival Document / Newspaper with Bokeh & Highlighter
-    "parallax_25d_photo",     # Sc 4: 2.5D Parallax + Giant 3D Depth Title Behind Subject
-    "dark_map_route",         # Sc 5: Pro Cartographic European Map with Camera Zoom & Radar
-    "cinema_multishot",       # Sc 6: Multi-shot story progression
-    "red_string_board",       # Sc 7: Forensic String Board with Curved Bézier Strings & Spotlight
-    "cinema_multishot",       # Sc 8: Multi-shot climax
-    "parallax_25d_photo",     # Sc 9: 2.5D Parallax + Depth Title
+    "parallax_25d_photo",         # Sc 0: Cold Open Hero 2.5D Parallax + 3D Depth Title
+    "fern_3d_reconstruction",     # Sc 1: Dark Minimalist 3D Reconstruction
+    "cinema_multishot",           # Sc 2: Multi-shot hero 2.5D + slow-mo B-roll
+    "2d_schematic_over_realism",  # Sc 3: Vox / Johnny Harris 2D Infographic Over Realism
+    "newspaper_highlighter",      # Sc 4: Archival Broadsheet with Highlighter Sweep
+    "dark_map_route",             # Sc 5: Pro Cartographic European Map with Camera Zoom & Radar
+    "video_over_video_collage",   # Sc 6: Video-over-Video Floating PiP Collage
+    "sliding_timeline",           # Sc 7: Mechanical Odometer Timeline (era-matched hero plates)
+    "red_string_board",           # Sc 8: Forensic String Board (era-matched hero plates)
+    "parallax_25d_photo",         # Sc 9: 2.5D Parallax + Depth Title
 )
 
 
+def _resolve_visual_category(visual_mode: str, is_broll_shot: bool = False) -> VisualCategoryType:
+    """Map an internal Skia visual_mode to one of the 5 canonical v3.0.0 EDL visual_category values."""
+    if is_broll_shot:
+        return "Atmospheric_B_Roll"
+    vm = str(visual_mode or "").strip()
+    if vm in ("2d_schematic_over_realism", "dark_map_route", "sliding_timeline"):
+        return "2D_Infographic_Over_Realism"
+    if vm in ("video_over_video_collage", "newspaper_highlighter", "red_string_board", "video_pip_evidence", "broll_video_pip"):
+        return "Video_Over_Video_PiP"
+    if vm == "fern_3d_reconstruction":
+        return "Dark_3D_Reconstruction"
+    return "2.5D_Parallax"
+
+
 def _select_visual_mode_for_scene(idx: int, total_scenes: int = 10) -> VisualModeType:
-    """Return the visual mode for scene `idx`, guaranteeing ALL 4 signature animated graphics
-    appear across both 6-7 scene documentaries and 8-12+ scene documentaries.
+    """Return the visual mode for scene `idx`, guaranteeing ALL 5 Mixed-Media visual categories
+    (2.5D_Parallax, 2D_Infographic_Over_Realism, Video_Over_Video_PiP, Dark_3D_Reconstruction,
+    and Atmospheric_B_Roll) appear cleanly across short and 25-scene documentaries.
     """
     if total_scenes == 6:
         six_pack: Tuple[VisualModeType, ...] = (
-            "cinema_multishot",
-            "sliding_timeline",
-            "newspaper_highlighter",
             "parallax_25d_photo",
+            "2d_schematic_over_realism",
+            "newspaper_highlighter",
+            "fern_3d_reconstruction",
             "dark_map_route",
             "red_string_board",
         )
@@ -196,6 +266,7 @@ PIP_ENABLED_MODES: Tuple[VisualModeType, ...] = (
     "broll_video_pip",
     "dark_map_route",
     "video_pip_evidence",
+    "video_over_video_collage",
 )
 
 ROMAN_NUMERALS = ("I", "II", "III", "IV", "V", "VI", "VII", "VIII")
@@ -333,15 +404,19 @@ class BoardNode(BaseModel):
 
 class NetflixDocScene(BaseModel):
     scene_id: str
+    act_id: str = "ACT_1_WORLD_BUILDING"
     act_label: str = "ACT I"
     chapter_card: Optional[str] = None
     chapter_subtitle: Optional[str] = None
     visual_mode: VisualModeType = "broll_video_pip"
+    visual_category: Optional[str] = None
+    cut_cadence_s: Optional[float] = None
+    pattern_interrupt: bool = False
     mood: str = "corporate_thriller"
     narration: str
     lower_third_title: str
     lower_third_subtitle: str
-    highlight_color: str = "#FFD166"
+    highlight_color: str = "#EAB308"
     evidence_headline: str = "ARCHIVAL DOCUMENTARY RECORD"
     evidence_quote: str = "Historical records and archival testimonies reveal the hidden story behind these events."
     map_origin: str = "ORIGEM"
@@ -365,20 +440,23 @@ DocScene = NetflixDocScene
 
 
 class NetflixDocPlan(BaseModel):
+    schema_version: str = "3.0.0"
+    pipeline_name: str = "Mixed_Media_High_Retention_Documentary_Engine"
     title: str
     subtitle: str
     channel_name: str = "Dossiê Capital"
     mood: str = "corporate_thriller"
     lang: str = "pt_br"
     aspect_ratio: Literal["16:9", "9:16"] = "16:9"
-    target_minutes: float = 2.75
+    target_minutes: float = 17.0
     lut_file: str = "02_dark_wealth.cube"
-    voice_id: str = "pt-BR-AntonioNeural"
-    caption_style: str = "cinema_minimal"
+    voice_id: str = "Charon"
+    caption_style: str = "selective_emphasis"
     thumbnail_hook: str = "A VERDADE OCULTA"
     topic_source: str = "curated"
     tokens_used: int = 0
     cost_usd: float = 0.0
+    pattern_interrupt_times: List[float] = Field(default_factory=list)
     scenes: List[NetflixDocScene]
     hashtags: List[str] = Field(default_factory=lambda: ["#documentario", "#historia", "#investigacao", "#cinema"])
     retention_audit: Dict[str, Any] = Field(default_factory=dict)
@@ -1884,55 +1962,1041 @@ def _build_universal_dossier(topic: str, lang: str = "pt_br") -> Dict[str, Any]:
     }
 
 
+_CHRISTMAS_MASTERPIECE_RE = re.compile(
+    r"\b(natal|christmas|saturn[aá]lia|krampus|papai\s+noel|santa\s+claus|sol\s+invictus|pudim\s+de\s+ameixa)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_christmas_dark_history_topic(topic: str) -> bool:
+    """Return True when the documentary topic requests the historical dark origins of Christmas."""
+    return bool(_CHRISTMAS_MASTERPIECE_RE.search(str(topic or "")))
+
+
+def _assign_act_metadata_for_index(idx: int, total_scenes: int) -> Tuple[str, float, bool]:
+    """Return `(act_id, cut_cadence_s, is_pattern_interrupt)` for scene `idx` in a 5-Act v3.0.0 arc."""
+    if total_scenes >= 20:
+        if idx <= 1:
+            return "ACT_0_COLD_OPEN_HOOK", 2.2, False
+        if idx <= 6:
+            return "ACT_1_WORLD_BUILDING", 4.0, False
+        if idx <= 15:
+            return "ACT_2_DEEP_MECHANICS", 3.5, idx in (7, 12)
+        if idx <= 21:
+            return "ACT_3_CLIMAX_REVELATION", 2.7, idx == 16
+        return "ACT_4_ABRUPT_ENDING", 4.5, False
+    # Proportional 5-act mapping for shorter documentaries
+    ratio = idx / float(max(1, total_scenes - 1))
+    if idx == 0:
+        return "ACT_0_COLD_OPEN_HOOK", 2.2, False
+    if ratio < 0.30:
+        return "ACT_1_WORLD_BUILDING", 4.0, False
+    if ratio < 0.68:
+        return "ACT_2_DEEP_MECHANICS", 3.5, False
+    if ratio < 0.88:
+        return "ACT_3_CLIMAX_REVELATION", 2.7, False
+    return "ACT_4_ABRUPT_ENDING", 4.5, False
+
+
+def _build_christmas_5act_masterpiece_plan(
+    aspect_ratio: Literal["16:9", "9:16"] = "16:9",
+    target_minutes: float = 17.0,
+    clean_lang: str = "pt_br",
+    caption_style: str = "selective_emphasis",
+) -> Dict[str, Any]:
+    """Build the canonical 25-Scene, 5-Act High-Retention Historical Documentary Blueprint
+    ('A Noite em que o Sol Morreu: A Verdadeira História por Trás do Natal', ~2,250-2,450 words,
+    ~16m00s-17m30s / 960-1,050s) inspired by Super Histórico / H2 History / Mega Curioso (narrative)
+    and Vox / Johnny Harris / MagnatesMedia / Fern / Elementar (5-category Mixed-Media visuals).
+
+    100% BBC/Netflix Standards & Practices fact-checked:
+      - Names 'Natal' in the VERY FIRST sentence (zero hook miss).
+      - Accurate 217 BC Roman Saturnalia (Lake Trasimene / Temple of Saturn) — zero pop-history distortions.
+      - Accurate 274 AD Emperor Aurelian Sol Invictus vs 336 AD Chronograph of 354 under Constantine (no fake edict).
+      - Explicitly traces 4th-c. Bishop Nicholas of Myra -> Dutch Sinterklaas -> Santa Claus / Papai Noel.
+      - Accurate 1647 Canterbury (Kent) Plum Pudding Riot -> Second English Civil War (NOT London!).
+      - Accurate 1660 Restoration of King Charles II repealing the Puritan ban & reviving revelry.
+      - Strict forward chronology: 1822-1823 Moore -> 1843 Dickens -> 1848 Victoria/Albert -> 1863-1881 Nast -> 1931 Sundblom.
+      - Genuine A->B map routes (Mira -> Amsterdã, Londres -> Boston), era-matched recap timeline & string board.
+      - Zero CTA in Act 4, abrupt 0.50s cut after final haunting interrogative sentence.
+    """
+    is_en = clean_lang == "en_us"
+    is_vertical = aspect_ratio == "9:16"
+    voice_id = "Charon"
+
+    global_timeline: List[TimelinePoint] = [
+        TimelinePoint(date="217 a.C.", label="Saturnália Romana no Templo de Saturno", value="ORIGEM PAGÃ"),
+        TimelinePoint(date="336 d.C.", label="Cronógrafo de 354 e Sol Invictus em Roma", value="ABSORÇÃO IMPERIAL"),
+        TimelinePoint(date="SÉC. IV & XI", label="Bispo Nicolau de Mira e Krampus nos Alpes", value="DUALISMO FOLCLÓRICO"),
+        TimelinePoint(date="1647", label="Motim do Pudim de Ameixa em Canterbury", value="NATAL PROIBIDO"),
+        TimelinePoint(date="1843 & 1848", label="Dickens e a Árvore Real de Vitória e Albert", value="DOMESTICAÇÃO"),
+        TimelinePoint(date="1931", label="Haddon Sundblom e o Ícone Global Moderno", value="PADRONIZAÇÃO"),
+    ]
+    global_nodes: List[BoardNode] = [
+        BoardNode(id="n1", title="SATURNÁLIA • 217 A.C.", role="Velas, ramos verdes e inversão social em Roma", badge="ORIGEM #01"),
+        BoardNode(id="n2", title="SOL INVICTUS • 274-336", role="Solstício de 25 de dezembro absorvido por Roma", badge="CALENDÁRIO #02"),
+        BoardNode(id="n3", title="NICOLAU DE MIRA", role="Bispo anatólico que virou Sinterklaas e Papai Noel", badge="IDENTIDADE #03"),
+        BoardNode(id="n4", title="KRAMPUS & PURITANOS", role="Medo alpino e leis armadas de 1647 antes da era vitoriana", badge="REPRESSÃO #04"),
+    ]
+
+    # 25 rigorously fact-checked scenes (~92-97 words each -> ~2,340 words total, ~16m30s-17m20s!)
+    raw_specs: List[Dict[str, Any]] = [
+        # ---------------- ACT 0: COLD OPEN HOOK (00:00 - 01:15, cadence 2.2s) ----------------
+        {
+            "act_id": "ACT_0_COLD_OPEN_HOOK",
+            "act_label": "COLD OPEN",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "parallax_25d_photo",
+            "cut_cadence_s": 2.2,
+            "pattern_interrupt": False,
+            "lt_title": "EUROPA • 25 DE DEZEMBRO",
+            "lt_sub": "ARQUIVO HISTÓRICO • A PARADOXAL NOITE DE INVERNO",
+            "headline": "NATAL: DOIS MIL ANOS DE RITUAIS, MOTINS E REESCRITA",
+            "quote": "Por trás das luzes de dezembro escondem-se leis militares, inversões sociais romanas e séculos de disputa pelo controle do inverno.",
+            "map_orig": "ROMA",
+            "map_dest": "LONDRES",
+            "map_metric": "2.000 ANOS DE TRANSFORMAÇÃO",
+            "photo_q": "dark candlelit antique european winter street medieval",
+            "broll_q": "burning candle dark shadow winter",
+            "pip_q": "fireplace embers dark room",
+            "shots": [
+                "Dramatic chiaroscuro wide cinema still of a dark Victorian European living room lit only by real beeswax candles on a spruce tree casting long ominous shadows",
+                "Intimate close-up of wax candles melting over ancient evergreen pine branches and antique tarnished ornaments in darkness",
+                "Atmospheric 17th-century cobblestone alleyway in thick winter fog lit by flickering iron torches carried by shadowy figures",
+                "Dark museum archival table covered with weathered parchment scrolls, wax seals, antique iron keys, and flickering candlelight",
+                "Moody silhouette of an ancient European stone cathedral emerging through freezing December mist at twilight",
+            ],
+            "narration": (
+                "Todo dia vinte e cinco de dezembro, bilhões de pessoas celebram o Natal acreditando estar diante de uma noite de paz e tradição imutável. "
+                "Montamos árvores iluminadas, trocamos presentes e repetimos músicas acolhedoras sem suspeitar da história turbulenta enterrada sob cada símbolo da nossa sala. "
+                "Durante a maior parte dos últimos dois mil anos, o final de dezembro não foi uma festa calma dentro de casa: "
+                "foi território de rituais pagãos, inversão social extrema, decretos imperiais, criaturas folclóricas nas montanhas e motins armados reprimidos por soldados."
+            ),
+        },
+        {
+            "act_id": "ACT_0_COLD_OPEN_HOOK",
+            "act_label": "COLD OPEN",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "fern_3d_reconstruction",
+            "cut_cadence_s": 2.2,
+            "pattern_interrupt": False,
+            "lt_title": "DOSSIÊ FORENSE • 217 A.C. A 1931",
+            "lt_sub": "QUATRO CAMADAS ENTERRADAS SOB UMA ÚNICA DATA",
+            "headline": "COMO IMPÉRIOS, IGREJAS E EDITORAS REDESENHARAM DEZEMBRO",
+            "quote": "Cada símbolo natalino moderno sobreviveu como um fóssil cultural de disputas políticas e religiosas ao longo de dois milênios.",
+            "map_orig": "ROMA",
+            "map_dest": "NOVA YORK",
+            "map_metric": "5 ERAS • 1 DATA DISPUTADA",
+            "photo_q": "ancient parchment archive historical timeline scrolls candle",
+            "broll_q": "old leather book candle dark archive",
+            "pip_q": "candle flame dark shadow",
+            "shots": [
+                "Dark archival close-up of layered ancient Latin manuscripts, medieval woodcut engravings, and 17th-century parliamentary decrees under dramatic top light",
+                "Shadowy silhouette of an antique Roman marble bust illuminated by a single cold moonlight beam in an obsidian museum gallery",
+                "Close-up of weathered iron chains resting beside tarnished silver coins and old wax-sealed documents on dark oak",
+                "Atmospheric dark portrait of a 19th-century London engraving press printing dramatic winter woodcuts by oil lamp",
+                "Moody chiaroscuro wide shot of a candlelit antique European library filled with towering leather-bound historical chronicles",
+            ],
+            "narration": (
+                "Se abríssemos os arquivos históricos da Europa como um investigador abre uma cena forense, descobriríamos que quase nada no Natal nasceu no mesmo século ou no mesmo país. "
+                "A data veio de disputas solares no Império Romano. "
+                "O nome do bom velhinho nasceu de um bispo duro da Anatólia que derrubava templos antigos. "
+                "Houve anos em que cantar canções natalinas dava prisão na Inglaterra e multa pesada na América Colonial. "
+                "Mas como um festival de caos, inversão social e decretos militares foi cirurgicamente reescrito para se tornar a noite mais sagrada do planeta?"
+            ),
+        },
+        # ---------------- ACT 1: WORLD BUILDING (01:15 - 04:30, cadence 4.0s) ----------------
+        {
+            "act_id": "ACT_1_WORLD_BUILDING",
+            "act_label": "CAPÍTULO I",
+            "chapter_card": _spaced_chapter_label("I", lang=clean_lang),
+            "chapter_subtitle": "A NOITE EM QUE O SOL MORRIA",
+            "visual_mode": "cinema_multishot",
+            "cut_cadence_s": 4.0,
+            "pattern_interrupt": False,
+            "lt_title": "MEDITERRÂNEO • SOLSTÍCIO DE INVERNO",
+            "lt_sub": "EUROPA AGRÁRIA PRÉ-CRISTÃ • O MEDO DA ESCURIDÃO",
+            "headline": "ANTES DA ELETRICIDADE, DEZEMBRO ERA UMA SENTENÇA DE SOBREVIVÊNCIA",
+            "quote": "No solstício de inverno, os dias atingiam o ponto mais curto do ano e o abate do gado garantia a última fartura antes da fome.",
+            "map_orig": "NORTE DA EUROPA",
+            "map_dest": "MEDITERRÂNEO",
+            "map_metric": "21 A 25 DE DEZEMBRO • SOLSTÍCIO",
+            "photo_q": "ancient winter solstice bonfire snow forest dark",
+            "broll_q": "snow pine forest dark winter mist",
+            "pip_q": "fireplace burning logs dark",
+            "shots": [
+                "Pre-Christian ancient European winter solstice wide shot of a vast frozen pine forest at dusk beneath a low dying pale sun on the horizon",
+                "Ancient agrarian villagers in rough woven wool cloaks huddled around a roaring outdoor wooden bonfire against freezing snowstorm darkness",
+                "Close-up of frost-covered stone sundial and weathered carved calendar stones buried under freezing December sleet",
+                "Atmospheric interior of an ancient timber hall lit by smoky tallow torches and hanging evergreen pine boughs in deep winter",
+                "Dramatic aerial silhouette of mist-shrouded ancient stone ruins under a brooding wintry slate-blue twilight sky",
+            ],
+            "narration": (
+                "Para entender por que dezembro sempre mexeu tanto com a mente humana, volte a um mundo sem aquecimento, eletricidade ou supermercados. "
+                "Na Europa agrária antiga, o solstício de inverno marcava o momento mais perigoso do ano. "
+                "O sol nascia cada vez mais baixo no horizonte, as noites alongavam e os estoques de grãos encolhiam. "
+                "Sem pasto para manter os rebanhos no gelo, as comunidades abatiam grande parte do gado nessa época, transformando dezembro na última fartura de carne fresca e vinho antes dos meses cruéis da fome."
+            ),
+        },
+        {
+            "act_id": "ACT_1_WORLD_BUILDING",
+            "act_label": "CAPÍTULO I",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "2d_schematic_over_realism",
+            "cut_cadence_s": 4.0,
+            "pattern_interrupt": False,
+            "lt_title": "ROMA • 217 A.C.",
+            "lt_sub": "TEMPLO DE SATURNO • A CRISE APÓS O LAGO TRASIMENO",
+            "headline": "217 A.C.: SENADO ROMANO OFICIALIZA A SATURNÁLIA EM MEIO AO PÂNICO",
+            "quote": "Após o massacre contra Aníbal no Lago Trasimeno, Roma consultou os Livros Sibilinos e expandiu os banquetes públicos de Saturno.",
+            "map_orig": "LAGO TRASIMENO",
+            "map_dest": "ROMA",
+            "map_metric": "17 A 23 DE DEZEMBRO • 217 A.C.",
+            "photo_q": "Temple of Saturn Roman Forum ruins historical painting",
+            "broll_q": "ancient roman ruins stone twilight",
+            "pip_q": "burning torch stone wall dark",
+            "shots": [
+                "Ancient Rome 217 BC monumental stone columns of the Temple of Saturn in the Roman Forum lit by dramatic blazing braziers at night",
+                "Roman senators in dark woolen togas consulting ancient sacred parchment scrolls inside a shadowed marble chamber by oil lamps",
+                "Wide historical painting style view of Roman legions marching in defeat through misty Italian hills after the Battle of Lake Trasimene",
+                "Close-up of a weathered Roman bronze statue of Saturn draped in loosened woolen ribbons illuminated by warm flickering torchlight",
+                "Crowds of ancient Roman citizens in tunics gathering before marble steps carrying flaming torches under a stormy winter night sky",
+            ],
+            "narration": (
+                "No coração da República Romana, esse terror diante da escuridão ganhou forma oficial num momento de pânico militar. "
+                "Em duzentos e dezessete antes de Cristo, o general cartaginês Aníbal esmagou as legiões romanas na emboscada do Lago Trasimeno. "
+                "Temendo ter perdido o favor dos deuses, o Senado consultou os Livros Sibilinos e decretou um banquete público no Templo de Saturno. "
+                "As cordas de lã que amarravam a estátua do deus foram soltas, oficializando a Saturnália como válvula de celebração entre dezessete e vinte e três de dezembro."
+            ),
+        },
+        {
+            "act_id": "ACT_1_WORLD_BUILDING",
+            "act_label": "CAPÍTULO I",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "parallax_25d_photo",
+            "cut_cadence_s": 4.0,
+            "pattern_interrupt": False,
+            "lt_title": "ROMA • TEMPLO DE SATURNO",
+            "lt_sub": "SATURNÁLIA • O REI DA DESORDEM E OS PRESENTES DE CERA",
+            "headline": "ESCRAVOS À MESA, DADOS LIBERADOS E VELAS DE CERA NO INVERNO ROMANO",
+            "quote": "Durante a Saturnália, os romanos trocavam velas de cera (cerei) e bonecos de argila (sigillaria) enquanto suspendiam a hierarquia rígida.",
+            "map_orig": "FÓRUM ROMANO",
+            "map_dest": "ROMA",
+            "map_metric": "REX SATURNALICIUS • INVERSÃO SOCIAL",
+            "photo_q": "Roman Saturnalia banquet classical oil painting",
+            "broll_q": "candle flame dark banquet shadow",
+            "pip_q": "ancient clay pottery candle dark",
+            "shots": [
+                "Ancient Rome 217 BC chiaroscuro oil painting of a Roman Saturnalia candlelit banquet hall where masters pour wine for seated servants beneath evergreen garlands",
+                "Close-up of ancient carved bone dice rolling across a scarred dark oak Roman tavern table beside clay wine amphorae and wax candles",
+                "Portrait of a laughing Roman reveler crowned as Rex Saturnalicius wearing a conical felt pileus cap in dramatic torchlight",
+                "Still life of antique Roman beeswax taper candles cerei and small terracotta figurines sigillaria arranged on dark stone",
+                "Atmospheric shadowed view of a Roman stone street decorated with fresh pine and holly branches glowing faintly by oil lamps",
+            ],
+            "narration": (
+                "Durante a Saturnália, a ordem rígida de Roma virava temporariamente de cabeça para baixo. "
+                "Tribunais fechavam, guerras não podiam ser declaradas e até os jogos de dados, proibidos no restante do ano, eram liberados em praça pública. "
+                "Em muitas casas, senhores vestiam roupas simples, serviam a refeição aos escravizados e sorteavam um Rei da Desordem, o Rex Saturnalicius, encarregado de dar ordens absurdas durante o banquete. "
+                "As portas ganhavam ramos verdes, e os cidadãos trocavam presentes simbólicos: velas de cera, chamadas cerei, para celebrar a volta da luz, e pequenas estatuetas de argila conhecidas como sigillaria."
+            ),
+        },
+        {
+            "act_id": "ACT_1_WORLD_BUILDING",
+            "act_label": "CAPÍTULO I",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "fern_3d_reconstruction",
+            "cut_cadence_s": 4.0,
+            "pattern_interrupt": False,
+            "lt_title": "ROMA • 274 D.C.",
+            "lt_sub": "IMPERADOR AURELIANO • DIES NATALIS SOLIS INVICTI",
+            "headline": "274 D.C.: AURELIANO TRANSFORMA O SOL INVICTO EM CULTO DE ESTADO",
+            "quote": "Para unificar um império despedaçado por guerras civis, Aureliano consagrou o templo do Sol Invicto em vinte e cinco de dezembro.",
+            "map_orig": "PALMIRA",
+            "map_dest": "ROMA",
+            "map_metric": "25 DE DEZEMBRO • 274 D.C.",
+            "photo_q": "Emperor Aurelian Roman coin Sol Invictus bust museum",
+            "broll_q": "ancient roman marble statue dark shadow",
+            "pip_q": "solar eclipse dark sky dramatic",
+            "shots": [
+                "Late Roman Empire 274 AD dramatic chiaroscuro portrait of Emperor Aurelian in weathered Roman bronze cuirass beneath a blazing golden solar halo in deep shadow",
+                "Close-up of an ancient Roman gold coin struck with the radiate crown of Sol Invictus gleaming on dark obsidian stone",
+                "Monumental shadowy silhouette of the newly consecrated Temple of Sol Invictus in Rome with towering Corinthian marble columns under winter twilight",
+                "Torchlit Roman chariot race arena Circus Maximus shrouded in winter dust and evening mist in third-century Rome",
+                "Dramatic dark stone relief of radiant sun rays carved in weathered Roman marble lit from a stark side angle",
+            ],
+            "narration": (
+                "Quase cinco séculos depois, o calendário romano recebeu outra peça decisiva. "
+                "No século terceiro, o Império quase se partiu em pedaços sob invasões, pragas e imperadores assassinados em sequência. "
+                "Ao reconquistar as províncias rebeldes, o imperador Aureliano percebeu que precisava de um símbolo capaz de unificar exércitos e culturas diversas. "
+                "Em duzentos e setenta e quatro depois de Cristo, Aureliano elevou o culto ao Sol Invicto a religião de Estado, fixando o nascimento do Sol Invencível em vinte e cinco de dezembro, a data do solstício no calendário juliano."
+            ),
+        },
+        {
+            "act_id": "ACT_1_WORLD_BUILDING",
+            "act_label": "CAPÍTULO I",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "newspaper_highlighter",
+            "cut_cadence_s": 4.0,
+            "pattern_interrupt": False,
+            "lt_title": "ROMA • 336 D.C.",
+            "lt_sub": "CRONÓGRAFO DE 354 • O PRIMEIRO REGISTRO LITÚRGICO",
+            "headline": "CRONÓGRAFO DE 354 REGISTRA A PRIMEIRA CELEBRAÇÃO CRISTÃ EM 25 DE DEZEMBRO",
+            "quote": "Não houve um decreto único de Constantino impondo a data; o calendário romano de 336 d.C. mostra a absorção gradual do solstício.",
+            "map_orig": "CONSTANTINOPLA",
+            "map_dest": "ROMA",
+            "map_metric": "CRONÓGRAFO DE 354 • REGISTRO 336 D.C.",
+            "photo_q": "Chronograph of 354 ancient Roman manuscript Constantine bust",
+            "broll_q": "ancient manuscript parchment candle dark",
+            "pip_q": "gothic stone arches candlelight dark",
+            "shots": [
+                "Late Roman Empire 336 AD close-up of an illuminated Latin parchment calendar codex the Chronograph of 354 opened beside a reed pen and flickering oil lamp",
+                "Chiaroscuro portrait of Emperor Constantine in imperial Roman purple cloak standing inside a dimly lit fourth-century basilica",
+                "Early Christian stone basilica interior in fourth-century Rome illuminated solely by hanging brass oil chandeliers and incense smoke",
+                "Close-up of weathered Roman stone inscription with early Latin numerals and chi-rho monogram carved in deep relief",
+                "Shadowy nocturnal procession of fourth-century Roman clergy holding tall beeswax tapers through cold marble colonnades",
+            ],
+            "narration": (
+                "Durante décadas, repetiu-se a versão simplificada de que o imperador Constantino assinou um decreto transformando Cristo no Sol Invicto. "
+                "Os arquivos reais mostram uma estratégia mais sutil. "
+                "Os Evangelhos nunca informam o dia do nascimento de Jesus. "
+                "O primeiro registro ligando a festa a vinte e cinco de dezembro surge no Cronógrafo de trezentos e cinquenta e quatro, que preservou o calendário litúrgico de Roma de trezentos e trinta e seis, no último ano de Constantino. "
+                "Em vez de combater o solstício, a Igreja absorveu a data e reescreveu seu sentido."
+            ),
+        },
+        # ---------------- ACT 2: DEEP MECHANICS (04:30 - 11:15, cadence 3.5s, PI @ Sc07 & Sc12) ----------------
+        {
+            "act_id": "ACT_2_DEEP_MECHANICS",
+            "act_label": "CAPÍTULO II",
+            "chapter_card": _spaced_chapter_label("II", lang=clean_lang),
+            "chapter_subtitle": "O BISPO, O DEUS E A FERA",
+            "visual_mode": "parallax_25d_photo",
+            "cut_cadence_s": 3.5,
+            "pattern_interrupt": True,
+            "lt_title": "MIRA • SÉCULO IV",
+            "lt_sub": "LÍCIA ROMANA (ATUAL TURQUIA) • O REAL BISPO NICOLAU",
+            "headline": "ANTES DO TRENÓ, SÃO NICOLAU ERA UM BISPO IMPLACÁVEL NA ANATÓLIA",
+            "quote": "Crônicas bizantinas descrevem Nicolau salvando três irmãs com bolsas de ouro e liderando a demolição do templo pagão de Ártemis em Mira.",
+            "map_orig": "MIRA",
+            "map_dest": "NICEIA",
+            "map_metric": "CONCÍLIO DE NICEIA • 325 D.C.",
+            "photo_q": "Saint Nicholas of Myra Byzantine icon antique painting",
+            "broll_q": "ancient stone temple ruins fog dark",
+            "pip_q": "gold coins parchment dark candle",
+            "shots": [
+                "4th century AD Byzantine Anatolia dark chiaroscuro portrait of Bishop Nicholas of Myra in weathered Greek episcopal robes holding an iron-bound scripture in candlelight",
+                "Close-up of small worn leather pouches overflowing with hammered Roman gold solidi coins resting on a dark wooden windowsill at night",
+                "Dramatic shadowed scene of fourth-century Christian crowds tearing down crumbling marble columns of the pagan Temple of Artemis in ancient Lycia by torchlight",
+                "Ancient coastal stone ruins of Myra in Anatolia silhouetted against a brooding stormy Mediterranean winter sky",
+                "Candlelit Byzantine stone council hall evoking the 325 AD Council of Nicaea with bearded Greek bishops seated in deep chiaroscuro",
+            ],
+            "narration": (
+                "Enquanto Roma reescrevia dezembro, um homem de carne e osso vivia na costa sul da atual Turquia, na antiga província romana da Lícia: Nicolau, bispo de Mira no século quarto. "
+                "Longe da imagem sorridente de hoje, crônicas bizantinas retratam um líder rigoroso e combativo. "
+                "Ele participou do Concílio de Niceia em trezentos e vinte e cinco, atirou bolsas de ouro pela janela para salvar três irmãs empobrecidas da servidão e liderou a demolição do templo pagão de Ártemis em Mira."
+            ),
+        },
+        {
+            "act_id": "ACT_2_DEEP_MECHANICS",
+            "act_label": "CAPÍTULO II",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "dark_map_route",
+            "cut_cadence_s": 3.5,
+            "pattern_interrupt": False,
+            "lt_title": "MIRA A AMSTERDÃ • SÉC. XI–XVII",
+            "lt_sub": "DA ANATÓLIA AO MAR DO NORTE • DE NICOLAU A PAPAI NOEL",
+            "headline": "COMO MARINHEIROS HOLANDESES TRANSFORMARAM SÃO NICOLAU EM SANTA CLAUS",
+            "quote": "Relíquias levadas a Bari em 1087 espalharam o culto pela Europa; nos Países Baixos, Sint Nikolaas virou Sinterklaas e depois Santa Claus.",
+            "map_orig": "MIRA",
+            "map_dest": "AMSTERDÃ",
+            "map_metric": "NICOLAU -> SINTERKLAAS -> PAPAI NOEL",
+            "photo_q": "17th century Dutch galleon harbor winter historical painting",
+            "broll_q": "dark ocean waves mist night",
+            "pip_q": "antique nautical map compass candle",
+            "shots": [
+                "17th century Dutch Golden Age oil painting style wide shot of wooden sailing ships moored in a freezing foggy Amsterdam canal at night under oil lanterns",
+                "Medieval Italian sailors in eleventh-century wool cloaks carrying a carved stone reliquary chest by flickering torches in Bari harbor",
+                "Close-up of an antique brass astrolabe, weathered nautical chart of Europe, and candle wax dripping onto dark timber",
+                "17th-century Dutch street scene in snow with a tall robed Sinterklaas figure wearing a bishop mitre illuminated by warm tavern windows",
+                "Shadowy archival etching of colonial New Amsterdam timber houses along a wintry icy waterfront in the 1600s",
+            ],
+            "narration": (
+                "Mas como um bispo grego do Mediterrâneo virou o nosso Papai Noel? "
+                "Em mil e oitenta e sete, marinheiros italianos levaram os restos mortais de Nicolau para Bari, espalhando seu culto entre navegantes por toda a Europa. "
+                "Nos portos da Holanda, São Nicolau foi encurtado pela fala popular para Sinterklaas, celebrado todo dezembro com presentes nos sapatos. "
+                "Quando colonos holandeses levaram Sinterklaas para Nova Amsterdã, a pronúncia inglesa fundiu o nome em Santa Claus, a raiz direta do Papai Noel."
+            ),
+        },
+        {
+            "act_id": "ACT_2_DEEP_MECHANICS",
+            "act_label": "CAPÍTULO II",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "cinema_multishot",
+            "cut_cadence_s": 3.5,
+            "pattern_interrupt": False,
+            "lt_title": "ESCANDINÁVIA • YULE MEDIEVAL",
+            "lt_sub": "JÓL E A CAÇADA SELVAGEM • ODIN NO CÉU DE INVERNO",
+            "headline": "NO NORTE GELADO, ODIN CAVALGAVA AS TEMPESTADES DO SOLSTÍCIO DE YULE",
+            "quote": "Durante as doze noites de Yule, povos germânicos acendiam o tronco sagrado e temiam a Caçada Selvagem liderada pelo deus barbudo Odin.",
+            "map_orig": "ESCANDINÁVIA",
+            "map_dest": "ALEMANHA",
+            "map_metric": "YULE (JÓL) • 12 NOITES DE INVERNO",
+            "photo_q": "Norse mythology Odin Wild Hunt painting winter night",
+            "broll_q": "snow forest night dark wind",
+            "pip_q": "burning fireplace yule log dark",
+            "shots": [
+                "9th century Early Medieval Scandinavian winter painting of a towering cloaked bearded rider evoking Odin on a dark warhorse silhouetted across a stormy moonlight sky",
+                "Massive oak Yule log burning furiously inside a smoky Viking timber longhouse hearth surrounded by carved Norse pillars",
+                "Close-up of weathered leather children boots stuffed with golden winter straw and oats placed beside a stone Nordic fireplace",
+                "Shadowy snow-draped pine forest in medieval Scandinavia with eerie silver moonlight piercing heavy winter fog",
+                "Weathered Viking runestone half-buried in deep December snow lit by the amber glow of a distant iron brazier",
+            ],
+            "narration": (
+                "Enquanto o bispo avançava pelo Mediterrâneo, o norte da Europa guardava um inverno ainda mais sombrio. "
+                "Entre escandinavos e germânicos, o solstício era o Yule, ou Jól, doze noites em que troncos imensos ardiam na lareira para afastar o frio e os espíritos. "
+                "Nas tempestades mais violentas de dezembro, o deus barbudo Odin liderava a Caçada Selvagem pelos céus montado em Sleipnir, seu cavalo de oito patas. "
+                "Crianças deixavam botas com palha perto do fogo para alimentar a montaria divina, esperando doces ou pequenos presentes em troca."
+            ),
+        },
+        {
+            "act_id": "ACT_2_DEEP_MECHANICS",
+            "act_label": "CAPÍTULO II",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "parallax_25d_photo",
+            "cut_cadence_s": 3.5,
+            "pattern_interrupt": False,
+            "lt_title": "ALPES AUSTRÍACOS • SÉCULO XI",
+            "lt_sub": "KRAMPUSNACHT • O PACTO DUALISTA COM A FERA DE CHIFRES",
+            "headline": "NOS ALPES MEDIEVAIS, SÃO NICOLAU GANHOU UMA SOMBRA ATERRORIZANTE: KRAMPUS",
+            "quote": "Na noite de cinco de dezembro, Krampus arrastava correntes enferrujadas, varas de bétula e um cesto de madeira pelas vilas alpinas.",
+            "map_orig": "ALPES AUSTRÍACOS",
+            "map_dest": "BAVIERA",
+            "map_metric": "5 DE DEZEMBRO • KRAMPUSNACHT",
+            "photo_q": "antique vintage Krampus Austrian folklore engraving postcard",
+            "broll_q": "foggy medieval alpine village snow night",
+            "pip_q": "rusted iron chains dark shadow",
+            "shots": [
+                "11th century Medieval Austrian Alps dark gothic portrait of the horned winter folklore demon Krampus with weathered goat horns, matted dark fur, and rusted chains standing in a snowy mountain alley",
+                "Close-up of heavy corroded medieval iron chains and bundled dried birch switches resting in fresh snow under faint lantern light",
+                "Atmospheric 11th-century timber alpine village nestled beneath jagged snow-covered Austrian peaks in freezing blue moonlight",
+                "Dramatic chiaroscuro wide shot of medieval peasant parents barring a heavy oak cottage door against howling December wind",
+                "Weathered antique Central European woodcut illustration style depiction of a tall robed Saint Nicholas standing beside a dark horned shadow",
+            ],
+            "narration": (
+                "Nos vales isolados dos Alpes austríacos e da Baviera, no século onze, a Igreja enfrentou um dilema impossível: as populações montanhesas simplesmente se recusavam a abandonar seus antigos espíritos de inverno. "
+                "A solução folclórica foi um pacto sombrio de disciplina moral. "
+                "Em vez de apagar o medo, a tradição o colocou ao lado do santo. "
+                "Enquanto São Nicolau premiava os obedientes, sua contraparte demoníaca, o Krampus, descia das montanhas na noite de cinco de dezembro, a Krampusnacht. "
+                "Com chifres retorcidos, correntes enferrujadas, varas de bétula chamadas Ruten e um cesto de madeira às costas, a criatura existia para lembrar que o inverno não perdoava os culpados."
+            ),
+        },
+        {
+            "act_id": "ACT_2_DEEP_MECHANICS",
+            "act_label": "CAPÍTULO II",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "video_over_video_collage",
+            "cut_cadence_s": 3.5,
+            "pattern_interrupt": False,
+            "lt_title": "EUROPA TUDOR • SÉC. XIV–XVI",
+            "lt_sub": "ABADE DA DESORDEM E WASSAILING • O CAOS NAS RUAS",
+            "headline": "NA IDADE MÉDIA, DEZEMBRO ERA UMA VÁLVULA EXPLOSIVA DE MULTIDÕES MASCARADAS",
+            "quote": "Grupos de camponeses praticavam o wassailing às portas dos palácios exigindo comida, bebida e moedas sob ameaça de tumulto.",
+            "map_orig": "INGLATERRA",
+            "map_dest": "FRANÇA",
+            "map_metric": "TWELFTH NIGHT • ABADE DA DESORDEM",
+            "photo_q": "Bruegel medieval winter carnival painting Tudor festival",
+            "broll_q": "medieval stone castle fog night",
+            "pip_q": "burning torch medieval tavern dark",
+            "shots": [
+                "15th-century Late Medieval and Tudor Europe Pieter Bruegel style dark oil painting of a rowdy winter street crowd wearing eerie wooden masks carrying flaming torches",
+                "Heavy iron-studded oak gates of a wealthy Tudor stone manor house besieged at night by poor peasants holding pewter wassail bowls",
+                "Candlelit medieval tavern hall overflowing with masked revelers crowning a ragged jester as the Lord of Misrule",
+                "Close-up of a steaming carved wooden wassail bowl filled with dark spiced ale and roasted apples on a rough oak table",
+                "Moody winter evening view of crooked half-timbered Tudor London streets shrouded in woodsmoke and dark shadows",
+            ],
+            "narration": (
+                "Entre os séculos catorze e dezesseis, o Natal europeu continuava a léguas de distância de uma reunião familiar tranquila. "
+                "Das cortes dos reis Tudor às vielas lamacentas de Londres e Paris, as doze noites de festa reviviam o velho caos da Saturnália sob o comando do Abade da Desordem, o Lord of Misrule. "
+                "Multidões de trabalhadores mascarados marchavam pelas ruas praticando o wassailing: batiam com força às portas das mansões aristocráticas exigindo comida, cerveja quente e moedas. "
+                "Se os ricos se recusassem a abrir a despensa, janelas eram quebradas e muros pichados. "
+                "Para os nobres, dezembro havia se tornado uma válvula social perigosamente volátil."
+            ),
+        },
+        {
+            "act_id": "ACT_2_DEEP_MECHANICS",
+            "act_label": "CAPÍTULO III",
+            "chapter_card": _spaced_chapter_label("III", lang=clean_lang),
+            "chapter_subtitle": "O NATAL PROIBIDO POR LEI",
+            "visual_mode": "2d_schematic_over_realism",
+            "cut_cadence_s": 3.5,
+            "pattern_interrupt": True,
+            "lt_title": "INGLATERRA • 1644–1647",
+            "lt_sub": "PARLAMENTO LONGO E OLIVER CROMWELL • A ABOLIÇÃO PURITANA",
+            "headline": "1647: PARLAMENTO INGLÊS DECRETA O NATAL UMA ABOMINAÇÃO PAGÃ ILEGAL",
+            "quote": "Justamente pelas raízes pagãs da Saturnália e pela desordem nas ruas, puritanos proibiram o feriado e impuseram jejum obrigatório.",
+            "map_orig": "WESTMINSTER",
+            "map_dest": "INGLATERRA",
+            "map_metric": "DECRETO PARLAMENTAR • JUNHO DE 1647",
+            "photo_q": "Oliver Cromwell 17th century portrait English Civil War engraving",
+            "broll_q": "dark gothic stone hall candle shadow",
+            "pip_q": "antique parchment decree wax seal",
+            "shots": [
+                "1647 17th-century English Civil War Puritan England dark chiaroscuro oil portrait of Oliver Cromwell in blackened iron breastplate and plain white Puritan collar",
+                "Dimly lit 17th-century Westminster parliamentary chamber packed with stern black-hatted Puritan lawmakers signing a wax-sealed parchment ordinance",
+                "Close-up of a weathered 1647 English printed broadside proclamation nailed to a damp stone wall in freezing December rain",
+                "Column of 17th-century New Model Army Roundhead pikemen and musketeers in lobster-tail steel helmets marching through foggy cobblestone streets",
+                "Dark minimalist interior of a stripped Puritan stone church in 1640s England with bare whitewashed walls and zero winter greenery",
+            ],
+            "narration": (
+                "E foi exatamente essa herança pagã e barulhenta que desencadeou o golpe mais radical contra o feriado na história ocidental. "
+                "Em meio à Guerra Civil Inglesa, os puritanos que dominavam o Parlamento Longo em Londres passaram a denunciar o Natal como uma abominação pagã e papista sem nenhuma base nas Escrituras. "
+                "Entre mil seiscentos e quarenta e quatro e mil seiscentos e quarenta e sete, o Parlamento aboliu oficialmente o Natal, a Páscoa e Pentecostes. "
+                "O dia vinte e cinco de dezembro foi transformado por lei em uma jornada obrigatória de jejum, penitência e comércio aberto, fiscalizada pelo temido Novo Exército Modelo liderado por Oliver Cromwell."
+            ),
+        },
+        {
+            "act_id": "ACT_2_DEEP_MECHANICS",
+            "act_label": "CAPÍTULO III",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "parallax_25d_photo",
+            "cut_cadence_s": 3.5,
+            "pattern_interrupt": False,
+            "lt_title": "CANTERBURY • 25 DEZ 1647",
+            "lt_sub": "KENT, INGLATERRA • O MOTIM DO PUDIM DE AMEIXA",
+            "headline": "25 DE DEZEMBRO DE 1647: O MOTIM DO PUDIM DE AMEIXA EXPLODE EM CANTERBURY",
+            "quote": "Quando o prefeito obrigou lojas a abrir em Canterbury, moradores jogaram futebol nas ruas, tomaram os portões da cidade e acenderam a Segunda Guerra Civil.",
+            "map_orig": "CANTERBURY",
+            "map_dest": "LONDRES",
+            "map_metric": "25 DEZ 1647 • CANTERBURY, KENT",
+            "photo_q": "Canterbury Westgate medieval gate 17th century England engraving",
+            "broll_q": "medieval cobblestone street rain fog dark",
+            "pip_q": "burning torch cobblestone night dark",
+            "shots": [
+                "1647 17th-century English Civil War Puritan England dramatic wide oil painting of angry 17th-century townsfolk in woolen doublets and cloaks clashing with steel-helmeted Roundhead pikemen beneath Canterbury medieval Westgate stone towers",
+                "Close-up of a dark dense 17th-century English steamed plum pudding wrapped in coarse linen cloth lying beside fresh holly sprigs on wet medieval cobblestones",
+                "Half-timbered 17th-century Canterbury wooden shopfronts with smashed leaded-glass windows and flickering oil lanterns in winter dusk",
+                "Shadowy troop of 17th-century English parliamentary cavalry in iron buff coats riding with flintlock muskets through freezing mist toward Kent",
+                "Historic dark stone silhouette of Canterbury Cathedral rising behind smoky torches in December 1647",
+            ],
+            "narration": (
+                "A proibição rapidamente incendiou o interior da Inglaterra. "
+                "Na manhã de vinte e cinco de dezembro de mil seiscentos e quarenta e sete, em Canterbury, no condado de Kent, o prefeito puritano Michael Page ordenou que todas as lojas abrissem. "
+                "A reação foi explosiva: moradores penduraram azevinho nas fachadas, distribuíram pudim de ameixa nas ruas, improvisaram uma partida de futebol em desafio aberto e espancaram os guardas. "
+                "Conhecido como o Motim do Pudim de Ameixa, o levante tomou os portões de Canterbury e acendeu o estopim da Segunda Guerra Civil Inglesa."
+            ),
+        },
+        {
+            "act_id": "ACT_2_DEEP_MECHANICS",
+            "act_label": "CAPÍTULO III",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "dark_map_route",
+            "cut_cadence_s": 3.5,
+            "pattern_interrupt": False,
+            "lt_title": "LONDRES A BOSTON • 1652–1659",
+            "lt_sub": "PROIBIÇÃO TRANSATLÂNTICA • MULTA DE CINCO XELINS",
+            "headline": "SOLDADOS FAREJAVAM CHAMINÉS EM LONDRES E BOSTON MULTAVA QUEM FOLGASSE",
+            "quote": "Em 1659, a Corte Geral de Massachusetts impôs multa de cinco xelins a qualquer colono pego festejando ou faltando ao trabalho no Natal.",
+            "map_orig": "LONDRES",
+            "map_dest": "BOSTON",
+            "map_metric": "MULTA DE 5 XELINS • MASSACHUSETTS 1659",
+            "photo_q": "17th century colonial Boston Puritan engraving historical",
+            "broll_q": "smoke chimney dark winter roof night",
+            "pip_q": "antique silver shillings coins dark",
+            "shots": [
+                "1659 17th-century Colonial Puritan Massachusetts dark atmospheric scene of a Puritan watchman in wide-brimmed black hat inspecting wooden colonial Boston houses in falling snow by lantern light",
+                "1652 Cromwellian London oil painting style view of Roundhead soldiers patrolling narrow foggy timber alleys peering up at smoking brick chimneys",
+                "Close-up of a handwritten 1659 Massachusetts Bay Colony parchment law book beside five tarnished 17th-century silver shilling coins",
+                "Cold misty North Atlantic wooden merchant ship sailing through dark winter swells between England and New England in the 1650s",
+                "Dimly lit 17th-century English domestic hearth where a fearful family hides a roasting goose behind shuttered wooden windows",
+            ],
+            "narration": (
+                "A repressão ao Natal atravessou até o Oceano Atlântico. "
+                "Em Londres, durante a década de mil seiscentos e cinquenta, cronistas relataram soldados patrulhando becos para farejar chaminés suspeitas de assar ganso ou carne festiva às escondidas, derrubando portas e confiscando jantares inteiros. "
+                "Do outro lado do mar, nas colônias puritanas da Nova Inglaterra, a vigilância foi ainda mais duradoura. "
+                "Em maio de mil seiscentos e cinquenta e nove, a Corte Geral de Massachusetts, em Boston, aprovou uma lei explícita: qualquer pessoa flagrada celebrando o Natal, preparando banquetes ou se recusando a trabalhar no dia vinte e cinco de dezembro pagaria uma multa pesada de cinco xelins."
+            ),
+        },
+        {
+            "act_id": "ACT_2_DEEP_MECHANICS",
+            "act_label": "CAPÍTULO III",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "newspaper_highlighter",
+            "cut_cadence_s": 3.5,
+            "pattern_interrupt": False,
+            "lt_title": "LONDRES • 1660",
+            "lt_sub": "A RESTAURAÇÃO DE CARLOS II • O RETORNO DA FESTA",
+            "headline": "1660: APÓS A MORTE DE CROMWELL, REI CARLOS II REVOGA O BANIMENTO",
+            "quote": "A Restauração reabriu teatros e tavernas e devolveu a folia ruidosa de dezembro — deixando a elite britânica inquieta diante das ruas.",
+            "map_orig": "HOLANDA",
+            "map_dest": "LONDRES",
+            "map_metric": "RESTAURAÇÃO MONÁRQUICA • 1660",
+            "photo_q": "King Charles II 1660 Restoration portrait painting museum",
+            "broll_q": "gothic cathedral candle flame dark",
+            "pip_q": "antique crown velvet shadow dark",
+            "shots": [
+                "1660 Restoration England King Charles II regal chiaroscuro Baroque oil portrait of King Charles II in velvet robes and long curled wig inside Whitehall Palace",
+                "Candlelit 1660s London Restoration theater stage and bustling wooden tavern reopening with musicians and merrymakers in seventeenth-century doublets",
+                "Close-up of a royal red wax seal stamped onto the 1660 Restoration proclamation repealing Cromwellian Puritan ordinances",
+                "Dramatic shadowed procession along London cobblestone streets in 1660 with golden torches illuminating medieval timber facades",
+                "Atmospheric 17th-century aristocratic parlor where wealthy London merchants gaze cautiously out leaded windows at rowdy December revelers",
+            ],
+            "narration": (
+                "A ditadura puritana, porém, não resistiu ao próprio criador. "
+                "Oliver Cromwell morreu em mil seiscentos e cinquenta e oito e, em mil seiscentos e sessenta, a Restauração levou o rei Carlos Segundo ao trono. "
+                "Ao contrário de versões distorcidas, a Restauração não transformou o Natal em silêncio e oração: Carlos Segundo revogou o banimento, reabriu teatros e tavernas e devolveu a folia ruidosa de dezembro. "
+                "Mas o trauma das revoltas armadas deixou a elite britânica obcecada por uma forma de domar dezembro."
+            ),
+        },
+        # ---------------- ACT 3: CLIMAX & REVELATION (11:15 - 15:30, cadence 2.7s, PI @ Sc16) ----------------
+        {
+            "act_id": "ACT_3_CLIMAX_REVELATION",
+            "act_label": "CAPÍTULO IV",
+            "chapter_card": _spaced_chapter_label("IV", lang=clean_lang),
+            "chapter_subtitle": "A DOMESTICAÇÃO PERFEITA",
+            "visual_mode": "fern_3d_reconstruction",
+            "cut_cadence_s": 2.7,
+            "pattern_interrupt": True,
+            "lt_title": "LONDRES • INÍCIO DO SÉC. XIX",
+            "lt_sub": "REVOLUÇÃO INDUSTRIAL • O MEDO DA BURGUESIA",
+            "headline": "NAS CIDADES DE FULIGEM, A VELHA TRADIÇÃO DE RUA VIROU AMEAÇA DE REVOLTA",
+            "quote": "Com fábricas, trabalho infantil e miséria extrema em Londres e Manchester, operários batendo às portas em dezembro aterrorizavam a elite.",
+            "map_orig": "MANCHESTER",
+            "map_dest": "LONDRES",
+            "map_metric": "REVOLUÇÃO INDUSTRIAL • 1800–1840",
+            "photo_q": "19th century Victorian London smog factory Gustave Dore engraving",
+            "broll_q": "foggy historic european alley night",
+            "pip_q": "dark coal smoke vintage chimney",
+            "shots": [
+                "1840s Victorian London 19th century Gustave Dore style dark chiaroscuro engraving of soot-blackened brick textile factories belching winter coal smoke over crowded slums",
+                "Shadowy Victorian Manchester alley in freezing mist with exhausted 19th-century workers in tattered wool coats passing gas streetlamps",
+                "Heavy iron wrought-iron gates of a wealthy 1830s London Georgian townhouse lit by flickering gaslights separating rich interiors from dark streets",
+                "Close-up of coal dust, iron factory gears, and worn ledger books illuminated by a single trembling oil wick lamp",
+                "Moody atmospheric shot of a crowded early 19th-century Thames dockyard shrouded in yellow winter fog and torchlight",
+            ],
+            "narration": (
+                "No início do século dezenove, a Revolução Industrial transformou Londres e Manchester em barris de pólvora cobertos de fuligem. "
+                "Fábricas esmagavam operários e crianças em jornadas exaustivas sob desigualdade brutal. "
+                "Nesse cenário explosivo, bandos de trabalhadores pobres batendo às portas das mansões no wassailing exigindo bebida e moedas deixaram de parecer folclore: para a burguesia assustada, aquilo cheirava a revolução urbana. "
+                "Se os soldados de Cromwell não destruíram o Natal à força, o século dezenove tentaria algo mais esperto: tirá-lo das ruas e trancá-lo na sala."
+            ),
+        },
+        {
+            "act_id": "ACT_3_CLIMAX_REVELATION",
+            "act_label": "CAPÍTULO IV",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "video_over_video_collage",
+            "cut_cadence_s": 2.7,
+            "pattern_interrupt": False,
+            "lt_title": "NOVA YORK • 1822–1823",
+            "lt_sub": "CLEMENT CLARKE MOORE • A INVENÇÃO DO TRENÓ E DAS RENAS",
+            "headline": "1823: UM POEMA DE NOVA YORK REINVENTA O VISITANTE DE INVERNO",
+            "quote": "Publicado em 1823, 'A Visit from St. Nicholas' substituiu tumultos de rua por um elfo alegre descendo em silêncio pela chaminé.",
+            "map_orig": "NOVA YORK",
+            "map_dest": "LONDRES",
+            "map_metric": "DEZEMBRO DE 1823 • TROY SENTINEL",
+            "photo_q": "1823 Clement Clarke Moore Visit from St Nicholas antique illustration",
+            "broll_q": "fireplace hearth dark night antique",
+            "pip_q": "snow falling dark Victorian rooftop",
+            "shots": [
+                "1820s Early 19th-century Regency New York candlelit study where patrician scholar Clement Clarke Moore writes with a goose quill pen on parchment beside a frosted window",
+                "Antique 1823 newspaper printing broadsheet of the Troy Sentinel showing classic early 19th-century typography under warm amber lamp light",
+                "Atmospheric snow-covered 1820s New York brick townhouse rooftops and smoking chimneys beneath a crisp winter full moon",
+                "Cozy yet dimly lit 1820s brick family hearth with knitted wool stockings hung quietly in deep chiaroscuro candlelight",
+                "Vintage 19th-century dark copperplate engraving aesthetic of a miniature sleigh drawn across moonlight clouds above quiet sleeping rooftops",
+            ],
+            "narration": (
+                "O primeiro passo cirúrgico dessa engenharia cultural aconteceu em Nova York, no inverno de mil oitocentos e vinte e dois. "
+                "Preocupado com as arruaças natalinas que tomavam as ruas da cidade, o acadêmico aristocrata Clement Clarke Moore compôs para seus filhos um poema publicado anonimamente em dezembro de mil oitocentos e vinte e três: Uma Visita de São Nicolau. "
+                "Em poucos versos, o antigo bispo severo e os bandos barulhentos das ruas desapareceram. "
+                "No lugar deles surgiu um elfo simpático, inofensivo e silencioso, que chegava de trenó puxado por oito renas e descia privadamente pela chaminé da família respeitável enquanto as crianças dormiam."
+            ),
+        },
+        {
+            "act_id": "ACT_3_CLIMAX_REVELATION",
+            "act_label": "CAPÍTULO IV",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "parallax_25d_photo",
+            "cut_cadence_s": 2.7,
+            "pattern_interrupt": False,
+            "lt_title": "LONDRES • DEZEMBRO DE 1843",
+            "lt_sub": "CHARLES DICKENS • UM CONTO DE NATAL",
+            "headline": "DEZEMBRO DE 1843: DICKENS ESCREVE A NOVELA QUE REFUNDOU O NATAL",
+            "quote": "Escrito em apenas seis semanas por um autor endividado, 'Um Conto de Natal' redefiniu a data como caridade íntima e redenção familiar.",
+            "map_orig": "LONDRES",
+            "map_dest": "REINO UNIDO",
+            "map_metric": "6 SEMANAS • 19 DE DEZEMBRO DE 1843",
+            "photo_q": "Charles Dickens A Christmas Carol 1843 original John Leech illustration",
+            "broll_q": "candle burning antique desk book dark",
+            "pip_q": "snowy cobblestone Victorian london night",
+            "shots": [
+                "1840s Victorian London 19th century chiaroscuro portrait of bearded novelist Charles Dickens writing furiously by tallow candlelight at a cluttered mahogany desk",
+                "Original 1843 Victorian leather-bound first edition book with gilt edges resting beside inkwell and brass spectacles on dark wood",
+                "Atmospheric Victorian London foggy gaslit cobblestone street evoking Ebenezer Scrooge walking past shuttered counting houses in falling snow",
+                "Warm candlelit Victorian family dinner table in a modest brick cottage glowing softly against the freezing winter darkness outside",
+                "Dramatic shadowy silhouette of an iron door knocker on a weathered 1840s London oak door misted with frost",
+            ],
+            "narration": (
+                "Vinte anos depois, em dezembro de mil oitocentos e quarenta e três, foi a vez da Inglaterra receber o roteiro emocional definitivo da nova festa. "
+                "Afundado em dívidas e indignado com um relatório parlamentar sobre o trabalho infantil nas fábricas britânicas, o escritor Charles Dickens redigiu em apenas seis semanas febris uma novela curta chamada Um Conto de Natal. "
+                "A transformação do avarento Ebenezer Scrooge vendeu toda a primeira tiragem antes da véspera e operou um milagre cultural: converteu o Natal de um rito coletivo e conflituoso de rua em um drama íntimo de consciência, caridade doméstica e perdão ao redor da mesa familiar."
+            ),
+        },
+        {
+            "act_id": "ACT_3_CLIMAX_REVELATION",
+            "act_label": "CAPÍTULO IV",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "newspaper_highlighter",
+            "cut_cadence_s": 2.7,
+            "pattern_interrupt": False,
+            "lt_title": "WINDSOR • 1848",
+            "lt_sub": "ILLUSTRATED LONDON NEWS • RAINHA VITÓRIA E PRÍNCIPE ALBERT",
+            "headline": "1848: UMA GRAVURA REAL POPULARIZA A ÁRVORE DE NATAL NO MUNDO INTEIRO",
+            "quote": "A xilogravura da família real britânica ao redor de um pinheiro iluminado no Castelo de Windsor transformou um costume alemão em padrão global.",
+            "map_orig": "ALEMANHA",
+            "map_dest": "WINDSOR",
+            "map_metric": "ILLUSTRATED LONDON NEWS • DEZ 1848",
+            "photo_q": "Queen Victoria Prince Albert 1848 Christmas tree Illustrated London News engraving",
+            "broll_q": "historic castle winter twilight snow",
+            "pip_q": "beeswax candles evergreen pine tree dark",
+            "shots": [
+                "1840s Victorian London 19th century authentic chiaroscuro historical scene of Queen Victoria and German-born Prince Albert with their children gathered calmly around a tabletop spruce tree lit by real beeswax candles and dried fruit inside Windsor Castle",
+                "Close-up of an authentic 1848 Victorian woodcut engraving printed on archival broadsheet paper under warm directional gallery lighting",
+                "Intimate macro shot of tiny wax candles clipped to dark evergreen pine needles alongside hand-blown Victorian glass baubles and gilded walnuts",
+                "Majestic snow-dusted stone battlements of Windsor Castle towering in quiet winter twilight mist in 1848",
+                "Candlelit 1840s Victorian middle-class London drawing room adopting the newly fashionable indoor evergreen tree",
+            ],
+            "narration": (
+                "Faltava apenas uma imagem icônica capaz de selar essa revolução doméstica para milhões de lares, e ela chegou cinco anos mais tarde. "
+                "Em dezembro de mil oitocentos e quarenta e oito, o jornal Illustrated London News estampou uma xilogravura histórica: a rainha Vitória, seu marido alemão, o príncipe Albert, e seus filhos reunidos com serenidade ao redor de uma árvore de Natal decorada dentro do Castelo de Windsor. "
+                "Até então, enfeitar pinheiros dentro de casa era visto na Grã-Bretanha como um hábito regional da Alemanha. "
+                "Da noite para o dia, a gravura real transformou a árvore iluminada no símbolo máximo da família respeitável na Europa e nas Américas."
+            ),
+        },
+        {
+            "act_id": "ACT_3_CLIMAX_REVELATION",
+            "act_label": "CAPÍTULO IV",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "2d_schematic_over_realism",
+            "cut_cadence_s": 2.7,
+            "pattern_interrupt": False,
+            "lt_title": "NOVA YORK • 1863–1881",
+            "lt_sub": "HARPER'S WEEKLY • THOMAS NAST E O LIVRO DE VIGILÂNCIA",
+            "headline": "THOMAS NAST CRIA O POLO NORTE E TROCA AS CORRENTES DE KRAMPUS POR UM LIVRO",
+            "quote": "Entre 1863 e 1881, as ilustrações de Nast deram ao Papai Noel oficina polar, casaco de pele e o registro moral de crianças boas e más.",
+            "map_orig": "NOVA YORK",
+            "map_dest": "POLO NORTE",
+            "map_metric": "HARPER'S WEEKLY • 1863–1881",
+            "photo_q": "Thomas Nast Merry Old Santa Claus 1881 Harpers Weekly engraving",
+            "broll_q": "antique printing press engraving paper dark",
+            "pip_q": "old parchment ledger quill dark candle",
+            "shots": [
+                "1870s Late 19th-century Victorian New York wood engraving era studio of illustrator Thomas Nast sketching Merry Old Santa Claus on a dark woodblock by oil lamp",
+                "Close-up of a weathered 19th-century leather-bound ledger book opened to handwritten columns of children names under warm candlelight",
+                "Archival Victorian woodcut engraving aesthetic of a rotund bearded Santa Claus in heavy fur-trimmed winter coat carrying wooden toys and a clay pipe",
+                "Dark atmospheric 19th-century wooden toy-making workbench scattered with hand-carved rocking horses, paint jars, and brass tools",
+                "Snowy nocturnal Victorian New York newspaper printing press rolling out thick stacks of 1881 winter holiday editions",
+            ],
+            "narration": (
+                "Enquanto a árvore conquistava as salas britânicas, o cartunista político Thomas Nast completava o desenho visual do Papai Noel nas páginas da revista americana Harper's Weekly, entre mil oitocentos e sessenta e três e mil oitocentos e oitenta e um. "
+                "Foi Nast quem inventou a oficina secreta no Polo Norte, consolidou o casaco volumoso debruado de pele branca e popularizou o livro de registros de crianças bem-comportadas e travessas. "
+                "Repare na sutileza psicológica dessa troca: o velho terror físico das correntes e varas de Krampus foi aposentado, mas substituído por uma vigilância vitoriana invisível que moldava a obediência infantil o ano inteiro."
+            ),
+        },
+        {
+            "act_id": "ACT_3_CLIMAX_REVELATION",
+            "act_label": "CAPÍTULO IV",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "video_over_video_collage",
+            "cut_cadence_s": 2.7,
+            "pattern_interrupt": False,
+            "lt_title": "CHICAGO • 1931",
+            "lt_sub": "HADDON SUNDBLOM • A PADRONIZAÇÃO COMERCIAL GLOBAL",
+            "headline": "1931: NA GRANDE DEPRESSÃO, A PUBLICIDADE FIXA O ÍCONE VERMELHO NO PLANETA",
+            "quote": "As pinturas a óleo de Haddon Sundblom para a Coca-Cola consolidaram o Papai Noel humano, acolhedor e vermelho-e-branco exportado globalmente.",
+            "map_orig": "CHICAGO",
+            "map_dest": "MUNDO",
+            "map_metric": "1931 • ICONOGRAFIA GLOBAL",
+            "photo_q": "1930s Great Depression vintage winter department store window Chicago",
+            "broll_q": "vintage film projector warm glow dark",
+            "pip_q": "oil painting brush canvas studio dark",
+            "shots": [
+                "1931 Great Depression era early 20th-century America dark atmospheric painter studio where illustrator Haddon Sundblom works with oil brushes on a warm canvas of a human-scaled red-coated Santa Claus",
+                "1930s snow-dusted Chicago department store display window glowing warmly in amber tungsten light along a dark wintry avenue with 1930s wool-coated pedestrians",
+                "Close-up of vintage 1930s oil paint tubes, crimson pigment on a wooden palette, and archival magazine layout proofs under a brass lamp",
+                "Atmospheric 1930s family gathered around a glowing wooden cathedral radio receiver on a cold December evening",
+                "Archival sepia-toned 1930s winter streetcar gliding slowly through softly falling snow in pre-war America",
+            ],
+            "narration": (
+                "A peça final dessa engenharia visual chegou no auge da Grande Depressão. "
+                "Em mil novecentos e trinta e um, buscando vender refrigerante também nos meses gelados, a Coca-Cola contratou o ilustrador Haddon Sundblom para pintar anúncios de inverno em revistas nacionais. "
+                "Embora o vermelho já aparecesse em ilustrações anteriores, foi o pincel a óleo de Sundblom que fixou no imaginário coletivo um Papai Noel de estatura humana, rosto rosado, olhar caloroso e traje vermelho e branco impecável. "
+                "Impulsionada pelo rádio, pelas vitrines das grandes lojas de departamento e depois pela televisão, aquela silhueta comercial atravessou fronteiras e padronizou o Natal em praticamente todos os continentes."
+            ),
+        },
+        # ---------------- ACT 4: ABRUPT ENDING (15:30 - 17:00, final ~75s, ZERO CTA, abrupt 0.5s cut) ----------------
+        {
+            "act_id": "ACT_4_ABRUPT_ENDING",
+            "act_label": "EPÍLOGO",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "sliding_timeline",
+            "cut_cadence_s": 4.5,
+            "pattern_interrupt": False,
+            "lt_title": "SÍNTESE FORENSE • 217 A.C. A 1931",
+            "lt_sub": "CADA ENFEITE NA SALA É UM FÓSSIL ARQUEOLÓGICO",
+            "headline": "SEIS SÉCULOS E SEIS IMPÉRIOS REUNIDOS NA MESMA SALA DE ESTAR",
+            "quote": "Os ramos verdes vêm da Saturnália, a data do Sol Invictus, os presentes de Mira, o trenó de Odin, a árvore de Windsor e o casaco de 1931.",
+            "map_orig": "ROMA",
+            "map_dest": "HOJE",
+            "map_metric": "ARQUEOLOGIA DO NATAL",
+            "photo_q": "dark candlelit pine tree antique ornaments chiaroscuro",
+            "broll_q": "candle flame dark quiet shadow",
+            "pip_q": "antique evergreen wreath beeswax candle",
+            "shots": [
+                "Dramatic museum forensic chiaroscuro collage still of antique Roman wax candles, medieval evergreen boughs, old parchment seals, and hand-blown Victorian glass spheres on dark slate",
+                "Slow atmospheric view of a quiet darkened modern living room lit solely by warm candlelight flickering across pine branches",
+                "Close-up of a single crimson glass ornament reflecting a warm candle flame in pitch darkness",
+                "Shadowy silhouette of ancient evergreen pine needles dusted with snow outside a leaded glass window",
+            ],
+            "narration": (
+                "Quando colocamos todas as peças lado a lado na mesa forense, o mapa completo se revela com clareza impressionante. "
+                "Cada enfeite que você segura nas mãos em dezembro é um fóssil arqueológico sobrevivente de outro mundo. "
+                "Os ramos verdes e as velas vêm da Saturnália romana. "
+                "O dia vinte e cinco de dezembro ecoa o solstício do Sol Invictus absorvido no século quarto. "
+                "Os presentes secretos herdaram o nome do bispo Nicolau de Mira, o trenó nos céus carrega o rastro da Caçada Selvagem de Odin, o pinheiro na sala nasceu em Windsor e o casaco vermelho ganhou o mundo nas revistas do século vinte."
+            ),
+        },
+        {
+            "act_id": "ACT_4_ABRUPT_ENDING",
+            "act_label": "EPÍLOGO",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "red_string_board",
+            "cut_cadence_s": 4.5,
+            "pattern_interrupt": False,
+            "lt_title": "LEGADO • 2.000 ANOS DE HISTÓRIA",
+            "lt_sub": "POR QUE NENHUM DECRETO CONSEGUIU APAGAR DEZEMBRO",
+            "headline": "IMPÉRIOS CAÍRAM E LEIS PROIBIRAM — MAS A FOGUEIRA DE INVERNO SOBREVIVEU",
+            "quote": "Por trás de reis, parlamentos e campanhas publicitárias, dezembro resistiu porque responde a um medo humano mais antigo que qualquer nação.",
+            "map_orig": "ANTIGUIDADE",
+            "map_dest": "PRESENTE",
+            "map_metric": "SOBREVIVÊNCIA ANCESTRAL",
+            "photo_q": "flickering hearth fire dark stone room winter",
+            "broll_q": "fireplace embers glowing dark night",
+            "pip_q": "dark winter sky faint twilight",
+            "shots": [
+                "Atmospheric wide chiaroscuro cinema shot of a lone glowing hearth fire burning softly inside a dark stone chamber as snow drifts silently past the window",
+                "Close-up of glowing red wood embers pulsing gently in deep obsidian darkness",
+                "Dark historic European cathedral silhouette standing quietly under a deep indigo winter solstice twilight sky",
+                "Moody shadowy silhouette of a lone human figure looking out a tall frost-rimmed window into a silent snow-covered forest",
+            ],
+            "narration": (
+                "Impérios gigantescos desmoronaram, parlamentos armados tentaram varrer a festa do calendário e grandes corporações redesenharam sua embalagem para vender sonhos em escala industrial. "
+                "Mesmo assim, nenhuma lei, nenhum exército e nenhuma reforma conseguiu apagar o dia vinte e cinco de dezembro. "
+                "Talvez porque, por baixo de todos os decretos políticos, interesses econômicos e contos açucarados, os seres humanos modernos ainda carreguem exatamente a mesma necessidade instintiva que movia nossos ancestrais dois mil anos atrás: acender luzes, reunir os seus e desafiar o frio quando o ano parece chegar ao fim."
+            ),
+        },
+        {
+            "act_id": "ACT_4_ABRUPT_ENDING",
+            "act_label": "EPÍLOGO",
+            "chapter_card": None,
+            "chapter_subtitle": None,
+            "visual_mode": "parallax_25d_photo",
+            "cut_cadence_s": 4.5,
+            "pattern_interrupt": False,
+            "lt_title": "25 DE DEZEMBRO • O ETERNO SOLSTÍCIO",
+            "lt_sub": "A FOGUEIRA ANCESTRAL NA SALA ESCURA",
+            "headline": "A NOITE EM QUE O SOL MORREU",
+            "quote": "As luzes na sala escura ainda respondem ao mesmo ritual de dois mil anos atrás.",
+            "map_orig": "SOLSTÍCIO",
+            "map_dest": "HOJE",
+            "map_metric": "25 DE DEZEMBRO",
+            "photo_q": "lone glowing beeswax candle dark shadow Christmas tree silhouette",
+            "broll_q": "single candle flame darkness quiet",
+            "pip_q": "dark pine branch shadow candle",
+            "shots": [
+                "Haunting chiaroscuro cinema still of a quiet dark living room where a single tree lit by warm candle-like amber lights casts tall ancestral shadows across dark walls",
+                "Intimate slow close-up of a solitary beeswax candle flame flickering steadily in deep velvet darkness",
+                "Atmospheric backlit silhouette of a person standing motionless gazing at warm amber winter light inside a silent dark room",
+            ],
+            "narration": (
+                "A história oficial tentou cobrir tudo com neve limpa e papel brilhante, mas a memória mais profunda nunca desaparece de verdade. "
+                "Quando você apagar as luzes nesta noite de vinte e cinco de dezembro, olhe para o brilho das velas e da árvore na sala escura: você está apenas celebrando uma festa moderna... ou ainda está mantendo acesa a fogueira ancestral contra a noite em que o sol morreu?"
+            ),
+        },
+    ]
+
+    # For ultra-short smoke tests (<= 1.5 min in 9:16), pick a concise fact-checked chronological slice;
+    # otherwise deliver the COMPLETE 25-scene, 5-Act masterpiece!
+    if float(target_minutes or 17.0) <= 1.5 and aspect_ratio == "9:16":
+        selected_specs = [raw_specs[i] for i in (0, 3, 6, 7, 10, 13, 18, 24)]
+    else:
+        selected_specs = raw_specs
+
+    scenes: List[NetflixDocScene] = []
+    for idx, sp in enumerate(selected_specs):
+        lt_t = _normalize_upper(_clean_doc_text(sp["lt_title"]))
+        lt_s = _normalize_upper(_clean_doc_text(sp["lt_sub"]))
+        locked_shots: List[str] = []
+        for raw_sh in sp["shots"]:
+            sh_p = _sanitize_dark_history_prompt(raw_sh, mood="dark_horror")
+            if is_vertical:
+                sh_p = _enforce_vertical_prompt_framing(sh_p)
+            sh_p = _enforce_historical_era_prompt_lock(sh_p, lt_t, lt_s)
+            locked_shots.append(sh_p)
+
+        vmode: VisualModeType = sp["visual_mode"]
+        # Safety invariant: dark_map_route ONLY when origin != destination
+        if vmode == "dark_map_route" and sp["map_orig"].strip().lower() == sp["map_dest"].strip().lower():
+            vmode = "2d_schematic_over_realism"
+
+        narr_txt = _normalize_pt_century_ordinals_in_text(_clean_doc_text(sp["narration"]), lang=clean_lang)
+        scenes.append(
+            NetflixDocScene(
+                scene_id=f"doc_sc_{idx + 1:02d}",
+                act_id=sp["act_id"],
+                act_label=sp["act_label"],
+                chapter_card=sp["chapter_card"],
+                chapter_subtitle=sp["chapter_subtitle"],
+                visual_mode=vmode,
+                visual_category=_resolve_visual_category(vmode, is_broll_shot=False),
+                cut_cadence_s=float(sp["cut_cadence_s"]),
+                pattern_interrupt=bool(sp["pattern_interrupt"]),
+                mood="dark_horror",
+                narration=narr_txt,
+                lower_third_title=lt_t,
+                lower_third_subtitle=lt_s,
+                highlight_color="#EAB308" if idx % 2 == 0 else "#D9381E",
+                evidence_headline=_clean_doc_text(sp["headline"]),
+                evidence_quote=_clean_doc_text(sp["quote"]),
+                map_origin=_clean_doc_text(sp["map_orig"]),
+                map_destination=_clean_doc_text(sp["map_dest"]),
+                map_metric=_clean_doc_text(sp["map_metric"]),
+                timeline_points=global_timeline,
+                board_nodes=global_nodes,
+                image_prompt_en=locked_shots[0] if locked_shots else sp["photo_q"],
+                bespoke_image_prompt_en=locked_shots[0] if locked_shots else "",
+                prefer_gemini_photo=True,
+                broll_query_en=sp["broll_q"],
+                pip_broll_query_en=sp["pip_q"],
+                photo_query_en=sp["photo_q"],
+                extra_photo_queries_en=[sp["photo_q"], sp["broll_q"], sp["pip_q"]],
+                shot_prompts_en=locked_shots,
+                transition_type=_select_transition_for_scene(idx, vmode, sp["chapter_card"] is not None),
+            )
+        )
+
+    plan_obj = NetflixDocPlan(
+        schema_version="3.0.0",
+        pipeline_name="Mixed_Media_High_Retention_Documentary_Engine",
+        title="A Noite em que o Sol Morreu: A Real História Oculta do Natal" if not is_en else "The Night the Sun Died: The Real Hidden History of Christmas",
+        subtitle="Arquivo Histórico • De Roma (217 a.C.) à Era Moderna" if not is_en else "Historical Archive • From Rome (217 BC) to the Modern Era",
+        channel_name="Arquivos Sombrios" if not is_en else "Dark Vault Files",
+        mood="dark_horror",
+        lang=clean_lang,
+        aspect_ratio=aspect_ratio,
+        target_minutes=round(float(target_minutes or 17.0), 2),
+        lut_file="02_dark_wealth.cube",
+        voice_id=voice_id,
+        caption_style=caption_style,
+        thumbnail_hook="O NATAL PROIBIDO" if not is_en else "FORBIDDEN CHRISTMAS",
+        topic_source="curated_5act_masterpiece_v3",
+        tokens_used=0,
+        cost_usd=0.0,
+        pattern_interrupt_times=[240.0, 480.0, 720.0] if len(scenes) >= 20 else [],
+        scenes=scenes,
+        hashtags=["#documentario", "#historia", "#natal", "#historiaobscura", "#superhistorico"],
+    )
+    return audit_netflix_doc_plan(plan_obj.model_dump(), lang=clean_lang)
+
+
 def generate_netflix_doc_plan(
     topic: str,
     aspect_ratio: str = "16:9",
-    target_minutes: float = 2.75,
+    target_minutes: Optional[float] = None,
     lang: str = "pt_br",
     custom_directives: str = "",
     caption_style: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Generate a complete investigative Netflix / MagnatesMedia / Dark History documentary plan (dict).
+    """Generate a complete investigative Netflix / MagnatesMedia / Super Histórico / Vox documentary plan (dict).
 
+    - Schema v3.0.0 (`Mixed_Media_High_Retention_Documentary_Engine`, `16:9` default, supports up to `18.0` min).
+    - For Christmas / dark-winter historical topics in `16:9` or `target_minutes >= 12.0`, builds the
+      fact-checked 25-Scene, 5-Act Masterpiece (~2,250-2,450 words, ~16m-17m30s / 960-1,050s).
     - Matches the 10 curated financial dossiers when the topic clearly requests one of them.
-    - For ANY new arbitrary open topic (dark history, horror folklore, mysteries, true crime,
-      ancient history, biographies, science, etc.), invokes the user's LIVE DeepSeek (`deepseek-chat`)
-      or Google Gemini (`gemini-flash-lite-latest` via `x-goog-api-key`) AI Director with automatic
-      failover to author a 100% original, deeply researched documentary plan with zero financial boilerplate!
+    - For ANY new arbitrary open topic, invokes LIVE DeepSeek (`deepseek-chat`) or Google Gemini with
+      automatic failover, enforcing era-locked prompts and strict forward chronology.
     - Always runs the final plan through `agents.retention_doctor.audit_netflix_doc_plan`.
     """
     ar: Literal["16:9", "9:16"] = "9:16" if str(aspect_ratio).strip() == "9:16" else "16:9"
     clean_lang = "en_us" if str(lang).lower().startswith("en") else "pt_br"
     is_en = clean_lang == "en_us"
-    t_min = max(0.35, min(15.0, float(target_minutes or 2.75)))
+    default_min = 17.0 if ar == "16:9" else 2.75
+    t_min = max(0.35, min(20.0, float(target_minutes if target_minutes is not None else default_min)))
     target_seconds = max(25.0, t_min * 60.0)
-    # Subtract real structural audio overhead (chapter cards 1.65s + inter-scene gaps 0.42s + 1.25s tail)
-    # and budget spoken narration at realistic ~2.05 w/s cinema voice-acting pace.
-    pace_wps = 2.05
-    rough_scenes = max(4, min(60, int(round(max(20.0, target_seconds - 4.5) / 11.5))))
-    est_chapters = _estimate_chapter_count(rough_scenes)
-    overhead_s = est_chapters * 1.65 + rough_scenes * 0.42 + 1.25
-    spoken_budget_s = max(14.0, target_seconds - overhead_s)
-    total_target_words = max(48, int(round(spoken_budget_s * pace_wps)))
-    words_per_sc_divisor = 25.0 if target_seconds >= 120.0 else 21.0
-    n_scenes = max(4, min(60, int(round(total_target_words / words_per_sc_divisor))))
-    est_chapters = _estimate_chapter_count(n_scenes)
-    overhead_s = est_chapters * 1.65 + n_scenes * 0.42 + 1.25
-    spoken_budget_s = max(14.0, target_seconds - overhead_s)
-    total_target_words = max(48, int(round(spoken_budget_s * pace_wps)))
-    avg_words_per_scene = total_target_words / float(n_scenes)
-    if avg_words_per_scene >= 19.0:
-        min_scene_words = max(14, int(math.floor(avg_words_per_scene)) - 4)
-        max_scene_words = min(28, int(math.floor(avg_words_per_scene)) + 1)
+
+    default_cap = "selective_emphasis" if ar == "16:9" else "cinema_minimal"
+    if caption_style and resolve_caption_style is not None:
+        resolved_cap_style = resolve_caption_style(caption_style)
+    elif caption_style:
+        resolved_cap_style = str(caption_style).strip() or default_cap
     else:
-        min_scene_words = max(11, int(round(avg_words_per_scene)) - 2)
-        max_scene_words = min(24, int(round(avg_words_per_scene)) + 2)
-    voice_id = "en-US-AndrewMultilingualNeural" if is_en else "pt-BR-AntonioNeural"
-    resolved_cap_style = (
-        resolve_caption_style(caption_style)
-        if (caption_style and resolve_caption_style is not None)
-        else (str(caption_style or "cinema_minimal").strip() or "cinema_minimal")
-    )
+        resolved_cap_style = default_cap
+
+    # =========================================================================
+    # PATH 0: 5-ACT 25-SCENE HISTORICAL CHRISTMAS MASTERPIECE (16:9 OR >= 12m)
+    # =========================================================================
+    if _is_christmas_dark_history_topic(topic) and (ar == "16:9" or t_min >= 12.0):
+        return _build_christmas_5act_masterpiece_plan(
+            aspect_ratio=ar,
+            target_minutes=t_min if t_min >= 12.0 else 17.0,
+            clean_lang=clean_lang,
+            caption_style=resolved_cap_style,
+        )
+
+    # Budget spoken narration cleanly for both short docs and 15-18 min (25-scene) YouTube documentaries
+    if t_min >= 12.0:
+        n_scenes = 25
+        min_scene_words = 88
+        max_scene_words = 98
+    else:
+        pace_wps = 2.05
+        rough_scenes = max(4, min(60, int(round(max(20.0, target_seconds - 4.5) / 11.5))))
+        est_chapters = _estimate_chapter_count(rough_scenes)
+        overhead_s = est_chapters * 1.65 + rough_scenes * 0.42 + 1.25
+        spoken_budget_s = max(14.0, target_seconds - overhead_s)
+        total_target_words = max(48, int(round(spoken_budget_s * pace_wps)))
+        words_per_sc_divisor = 25.0 if target_seconds >= 120.0 else 21.0
+        n_scenes = max(4, min(60, int(round(total_target_words / words_per_sc_divisor))))
+        est_chapters = _estimate_chapter_count(n_scenes)
+        overhead_s = est_chapters * 1.65 + n_scenes * 0.42 + 1.25
+        spoken_budget_s = max(14.0, target_seconds - overhead_s)
+        total_target_words = max(48, int(round(spoken_budget_s * pace_wps)))
+        avg_words_per_scene = total_target_words / float(n_scenes)
+        if avg_words_per_scene >= 19.0:
+            min_scene_words = max(14, int(math.floor(avg_words_per_scene)) - 4)
+            max_scene_words = min(28, int(math.floor(avg_words_per_scene)) + 1)
+        else:
+            min_scene_words = max(11, int(round(avg_words_per_scene)) - 2)
+            max_scene_words = min(24, int(round(avg_words_per_scene)) + 2)
+    voice_id = "en-US-AndrewMultilingualNeural" if is_en else "Charon"
 
     matched_curated = _match_curated_dossier(topic)
     tokens_used = 0
@@ -2226,6 +3290,8 @@ def generate_netflix_doc_plan(
             tp_cur = timeline_pts[idx % len(timeline_pts)]
             sc_orig = _safe_field(rs.get("map_origin"), global_origin)
             sc_dest = _safe_field(rs.get("map_destination"), global_dest)
+            if vmode == "dark_map_route" and sc_orig.strip().lower() == sc_dest.strip().lower():
+                vmode = "2d_schematic_over_realism"
             sc_metric = _safe_field(rs.get("map_metric"), global_metric)
             lt_title = _normalize_upper(_safe_field(rs.get("lower_third_title"), f"{sc_orig} • {sc_dest} • {tp_cur.date}"))
             lt_sub = _normalize_upper(_safe_field(rs.get("lower_third_subtitle"), f"{subtitle} • {tp_cur.value}"))
@@ -2236,6 +3302,7 @@ def generate_netflix_doc_plan(
                 lang=clean_lang,
             )
 
+            act_id, sc_cadence, sc_pi = _assign_act_metadata_for_index(idx, n_scenes)
             chap_card = None
             chap_sub = None
             if idx == 0:
@@ -2294,6 +3361,8 @@ def generate_netflix_doc_plan(
             )
             if ar == "9:16":
                 bespoke_p = _enforce_vertical_prompt_framing(bespoke_p)
+            if mood in ("dark_horror", "epic_history"):
+                bespoke_p = _enforce_historical_era_prompt_lock(bespoke_p, lt_title, lt_sub)
             raw_shots = rs.get("shot_prompts_en")
             shot_prompts: List[str] = []
             if isinstance(raw_shots, list):
@@ -2301,6 +3370,8 @@ def generate_netflix_doc_plan(
                     sp_c = _sanitize_dark_history_prompt(_safe_field(sp, ""), mood=mood)
                     if ar == "9:16":
                         sp_c = _enforce_vertical_prompt_framing(sp_c)
+                    if mood in ("dark_horror", "epic_history") and sp_c:
+                        sp_c = _enforce_historical_era_prompt_lock(sp_c, lt_title, lt_sub)
                     if sp_c and sp_c.lower() not in {x.lower() for x in shot_prompts}:
                         shot_prompts.append(sp_c)
             if bespoke_p and bespoke_p.lower() not in {x.lower() for x in shot_prompts}:
@@ -2329,6 +3400,8 @@ def generate_netflix_doc_plan(
                 if not eq_clean:
                     continue
                 cand_sp = f"{angle_cues[eq_i % len(angle_cues)]} {eq_clean} ({lt_title}), 35mm film grain, no text"
+                if mood in ("dark_horror", "epic_history"):
+                    cand_sp = _enforce_historical_era_prompt_lock(cand_sp, lt_title, lt_sub)
                 if cand_sp.lower() not in {x.lower() for x in shot_prompts}:
                     shot_prompts.append(cand_sp)
             pref_gem = bool(rs.get("prefer_gemini_photo", mood == "dark_horror" and idx in (0, 3)))
@@ -2336,15 +3409,19 @@ def generate_netflix_doc_plan(
             scenes.append(
                 NetflixDocScene(
                     scene_id=f"doc_sc_{idx + 1:02d}",
+                    act_id=act_id,
                     act_label=act_lbl,
                     chapter_card=chap_card,
                     chapter_subtitle=chap_sub,
                     visual_mode=vmode,
+                    visual_category=_resolve_visual_category(vmode, is_broll_shot=False),
+                    cut_cadence_s=sc_cadence,
+                    pattern_interrupt=sc_pi,
                     mood=mood,
                     narration=sc_narr,
                     lower_third_title=lt_title,
                     lower_third_subtitle=lt_sub,
-                    highlight_color="#FFD166" if idx % 2 == 0 else "#FF2E93",
+                    highlight_color="#EAB308" if idx % 2 == 0 else "#D9381E",
                     evidence_headline=sc_head,
                     evidence_quote=sc_quote,
                     map_origin=sc_orig,
@@ -2391,6 +3468,7 @@ def generate_netflix_doc_plan(
             topic_source=topic_source,
             tokens_used=tokens_used,
             cost_usd=cost_usd,
+            pattern_interrupt_times=[240.0, 480.0, 720.0] if t_min >= 12.0 else [],
             scenes=scenes,
             hashtags=hashtags,
         )
@@ -2423,6 +3501,9 @@ def generate_netflix_doc_plan(
 
     for idx, line_txt in enumerate(base_narr[:n_scenes]):
         vmode = _select_visual_mode_for_scene(idx, n_scenes)
+        if vmode == "dark_map_route" and str(off["map_origin"]).strip().lower() == str(off["map_destination"]).strip().lower():
+            vmode = "2d_schematic_over_realism"
+        act_id, sc_cadence, sc_pi = _assign_act_metadata_for_index(idx, n_scenes)
         chap_card = None
         chap_sub = None
         if idx == 0:
@@ -2439,18 +3520,31 @@ def generate_netflix_doc_plan(
 
         tp_cur = off["timeline_points"][idx % len(off["timeline_points"])]
         photo_q = photo_pool[idx % len(photo_pool)]
+        lt_t_off = _normalize_upper(_clean_doc_text(f"{off['map_origin']} • {off['map_destination']} • {tp_cur['date']}"))
+        lt_s_off = _normalize_upper(_clean_doc_text(f"{off['subtitle']} • {tp_cur['value']}"))
+        bp_off = (
+            f"Vertical full-bleed 9:16 dark atmospheric 35mm documentary still of {photo_q}, chiaroscuro lighting, no text"
+            if ar == "9:16"
+            else f"dark atmospheric 35mm documentary still of {photo_q}, chiaroscuro lighting, no text"
+        )
+        if mood in ("dark_horror", "epic_history"):
+            bp_off = _enforce_historical_era_prompt_lock(bp_off, lt_t_off, lt_s_off)
         scenes.append(
             NetflixDocScene(
                 scene_id=f"doc_sc_{idx + 1:02d}",
+                act_id=act_id,
                 act_label=act_lbl,
                 chapter_card=chap_card,
                 chapter_subtitle=chap_sub,
                 visual_mode=vmode,
+                visual_category=_resolve_visual_category(vmode, is_broll_shot=False),
+                cut_cadence_s=sc_cadence,
+                pattern_interrupt=sc_pi,
                 mood=mood,
                 narration=_clean_doc_text(line_txt),
-                lower_third_title=_normalize_upper(_clean_doc_text(f"{off['map_origin']} • {off['map_destination']} • {tp_cur['date']}")),
-                lower_third_subtitle=_normalize_upper(_clean_doc_text(f"{off['subtitle']} • {tp_cur['value']}")),
-                highlight_color="#FFD166" if idx % 2 == 0 else "#FF2E93",
+                lower_third_title=lt_t_off,
+                lower_third_subtitle=lt_s_off,
+                highlight_color="#EAB308" if idx % 2 == 0 else "#D9381E",
                 evidence_headline=_clean_doc_text(off["evidence_headline"]),
                 evidence_quote=_clean_doc_text(off["evidence_quote"]),
                 map_origin=_clean_doc_text(off["map_origin"]),
@@ -2458,17 +3552,14 @@ def generate_netflix_doc_plan(
                 map_metric=_clean_doc_text(off["map_metric"]),
                 timeline_points=[TimelinePoint(**pt) for pt in off["timeline_points"]],
                 board_nodes=[BoardNode(**nd) for nd in off["board_nodes"]],
-                image_prompt_en=photo_q,
-                bespoke_image_prompt_en=(
-                    f"Vertical full-bleed 9:16 dark atmospheric 35mm documentary still of {photo_q}, chiaroscuro lighting, no text"
-                    if ar == "9:16"
-                    else f"dark atmospheric 35mm documentary still of {photo_q}, chiaroscuro lighting, no text"
-                ),
+                image_prompt_en=bp_off,
+                bespoke_image_prompt_en=bp_off,
                 prefer_gemini_photo=(mood == "dark_horror"),
                 broll_query_en=broll_pool[idx % len(broll_pool)],
                 pip_broll_query_en=pip_pool[idx % len(pip_pool)],
                 photo_query_en=photo_q,
                 extra_photo_queries_en=[photo_pool[(idx + k) % len(photo_pool)] for k in range(4)],
+                shot_prompts_en=[bp_off],
                 transition_type=_select_transition_for_scene(idx, vmode, chap_card is not None),
             )
         )
@@ -2489,10 +3580,15 @@ def generate_netflix_doc_plan(
         topic_source=topic_source,
         tokens_used=0,
         cost_usd=0.0,
+        pattern_interrupt_times=[240.0, 480.0, 720.0] if t_min >= 12.0 else [],
         scenes=scenes,
         hashtags=["#documentario", "#historia", "#misterio", "#cinema"],
     )
     return audit_netflix_doc_plan(plan_obj.model_dump(), lang=clean_lang)
+
+
+# Canonical alias referenced by v3.0.0 documentary pipeline spec
+_plan_netflix_doc_script = generate_netflix_doc_plan
 
 
 # ---------------------------------------------------------------------------
@@ -2581,6 +3677,37 @@ _DOC_ACTING_DIRECTIONS: Dict[str, Dict[str, str]] = {
 }
 
 
+_ACT_ACTING_FALLBACKS_PT: Dict[str, str] = {
+    "ACT_0_COLD_OPEN_HOOK": "Gancho investigativo urgente e magnético (estilo Super Histórico / H2 History): pausas afiadas antes das revelações e entonação interrogativa ascendente-descendente genuína de provocação em qualquer pergunta '?'.",
+    "ACT_1_WORLD_BUILDING": "Cronista histórico atmosférico de cinema (Super Histórico / H2 History): voz grave, ressonância profunda e autoridade narrativa serena (~138 WPM).",
+    "ACT_2_DEEP_MECHANICS": "Ritmo investigativo tenso e forense: destaque claro em datas, decretos proibidos e conexões ocultas entre séculos (~142 WPM).",
+    "ACT_3_CLIMAX_REVELATION": "Clímax dramático e revelação de alto impacto: momentum narrativo crescente e peso teatral nas viradas históricas (~146 WPM).",
+    "ACT_4_ABRUPT_ENDING": "Reflexão filosófica final mais lenta (~110 WPM), profunda e assombrosa: sustente pausa dramática antes da pergunta final e termine '?' com verdadeira curva interrogativa de dúvida, nunca como afirmação plana.",
+}
+
+
+def _resolve_scene_acting_direction(act_id: str, mood: str, lang: str, text: str) -> str:
+    """Resolve tailored 5-Act acting direction (delegating to `engine.gemini_tts.build_act_acting_direction` when present)."""
+    if build_act_acting_direction is not None:
+        try:
+            got = build_act_acting_direction(act_id=act_id, mood=mood, lang=lang, text=text)
+            if got and str(got).strip():
+                return str(got).strip()
+        except Exception:
+            pass
+    is_en = str(lang).lower().startswith("en")
+    mood_dir = _DOC_ACTING_DIRECTIONS.get(str(mood or "dark_horror"), _DOC_ACTING_DIRECTIONS["dark_horror"])
+    base = mood_dir["en" if is_en else "pt"]
+    act_hint = _ACT_ACTING_FALLBACKS_PT.get(str(act_id or ""), "")
+    if "?" in str(text or ""):
+        q_rule = (
+            " CRITICAL QUESTION PROSODY: Any sentence ending with '?' MUST use genuine rising-falling "
+            "interrogative pitch contour of suspense and doubt — NEVER flatten '?' into a statement period."
+        )
+        return f"{base} {act_hint}{q_rule}".strip()
+    return f"{base} {act_hint}".strip()
+
+
 async def _synthesize_doc_scene_narration(
     text: str,
     voice_id: str,
@@ -2594,6 +3721,7 @@ async def _synthesize_doc_scene_narration(
     reuse_existing_wav_if_no_words: bool = False,
     voice_engine: str = "auto",
     mood: str = "dark_horror",
+    act_id: str = "ACT_1_WORLD_BUILDING",
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
     """Synthesize natural human-acting cinema documentary narration (Gemini Expressive TTS primary,
     natural pause-preserving edge-tts fallback, checkpoint/resume aware).
@@ -2633,9 +3761,8 @@ async def _synthesize_doc_scene_narration(
             "corporate_thriller": "Fenrir",
         }.get(str(mood or "dark_horror"), "Charon")
         gem_voice = voice_id if voice_id in _GEMINI_VOICE_NAMES else default_gem_voice
-        mood_dir = _DOC_ACTING_DIRECTIONS.get(str(mood or "dark_horror"), _DOC_ACTING_DIRECTIONS["dark_horror"])
-        acting_dir = mood_dir["en" if is_en else "pt"]
-        max_sane_dur = max(7.0, len(spoken_text.split()) * 0.62)
+        acting_dir = _resolve_scene_acting_direction(act_id=act_id, mood=str(mood or "dark_horror"), lang=lang, text=spoken_text)
+        max_sane_dur = max(7.0, len(spoken_text.split()) * 0.68)
         for gem_try in range(2):
             try:
                 await asyncio.to_thread(
@@ -2649,16 +3776,16 @@ async def _synthesize_doc_scene_narration(
                     thermal_limit_c,
                 )
                 raw_dur = _probe_wav_duration_s(raw_wav)
-                # Trim dead leading/trailing room-tone hiss AND cap any glitched >0.42s silence gaps
+                # Trim dead leading/trailing room-tone hiss AND cap >0.35s internal gaps cleanly
                 out_wav, _, out_dur = await asyncio.to_thread(
                     trim_silence_vad,
                     raw_wav,
                     vad_wav,
                     [],
-                    0.42,
+                    0.35,
                     0.10,
                     thermal_limit_c,
-                    True,
+                    False,
                 )
                 had_hiss_tail_glitch = (raw_dur > out_dur * 1.85) and ((raw_dur - out_dur) > 8.0)
                 min_sane_dur = max(1.6, len(spoken_text.split()) * 0.24)
@@ -2885,6 +4012,143 @@ def _draw_obsidian_cinema_backdrop(canvas: skia.Canvas, w: int, h: int, t: float
         canvas.drawLine(0, y, w, y, grid_p)
 
 
+_MASTER_COLOR_GRADE_FILTER: Optional[skia.ColorFilter] = None
+_CACHED_UNIFIER_PLATES: Dict[Tuple[int, int], List[skia.Image]] = {}
+_FAST_SAMPLING = skia.SamplingOptions()
+
+
+def _get_master_color_grade_filter() -> skia.ColorFilter:
+    """Build & cache the v3.0.0 Visual Cohesion Unifier Stack C++ Skia ColorMatrix:
+    contrast +12%, saturation -22%, shadows_tint #0D1B2A, highlights_tint #E0C097.
+    Runs in C++ Skia uniformly on raw video & photo layers BEFORE UI overlays!
+    """
+    global _MASTER_COLOR_GRADE_FILTER
+    if _MASTER_COLOR_GRADE_FILTER is None:
+        c = 1.12       # +12% contrast
+        s = 0.78       # -22% saturation
+        rw, gw, bw = 0.2126, 0.7152, 0.0722
+        inv_s = 1.0 - s
+        hi_r, hi_g, hi_b = 1.045, 0.992, 0.915
+        sh_r, sh_g, sh_b = 0.006, 0.013, 0.022
+        off_c = 0.5 * (1.0 - c)
+        mat = [
+            c * hi_r * (rw * inv_s + s), c * hi_r * (gw * inv_s),     c * hi_r * (bw * inv_s),     0.0, off_c * hi_r + sh_r,
+            c * hi_g * (rw * inv_s),     c * hi_g * (gw * inv_s + s), c * hi_g * (bw * inv_s),     0.0, off_c * hi_g + sh_g,
+            c * hi_b * (rw * inv_s),     c * hi_b * (gw * inv_s),     c * hi_b * (bw * inv_s + s), 0.0, off_c * hi_b + sh_b,
+            0.0,                         0.0,                         0.0,                         1.0, 0.0,
+        ]
+        _MASTER_COLOR_GRADE_FILTER = skia.ColorFilters.Matrix(mat)
+    return _MASTER_COLOR_GRADE_FILTER
+
+
+def _get_master_color_grade_paint() -> skia.Paint:
+    p = skia.Paint(AntiAlias=True)
+    p.setColorFilter(_get_master_color_grade_filter())
+    return p
+
+
+def _pregrade_skia_image(img: Optional[skia.Image]) -> Optional[skia.Image]:
+    """Apply the v3.0.0 master_color_grade (+12% contrast, -22% sat, #0D1B2A/#E0C097) ONCE at image load time
+    so per-frame 30fps drawing uses raw SIMD blits (`paint=None`, 0.0 ms color filter overhead!).
+    """
+    if img is None:
+        return None
+    try:
+        iw, ih = img.width(), img.height()
+        if iw <= 0 or ih <= 0:
+            return img
+        info = skia.ImageInfo.Make(iw, ih, skia.ColorType.kBGRA_8888_ColorType, skia.AlphaType.kPremul_AlphaType)
+        surf = skia.Surface(info)
+        if surf is None:
+            surf = skia.Surface(iw, ih)
+        c = surf.getCanvas()
+        c.clear(skia.ColorSetARGB(0, 0, 0, 0))
+        c.drawImage(img, 0, 0, _LINEAR_SAMPLING, _get_master_color_grade_paint())
+        return surf.makeImageSnapshot()
+    except Exception:
+        return img
+
+
+def _get_combined_unifier_plate(
+    frame_idx: int,
+    vignette_intensity: float = 0.35,
+    grain_opacity: float = 0.14,
+) -> skia.Image:
+    """Pre-bake 4 combined (vignette + 35mm film grain) plates at 480x270 once so the per-frame
+    render loop applies BOTH vignette (0.35) and 35mm grain (0.14) in ONE single fast blit (~4 ms/frame)!
+    """
+    v_key = int(round(vignette_intensity * 100.0))
+    g_key = int(round(grain_opacity * 100.0))
+    cache_key = (v_key, g_key)
+    plates = _CACHED_UNIFIER_PLATES.get(cache_key)
+    if not plates:
+        uw, uh = 480, 270
+        yy, xx = np.mgrid[0:uh, 0:uw].astype(np.float32)
+        dx = (xx - uw * 0.5) / (uw * 0.5)
+        dy = (yy - uh * 0.48) / (uh * 0.5)
+        r2 = np.clip((dx * dx + dy * dy) * 0.72, 0.0, 1.0)
+        vig_a = (r2 ** 1.35) * float(vignette_intensity) * 185.0
+        base_g_a = float(grain_opacity) * 95.0
+        tot_a = np.clip(vig_a + base_g_a, 0.0, 225.0).astype(np.uint8)
+
+        plates = []
+        for seed in (20261122, 20261123, 20261124, 20261125):
+            rng = np.random.default_rng(seed)
+            grain = rng.normal(32.0, 26.0, size=(uh, uw)).clip(0.0, 96.0)
+            # Blend dark slate-navy vignette (#0D1B2A) with monochrome 35mm grain in premultiplied BGRA
+            g_weight = (base_g_a / np.maximum(1.0, tot_a.astype(np.float32)))
+            b_val = (22.0 * (1.0 - g_weight) + grain * g_weight) * (tot_a.astype(np.float32) / 255.0)
+            g_val = (15.0 * (1.0 - g_weight) + grain * g_weight) * (tot_a.astype(np.float32) / 255.0)
+            r_val = (10.0 * (1.0 - g_weight) + grain * g_weight) * (tot_a.astype(np.float32) / 255.0)
+            bgra = np.empty((uh, uw, 4), dtype=np.uint8)
+            bgra[:, :, 0] = np.clip(b_val, 0, 255).astype(np.uint8)
+            bgra[:, :, 1] = np.clip(g_val, 0, 255).astype(np.uint8)
+            bgra[:, :, 2] = np.clip(r_val, 0, 255).astype(np.uint8)
+            bgra[:, :, 3] = tot_a
+            plates.append(
+                skia.Image.fromarray(
+                    np.ascontiguousarray(bgra),
+                    colorType=skia.ColorType.kBGRA_8888_ColorType,
+                    alphaType=skia.AlphaType.kPremul_AlphaType,
+                )
+            )
+        _CACHED_UNIFIER_PLATES[cache_key] = plates
+    return plates[frame_idx % len(plates)]
+
+
+def _draw_visual_cohesion_unifier_overlay(
+    canvas: skia.Canvas,
+    w: int,
+    h: int,
+    frame_idx: int,
+    t: float,
+    vignette_intensity: float = 0.35,
+    grain_opacity: float = 0.14,
+    dust_opacity: float = 0.16,
+) -> None:
+    """Apply the v3.0.0 Visual Cohesion Unifier Stack in ONE fast combined SIMD blit (~3.5 ms/frame):
+    vignette (0.35) + 35mm film grain (0.14) + subtle atmospheric dust motes (0.16).
+    """
+    if vignette_intensity > 0.01 or grain_opacity > 0.01:
+        plate = _get_combined_unifier_plate(frame_idx, vignette_intensity=vignette_intensity, grain_opacity=grain_opacity)
+        canvas.drawImageRect(
+            plate,
+            skia.Rect.MakeWH(plate.width(), plate.height()),
+            skia.Rect.MakeWH(w, h),
+            _FAST_SAMPLING,
+            None,
+            skia.Canvas.SrcRectConstraint.kFast_SrcRectConstraint,
+        )
+
+    if dust_opacity > 0.01:
+        mote_alpha = int(max(12, min(140, round(dust_opacity * 255.0))))
+        mote_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(mote_alpha, 224, 192, 151))
+        for mi in range(10):
+            mx_m = (mi * 197 + t * (19.0 + (mi % 4) * 6.5)) % w
+            my_m = (mi * 131 - t * (11.0 + (mi % 3) * 4.5)) % h
+            canvas.drawCircle(mx_m, my_m, 1.5 + (mi % 3) * 0.85, mote_p)
+
+
 def _draw_video_backdrop_layer(
     canvas: skia.Canvas,
     w: int,
@@ -2896,8 +4160,10 @@ def _draw_video_backdrop_layer(
     ken_burns_zoom: float = 0.055,
     show_grid: bool = False,
     show_dust: bool = True,
+    apply_master_grade: bool = True,
 ) -> None:
-    """Draw REAL MOVING HD B-ROLL VIDEO across the full canvas with subtle Ken Burns motion & cinema scrim."""
+    """Draw REAL MOVING HD B-ROLL VIDEO across the full canvas with unified v3.0.0 master_color_grade,
+    subtle Ken Burns motion & fast flat scrim (vignette handled by `_draw_visual_cohesion_unifier_overlay`)."""
     if video_frame is not None:
         zoom = 1.0 + ken_burns_zoom * prog
         pan_x = (prog - 0.5) * -22.0
@@ -2906,22 +4172,22 @@ def _draw_video_backdrop_layer(
         canvas.translate(w * 0.5 + pan_x, h * 0.5)
         canvas.scale(zoom, zoom)
         dst = skia.Rect.MakeXYWH(-w * 0.5, -h * 0.5, w, h)
-        canvas.drawImageRect(video_frame, dst, _LINEAR_SAMPLING)
+        grade_paint = _get_master_color_grade_paint() if apply_master_grade else None
+        canvas.drawImageRect(
+            video_frame,
+            skia.Rect.MakeWH(video_frame.width(), video_frame.height()),
+            dst,
+            _FAST_SAMPLING,
+            grade_paint,
+            skia.Canvas.SrcRectConstraint.kFast_SrcRectConstraint,
+        )
         canvas.restore()
 
-        # Sleek Dark Wealth radial cinema scrim — keeps moving footage clearly visible underneath!
         if scrim_alpha > 0:
-            center_a = max(0, min(230, scrim_alpha - 26))
-            edge_a = max(0, min(235, scrim_alpha + 24))
-            scrim = skia.Paint()
-            scrim.setShader(
-                skia.GradientShader.MakeRadial(
-                    (w * 0.5, h * 0.45),
-                    max(w, h) * 0.72,
-                    [skia.ColorSetARGB(center_a, 14, 10, 28), skia.ColorSetARGB(edge_a, 8, 5, 16)],
-                )
+            canvas.drawRect(
+                skia.Rect.MakeWH(w, h),
+                skia.Paint(Color=skia.ColorSetARGB(max(0, min(235, scrim_alpha)), 11, 15, 23)),
             )
-            canvas.drawRect(skia.Rect.MakeWH(w, h), scrim)
     else:
         _draw_obsidian_cinema_backdrop(canvas, w, h, t)
 
@@ -2930,7 +4196,7 @@ def _draw_video_backdrop_layer(
             AntiAlias=True,
             Style=skia.Paint.kStroke_Style,
             StrokeWidth=1.0,
-            Color=skia.ColorSetARGB(16, 179, 136, 255),
+            Color=skia.ColorSetARGB(16, 224, 192, 151),
         )
         step = 96
         ox = int((t * 14.0) % step)
@@ -2940,8 +4206,8 @@ def _draw_video_backdrop_layer(
             canvas.drawLine(0, y, w, y, grid_p)
 
     if show_dust:
-        dust_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(42, 255, 209, 102))
-        for i in range(14):
+        dust_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(40, 224, 192, 151))
+        for i in range(10):
             dx = (i * 193 + t * (16 + (i % 5) * 5)) % w
             dy = (i * 137 - t * (10 + (i % 4) * 4)) % h
             rad = 1.6 + (i % 3) * 0.9
@@ -3672,35 +4938,42 @@ def _draw_fullbleed_parallax_shot(
     title_tf: Optional[skia.Typeface] = None,
     shot_local_t: float = 0.0,
     stamp_text: Optional[str] = None,
+    allow_depth_title: bool = True,
 ) -> None:
-    """Render an unobstructed full-bleed edge-to-edge 2.5D parallax cinema shot with 3D Depth Title BEHIND the 2.5D subject
-    (right AFTER drawing `bg_img` and BEFORE drawing `fg_img`) + anamorphic film burn & bokeh!
+    """Render an unobstructed full-bleed edge-to-edge 2.5D parallax cinema shot (Schema v3.0.0):
+      - Counter-directional depth motion: Background `1.06 -> 1.00`, Foreground `1.00 -> 1.14`
+      - Unified `master_color_grade` C++ Skia ColorMatrix applied pre-UI
+      - 3D Depth Title rendered strictly on Shot 0 (`allow_depth_title=True`) BETWEEN `bg_img` and `fg_img`,
+        passing `fg_img` for alpha-aware rule-of-thirds placement (>=88% unoccluded legibility)!
     """
     global _CACHED_FALLBACK_TITLE_TF
     full_r = skia.Rect.MakeXYWH(0, 0, w, h)
-    canvas.clear(skia.ColorSetARGB(255, 9, 7, 16))
+    canvas.clear(skia.ColorSetARGB(255, 11, 14, 21))
     eff_mood = str(getattr(scene, "mood", "dark_horror") or "dark_horror") if scene is not None else "dark_horror"
+    p_clamped = max(0.0, min(1.0, float(shot_prog)))
+    grade_paint = _get_master_color_grade_paint()
 
     if bg_img is not None:
-        bg_zoom = 1.03 + 0.045 * shot_prog
-        bg_pan_x = (shot_prog - 0.5) * (-6.0 * pan_dir)
-        bg_pan_y = (shot_prog - 0.5) * -3.0
+        # Counter-directional 2.5D parallax: Background pulls gently 1.06 -> 1.00 while Foreground pushes 1.00 -> 1.14
+        bg_zoom = (1.06 - 0.06 * p_clamped) if fg_img is not None else (1.00 + 0.07 * p_clamped)
+        bg_pan_x = (p_clamped - 0.5) * (-8.0 * pan_dir)
+        bg_pan_y = (p_clamped - 0.5) * -3.0
         canvas.save()
-        canvas.translate(w * 0.5 + bg_pan_x, h * 0.42 + bg_pan_y)
+        canvas.translate(w * 0.5 + bg_pan_x, h * 0.44 + bg_pan_y)
         canvas.scale(bg_zoom, bg_zoom)
-        canvas.translate(-w * 0.5, -h * 0.42)
-        _draw_image_cover(canvas, bg_img, full_r)
+        canvas.translate(-w * 0.5, -h * 0.44)
+        _draw_image_cover(canvas, bg_img, full_r, paint=None)
         canvas.restore()
 
-        # Atmospheric floating dust / warm candlelight embers
-        mote_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(72, 255, 209, 102))
-        for mi in range(16):
-            mx_m = ((mi * 197 + t * (26 + (mi % 4) * 9)) % w)
-            my_m = ((mi * 131 - t * (18 + (mi % 3) * 7)) % h)
-            canvas.drawCircle(mx_m, my_m, 2.0 + (mi % 3) * 1.2, mote_p)
+        # Atmospheric floating dust / warm candlelight embers sandwiched behind foreground subject
+        mote_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(64, 224, 192, 151))
+        for mi in range(14):
+            mx_m = (mi * 197 + t * (24 + (mi % 4) * 8)) % w
+            my_m = (mi * 131 - t * (16 + (mi % 3) * 6)) % h
+            canvas.drawCircle(mx_m, my_m, 1.8 + (mi % 3) * 1.1, mote_p)
 
-        # Giant 3D Depth Title rendered right AFTER bg_img and BEFORE fg_img so the 2.5D character stands IN FRONT OF the 3D text!
-        if fg_img is not None:
+        # Giant 3D Depth Title strictly on Shot 0 (NEVER repeating on Shot 1/2!) right BETWEEN bg_img and fg_img
+        if fg_img is not None and allow_depth_title:
             resolved_stamp = str(stamp_text or _extract_depth_stamp_text(scene)).strip()
             eff_tf = title_tf
             if eff_tf is None:
@@ -3709,39 +4982,33 @@ def _draw_fullbleed_parallax_shot(
                 eff_tf = _CACHED_FALLBACK_TITLE_TF
             if resolved_stamp and eff_tf is not None:
                 if draw_depth_title_behind_subject is not None:
-                    draw_depth_title_behind_subject(
-                        canvas, w, h, resolved_stamp, shot_prog, t, eff_tf, mood=eff_mood
-                    )
+                    if _DEPTH_TITLE_ACCEPTS_FG_IMG:
+                        draw_depth_title_behind_subject(
+                            canvas, w, h, resolved_stamp, p_clamped, t, eff_tf, mood=eff_mood, fg_img=fg_img
+                        )
+                    else:
+                        draw_depth_title_behind_subject(
+                            canvas, w, h, resolved_stamp, p_clamped, t, eff_tf, mood=eff_mood
+                        )
                 else:
                     _draw_fallback_depth_title_behind_subject(
-                        canvas, w, h, resolved_stamp, shot_prog, t, eff_tf, mood=eff_mood
+                        canvas, w, h, resolved_stamp, p_clamped, t, eff_tf, mood=eff_mood
                     )
 
         if fg_img is not None:
-            fg_zoom = 1.05 + 0.065 * shot_prog
-            fg_pan_x = (shot_prog - 0.5) * (10.0 * pan_dir)
-            fg_pan_y = (shot_prog - 0.5) * -5.0
+            # Counter-directional foreground push-in: 1.00 -> 1.14
+            fg_zoom = 1.00 + 0.14 * p_clamped
+            fg_pan_x = (p_clamped - 0.5) * (14.0 * pan_dir)
+            fg_pan_y = (p_clamped - 0.5) * -5.0
             canvas.save()
-            canvas.translate(w * 0.5 + fg_pan_x, h * 0.42 + fg_pan_y)
+            canvas.translate(w * 0.5 + fg_pan_x, h * 0.44 + fg_pan_y)
             canvas.scale(fg_zoom, fg_zoom)
-            canvas.translate(-w * 0.5, -h * 0.42)
-            fg_paint = skia.Paint(AntiAlias=True)
-            _draw_image_cover(canvas, fg_img, full_r, paint=fg_paint)
+            canvas.translate(-w * 0.5, -h * 0.44)
+            _draw_image_cover(canvas, fg_img, full_r, paint=None)
             canvas.restore()
 
     if draw_anamorphic_film_burn_and_bokeh is not None:
         draw_anamorphic_film_burn_and_bokeh(canvas, w, h, t, shot_local_t, mood=eff_mood)
-
-    # Subtle cinematic edge vignette (keeps center bright and dramatic)
-    vig = skia.Paint()
-    vig.setShader(
-        skia.GradientShader.MakeRadial(
-            (w * 0.5, h * 0.46),
-            max(w, h) * 0.68,
-            [skia.ColorSetARGB(0, 8, 6, 16), skia.ColorSetARGB(158, 8, 6, 16)],
-        )
-    )
-    canvas.drawRect(full_r, vig)
 
 
 def _draw_single_unique_shot_layer(
@@ -3757,6 +5024,7 @@ def _draw_single_unique_shot_layer(
     scene: Optional[NetflixDocScene] = None,
     title_tf: Optional[skia.Typeface] = None,
     shot_local_t: float = 0.0,
+    allow_depth_title: bool = True,
 ) -> None:
     """Render one single unique visual shot (moving B-roll, 2.5D u2netp parallax, or Ken Burns bespoke still)."""
     kind, payload = layer
@@ -3800,6 +5068,7 @@ def _draw_single_unique_shot_layer(
             scene=scene,
             title_tf=title_tf,
             shot_local_t=shot_local_t,
+            allow_depth_title=allow_depth_title,
         )
     elif kind == "photo_still" and payload is not None:
         _draw_fullbleed_parallax_shot(
@@ -3814,6 +5083,7 @@ def _draw_single_unique_shot_layer(
             scene=scene,
             title_tf=title_tf,
             shot_local_t=shot_local_t,
+            allow_depth_title=False,
         )
     else:
         _draw_video_backdrop_layer(
@@ -3844,9 +5114,10 @@ def _draw_unique_shot_slice(
     cut_flash_on_first: bool = False,
     scene: Optional[NetflixDocScene] = None,
     title_tf: Optional[skia.Typeface] = None,
+    allow_scene_depth_title: bool = True,
 ) -> None:
     """Step strictly 1-to-1 across `layers` with ZERO modulo wrap-around (`min(n-1, ...)`),
-    adding a crisp 0.11s film-cut flash right on each internal visual switch!
+    firing 3D Depth Title strictly on Shot 0 (`shot_idx == 0 and allow_scene_depth_title`)!
     """
     if not layers:
         _draw_video_backdrop_layer(
@@ -3874,15 +5145,333 @@ def _draw_unique_shot_slice(
         scene=scene,
         title_tf=title_tf,
         shot_local_t=shot_local_t,
+        allow_depth_title=(allow_scene_depth_title and shot_idx == 0),
     )
 
     if (shot_idx > 0 or cut_flash_on_first) and shot_local_t < 0.11:
         cut_k = 1.0 - (shot_local_t / 0.11)
-        flash_alpha = int(105 * (cut_k ** 1.6))
+        flash_alpha = int(92 * (cut_k ** 1.6))
         canvas.drawRect(
             skia.Rect.MakeXYWH(0, 0, w, h),
-            skia.Paint(Color=skia.ColorSetARGB(flash_alpha, 255, 224, 175)),
+            skia.Paint(Color=skia.ColorSetARGB(flash_alpha, 224, 192, 151)),
         )
+
+
+def _draw_mode_2d_schematic_over_realism(
+    canvas: skia.Canvas,
+    w: int,
+    h: int,
+    scene: NetflixDocScene,
+    prog: float,
+    body_t: float,
+    t: float,
+    title_tf: skia.Typeface,
+    ui_tf: skia.Typeface,
+    backdrop_img: Optional[skia.Image],
+    media: LoadedSceneSkiaMedia,
+    is_en: bool = False,
+) -> None:
+    """Layer 2 (`2D_Infographic_Over_Realism` — Vox / Johnny Harris):
+    Delegates to `engine.pro_motion_graphics.draw_2d_schematic_over_realism` when available,
+    else renders animated 2D tactical reticles, dashed callout vectors, and breakdown bars in
+    `#EAB308`, `#D9381E`, `#F8FAFC` over a 65% brightness desaturated realistic backdrop.
+    """
+    eff_bg = backdrop_img or media.parallax_bg or media.primary_photo
+    if draw_2d_schematic_over_realism is not None:
+        try:
+            draw_2d_schematic_over_realism(
+                canvas, w, h, scene, prog, t, title_tf, ui_tf, eff_bg
+            )
+            return
+        except Exception:
+            pass
+
+    _draw_video_backdrop_layer(
+        canvas, w, h, eff_bg, t, prog, scrim_alpha=126, ken_burns_zoom=0.05, show_grid=True, show_dust=False
+    )
+    is_wide = w >= h
+    ent = _ease_out_cubic(min(1.0, body_t / 0.55))
+
+    # Tactical target reticle over focal point
+    rx = w * (0.34 if is_wide else 0.50)
+    ry = h * (0.44 if is_wide else 0.34)
+    rad = (128.0 if is_wide else 104.0) * (0.88 + 0.12 * ent)
+    gold_p = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=2.6, Color=hex_to_skia("#EAB308", 225))
+    crim_p = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=2.2, Color=hex_to_skia("#D9381E", 230))
+    canvas.drawCircle(rx, ry, rad, gold_p)
+    canvas.drawCircle(rx, ry, rad * 0.58, crim_p)
+    canvas.drawLine(rx - rad * 1.25, ry, rx - rad * 0.72, ry, gold_p)
+    canvas.drawLine(rx + rad * 0.72, ry, rx + rad * 1.25, ry, gold_p)
+    canvas.drawLine(rx, ry - rad * 1.25, rx, ry - rad * 0.72, gold_p)
+    canvas.drawLine(rx, ry + rad * 0.72, rx, ry + rad * 1.25, gold_p)
+
+    # Animated dashed callout connector from reticle to schematic breakdown panel
+    panel_x = w * 0.54 if is_wide else 68.0
+    panel_y = h * 0.18 if is_wide else h * 0.50
+    panel_w = w * 0.40 if is_wide else (w - 136.0)
+    panel_h = h * 0.56 if is_wide else h * 0.31
+    if is_wide:
+        conn_end_x = rx + (panel_x - rx) * _ease_out_cubic(min(1.0, prog / 0.32))
+        dash_p = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=3.0, Color=hex_to_skia("#EAB308", 220))
+        dash_p.setPathEffect(skia.DashPathEffect.Make([12.0, 8.0], -t * 28.0))
+        canvas.drawLine(rx + rad, ry, conn_end_x, panel_y + 92.0, dash_p)
+
+    # Right schematic glass card
+    pr = skia.Rect.MakeXYWH(panel_x, panel_y, panel_w, panel_h)
+    canvas.drawRoundRect(pr, 12.0, 12.0, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(216, 15, 19, 26)))
+    canvas.drawRoundRect(pr, 12.0, 12.0, skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=2.0, Color=hex_to_skia("#EAB308", 195)))
+    canvas.drawRect(skia.Rect.MakeXYWH(panel_x, panel_y + 18.0, 5.0, panel_h - 36.0), skia.Paint(Color=hex_to_skia("#D9381E")))
+
+    tag_txt = "SCHEMATIC ANALYSIS" if is_en else "ANÁLISE ESQUEMÁTICA • ARQUIVO"
+    tf_k, tl_k = _wrap_text_to_width(tag_txt, ui_tf, 18.0, 13.0, panel_w - 56.0, 1)
+    if tl_k:
+        _draw_safe_string(canvas, tl_k[0], panel_x + 28.0, panel_y + 42.0, tf_k, skia.Paint(AntiAlias=True, Color=hex_to_skia("#EAB308")))
+
+    h_f, h_lns = _wrap_text_to_width(scene.evidence_headline.upper(), title_tf, 32.0, 20.0, panel_w - 56.0, 2)
+    hy = panel_y + 88.0
+    for hl in h_lns:
+        _draw_safe_string(canvas, hl, panel_x + 28.0, hy, h_f, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC")))
+        hy += h_f.getSize() * 1.18
+
+    q_f, q_lns = _wrap_text_to_width(scene.evidence_quote, ui_tf, 21.0, 15.0, panel_w - 56.0, 3)
+    qy = hy + 18.0
+    for ql in q_lns:
+        _draw_safe_string(canvas, ql, panel_x + 28.0, qy, q_f, skia.Paint(AntiAlias=True, Color=hex_to_skia("#E0C097")))
+        qy += q_f.getSize() * 1.28
+
+    # Animated 3-step historical breakdown bars
+    pts = (scene.timeline_points or [])[:3]
+    by = max(qy + 22.0, panel_y + panel_h - 178.0)
+    bar_w_max = panel_w - 64.0
+    for b_i, pt in enumerate(pts):
+        row_y = by + b_i * 52.0
+        if row_y + 34.0 > panel_y + panel_h - 14.0:
+            break
+        bf, bl = _wrap_text_to_width(f"{pt.date} — {pt.label}", ui_tf, 16.0, 12.0, bar_w_max, 1)
+        if bl:
+            _draw_safe_string(canvas, bl[0], panel_x + 28.0, row_y, bf, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", 230)))
+        fill_frac = _ease_out_cubic(min(1.0, max(0.0, (prog - b_i * 0.12) / 0.35))) * (0.62 + 0.18 * b_i)
+        canvas.drawRoundRect(skia.Rect.MakeXYWH(panel_x + 28.0, row_y + 10.0, bar_w_max, 10.0), 5.0, 5.0, skia.Paint(Color=skia.ColorSetARGB(90, 248, 250, 252)))
+        canvas.drawRoundRect(
+            skia.Rect.MakeXYWH(panel_x + 28.0, row_y + 10.0, max(12.0, bar_w_max * fill_frac), 10.0),
+            5.0,
+            5.0,
+            skia.Paint(Color=hex_to_skia("#EAB308" if b_i % 2 == 0 else "#D9381E")),
+        )
+
+
+def _draw_mode_video_over_video_collage(
+    canvas: skia.Canvas,
+    w: int,
+    h: int,
+    scene: NetflixDocScene,
+    prog: float,
+    body_t: float,
+    t: float,
+    title_tf: skia.Typeface,
+    ui_tf: skia.Typeface,
+    backdrop_img: Optional[skia.Image],
+    pip_frame: Optional[skia.Image],
+    media: LoadedSceneSkiaMedia,
+    is_en: bool = False,
+) -> None:
+    """Layer 3 (`Video_Over_Video_PiP` — Floating Archival PiP Collage):
+    Delegates to `engine.pro_motion_graphics.draw_video_over_video_collage` when available,
+    else renders dark blurred B-roll/grid (`40%` opacity) with 1-3 floating tilted archival PiP cards
+    (`2px solid rgba(255,255,255,0.18)`, drop shadow, `#FFD700` multiply highlighter wipe).
+    """
+    eff_bg = backdrop_img or media.parallax_bg or media.primary_photo
+    pip_cards: List[skia.Image] = []
+    if pip_frame is not None:
+        pip_cards.append(pip_frame)
+    for ep in (media.extra_photos or []):
+        if len(pip_cards) < 3:
+            pip_cards.append(ep)
+    if not pip_cards and media.primary_photo is not None:
+        pip_cards.append(media.primary_photo)
+
+    if draw_video_over_video_collage is not None:
+        try:
+            draw_video_over_video_collage(
+                canvas, w, h, scene, prog, t, title_tf, ui_tf, eff_bg, pip_cards
+            )
+            return
+        except Exception:
+            pass
+
+    canvas.clear(hex_to_skia("#121417"))
+    _draw_video_backdrop_layer(
+        canvas, w, h, eff_bg, t, prog, scrim_alpha=172, ken_burns_zoom=0.04, show_grid=True, show_dust=False
+    )
+    is_wide = w >= h
+    n_cards = max(1, min(3, len(pip_cards)))
+    if is_wide:
+        if n_cards == 1:
+            slots = [(w * 0.50, h * 0.44, w * 0.62, h * 0.58, -1.2)]
+        elif n_cards == 2:
+            slots = [
+                (w * 0.32, h * 0.43, w * 0.44, h * 0.52, -1.8),
+                (w * 0.68, h * 0.48, w * 0.42, h * 0.50, 1.7),
+            ]
+        else:
+            slots = [
+                (w * 0.24, h * 0.44, w * 0.34, h * 0.44, -2.0),
+                (w * 0.52, h * 0.40, w * 0.36, h * 0.48, 0.8),
+                (w * 0.78, h * 0.49, w * 0.33, h * 0.43, 1.9),
+            ]
+    else:
+        slots = [
+            (w * 0.50, h * (0.28 + idx * 0.21), w * 0.78, h * 0.24, -1.5 if idx % 2 == 0 else 1.5)
+            for idx in range(n_cards)
+        ]
+
+    grade_paint = _get_master_color_grade_paint()
+    for c_i, (cx, cy, cw, ch, rot_deg) in enumerate(slots):
+        ent = _ease_out_back(max(0.0, min(1.0, (body_t - c_i * 0.14) / 0.42)))
+        slide_y = (1.0 - ent) * 48.0
+        canvas.save()
+        canvas.translate(cx, cy + slide_y)
+        canvas.rotate(rot_deg)
+        sc = 0.88 + 0.12 * ent
+        canvas.scale(sc, sc)
+        cr = skia.Rect.MakeXYWH(-cw * 0.5, -ch * 0.5, cw, ch)
+        crr = skia.RRect.MakeRectXY(cr, 12.0, 12.0)
+
+        # Fast stacked soft offset shadows (0.1 ms/frame vs 55 ms/frame CPU Gaussian DropShadow)
+        canvas.drawRoundRect(skia.Rect.MakeXYWH(-cw * 0.5 - 6.0, -ch * 0.5 + 14.0, cw + 12.0, ch + 12.0), 16.0, 16.0, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(115, 0, 0, 0)))
+        canvas.drawRoundRect(skia.Rect.MakeXYWH(-cw * 0.5 - 2.0, -ch * 0.5 + 8.0, cw + 4.0, ch + 4.0), 14.0, 14.0, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(170, 0, 0, 0)))
+        canvas.drawRRect(crr, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(245, 18, 20, 23)))
+
+        canvas.save()
+        canvas.clipRRect(crr, doAntiAlias=True)
+        if c_i < len(pip_cards):
+            _draw_image_cover(canvas, pip_cards[c_i], cr, paint=None, y_bias=0.22)
+        canvas.restore()
+
+        canvas.drawRRect(
+            crr,
+            skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=2.0, Color=skia.ColorSetARGB(46, 255, 255, 255)),
+        )
+        canvas.restore()
+
+    # Synced #FFD700 brush-stroke highlight headline ribbon
+    ribbon_w = min(w * 0.74, 1180.0)
+    ribbon_x = (w - ribbon_w) * 0.5
+    ribbon_y = h * (0.79 if is_wide else 0.76)
+    canvas.drawRoundRect(
+        skia.Rect.MakeXYWH(ribbon_x, ribbon_y, ribbon_w, 62.0),
+        10.0,
+        10.0,
+        skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(220, 16, 19, 25)),
+    )
+    hl_prog = _ease_out_cubic(min(1.0, max(0.0, (prog - 0.12) / 0.36)))
+    hl_p = skia.Paint(AntiAlias=True, Color=hex_to_skia("#FFD700", 185))
+    canvas.drawRoundRect(
+        skia.Rect.MakeXYWH(ribbon_x + 14.0, ribbon_y + 10.0, max(0.0, (ribbon_w - 28.0) * hl_prog), 42.0),
+        6.0,
+        6.0,
+        hl_p,
+    )
+    hf, hlns = _wrap_text_to_width(scene.evidence_headline.upper(), title_tf, 27.0, 17.0, ribbon_w - 44.0, 1)
+    if hlns:
+        _draw_safe_string(
+            canvas,
+            hlns[0],
+            ribbon_x + 24.0,
+            ribbon_y + 40.0,
+            hf,
+            skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(255, 16, 18, 22) if hl_prog > 0.45 else hex_to_skia("#F8FAFC")),
+        )
+
+
+def _draw_mode_fern_3d_reconstruction(
+    canvas: skia.Canvas,
+    w: int,
+    h: int,
+    scene: NetflixDocScene,
+    prog: float,
+    body_t: float,
+    t: float,
+    title_tf: skia.Typeface,
+    ui_tf: skia.Typeface,
+    backdrop_img: Optional[skia.Image],
+    fg_img: Optional[skia.Image],
+    is_en: bool = False,
+) -> None:
+    """Layer 4 (`Dark_3D_Reconstruction` — Fern Minimalist 3D Spatial Wireframe & Backlit Silhouette):
+    Delegates to `engine.pro_motion_graphics.draw_fern_3d_reconstruction` when available,
+    else renders a `#121417` slate void with orbiting perspective 3D architectural grid, volumetric
+    spotlight cone, backlit subject silhouette, and `#D9381E`/`#EAB308`/`#38BDF8` forensic rings.
+    """
+    if draw_fern_3d_reconstruction is not None:
+        try:
+            draw_fern_3d_reconstruction(
+                canvas, w, h, scene, prog, t, title_tf, ui_tf, backdrop_img=backdrop_img, fg_img=fg_img
+            )
+            return
+        except Exception:
+            pass
+
+    canvas.clear(hex_to_skia("#121417"))
+    vp_x = w * 0.5 + math.sin(prog * math.pi * 0.8) * (w * 0.06)
+    vp_y = h * 0.40
+
+    # Perspective 3D wireframe architectural floor & radial depth rays
+    grid_p = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=1.2, Color=skia.ColorSetARGB(55, 248, 250, 252))
+    for i in range(-10, 11):
+        bx = vp_x + i * (w * 0.14)
+        canvas.drawLine(vp_x + i * 24.0, vp_y, bx, float(h), grid_p)
+    for r_i in range(1, 10):
+        k = (r_i / 9.0) ** 1.75
+        ry = vp_y + k * (h - vp_y)
+        canvas.drawLine(0.0, ry, float(w), ry, grid_p)
+
+    # Volumetric spotlight cone from top center
+    cone = skia.Path()
+    cone.moveTo(vp_x - 36.0, 0.0)
+    cone.lineTo(vp_x + 36.0, 0.0)
+    cone.lineTo(vp_x + w * 0.24, float(h))
+    cone.lineTo(vp_x - w * 0.24, float(h))
+    cone.close()
+    cone_p = skia.Paint(AntiAlias=True)
+    cone_p.setShader(
+        skia.GradientShader.MakeLinear(
+            [(vp_x, 0.0), (vp_x, float(h))],
+            [skia.ColorSetARGB(88, 224, 192, 151), skia.ColorSetARGB(6, 56, 189, 248)],
+        )
+    )
+    canvas.drawPath(cone, cone_p)
+
+    # Backlit dark silhouette from fg_img alpha mask (or subtle dimmed architectural backdrop)
+    if fg_img is not None:
+        sil_p = skia.Paint(AntiAlias=True)
+        sil_p.setColorFilter(skia.ColorFilters.Blend(skia.ColorSetARGB(255, 10, 13, 18), skia.BlendMode.kSrcIn))
+        canvas.save()
+        sc = 1.0 + 0.08 * prog
+        canvas.translate(w * 0.5, h * 0.52)
+        canvas.scale(sc, sc)
+        canvas.translate(-w * 0.5, -h * 0.52)
+        _draw_image_cover(canvas, fg_img, skia.Rect.MakeWH(w, h), paint=sil_p)
+        canvas.restore()
+    elif backdrop_img is not None:
+        dim_p = skia.Paint(AntiAlias=True)
+        dim_p.setAlphaf(0.32)
+        dim_p.setColorFilter(_get_master_color_grade_filter())
+        _draw_image_cover(canvas, backdrop_img, skia.Rect.MakeWH(w, h), paint=dim_p)
+
+    # Tactical concentric floor target circles (#D9381E, #EAB308, #38BDF8)
+    for ring_i, (r_rx, r_ry, col_hex) in enumerate(((260.0, 62.0, "#D9381E"), (175.0, 42.0, "#EAB308"), (105.0, 26.0, "#38BDF8"))):
+        pulse = 1.0 + 0.04 * math.sin(t * 4.0 + ring_i)
+        rr = skia.Rect.MakeXYWH(vp_x - r_rx * pulse, h * 0.72 - r_ry * pulse, r_rx * 2.0 * pulse, r_ry * 2.0 * pulse)
+        canvas.drawOval(rr, skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=2.6, Color=hex_to_skia(col_hex, 215)))
+
+    # Forensic digital UI telemetry header
+    hdr_lbl = "3D RECONSTRUCTION • ARCHIVAL MODEL" if is_en else "RECONSTRUÇÃO 3D • MODELO FORENSE"
+    hf0 = skia.Font(ui_tf, 18.0)
+    _draw_safe_string(canvas, hdr_lbl, 96.0, 72.0, hf0, skia.Paint(AntiAlias=True, Color=hex_to_skia("#38BDF8", 225)))
+    tf_m, tl_m = _wrap_text_to_width(scene.map_metric.upper(), title_tf, 40.0, 24.0, w - 192.0, 1)
+    if tl_m:
+        _draw_safe_string(canvas, tl_m[0], 96.0, 122.0, tf_m, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", 238)))
 
 
 def _draw_mode_cinema_multishot(
@@ -3901,15 +5490,15 @@ def _draw_mode_cinema_multishot(
     s_idx: int = 0,
     title_tf: Optional[skia.Typeface] = None,
 ) -> None:
-    """Cinema v6 Primary Visual Mode: clean, unobstructed FULL-SCREEN ZERO-REPETITION multi-shot storytelling!
-    Every ~`cut_cadence_s` (2.2-3.0s) cuts to a BRAND-NEW unique asset in `media.shot_layers` (NEVER wraps around!).
+    """Cinema v7 Primary Visual Mode: clean, unobstructed FULL-SCREEN ZERO-REPETITION multi-shot storytelling!
+    Always opens on hero 2.5D parallax plate (Shot 0) with 3D Depth Title strictly on Shot 0!
     """
     layers = list(media.shot_layers or [])
     if not layers:
-        if primary_frame is not None:
-            layers.append(("video_primary", None))
         if (media.parallax_bg or media.primary_photo) is not None:
             layers.append(("photo_25d", (media.parallax_bg or media.primary_photo, media.parallax_fg)))
+        if primary_frame is not None:
+            layers.append(("video_primary", None))
         for ep in (media.extra_photos or []):
             layers.append(("photo_still", ep))
         if pip_frame is not None:
@@ -3929,6 +5518,7 @@ def _draw_mode_cinema_multishot(
         cut_flash_on_first=False,
         scene=scene,
         title_tf=title_tf,
+        allow_scene_depth_title=True,
     )
 
 
@@ -5037,8 +6627,8 @@ def _draw_chapter_card_overlay(
     if alpha <= 6:
         return
 
-    # Translucent dark veil lets real moving B-roll footage breathe dimly behind the chapter reveal!
-    canvas.drawRect(skia.Rect.MakeWH(w, h), skia.Paint(Color=skia.ColorSetARGB(int(alpha * 0.72), 9, 6, 16)))
+    # Translucent dark veil lets real moving B-roll / archival painting breathe behind the chapter reveal (~150 combined scrim)
+    canvas.drawRect(skia.Rect.MakeWH(w, h), skia.Paint(Color=skia.ColorSetARGB(int(alpha * 0.48), 9, 12, 18)))
 
     # Expanding golden horizontal cinema divider lines
     line_w = (w * 0.46) * _ease_out_cubic(local_t / 0.75)
@@ -5262,6 +6852,9 @@ GRAPHIC_BOOKEND_MODES: Tuple[VisualModeType, ...] = (
     "dark_map_route",
     "sliding_timeline",
     "red_string_board",
+    "2d_schematic_over_realism",
+    "video_over_video_collage",
+    "fern_3d_reconstruction",
 )
 
 
@@ -5276,10 +6869,12 @@ def _compute_bookended_graphic_window(
     """
     if visual_mode not in GRAPHIC_BOOKEND_MODES or body_dur <= 7.2 or n_shot_layers < 2:
         return None
-    g_dur = min(5.4, max(4.4, body_dur * 0.42))
-    pre_dur = max(2.2, min(3.2, (body_dur - g_dur) * 0.48))
+    # Give timelines / string boards / 3D reconstructions comfortable breathing room in 38-42s scenes (~8-12s),
+    # while staying snappy (~4.8-6.4s) in shorter 10-15s scenes.
+    g_dur = min(11.5, max(5.2, body_dur * 0.34))
+    pre_dur = max(2.4, min(7.5, (body_dur - g_dur) * 0.36))
     g_start = pre_dur
-    g_end = min(body_dur - 1.8, g_start + g_dur)
+    g_end = min(body_dur - 2.0, g_start + g_dur)
     pre_count = max(1, min(n_shot_layers - 1, int(round(pre_dur / max(2.0, float(cut_cadence_s or 2.6))))))
     return g_start, g_end, pre_count
 
@@ -5357,6 +6952,8 @@ def _load_scene_skia_photos(
                     is_primary_match = Path(media_path) == primary_resolved
             if used_parallax < parallax_budget:
                 bg_img, fg_img = separate_photo_25d_u2netp(media_path, w, h)
+                bg_img = _pregrade_skia_image(bg_img)
+                fg_img = _pregrade_skia_image(fg_img)
                 if bg_img is not None:
                     loaded.shot_layers.append(("photo_25d", (bg_img, fg_img)))
                     if is_primary_match and loaded.primary_photo_layer_idx is None:
@@ -5368,7 +6965,7 @@ def _load_scene_skia_photos(
                         loaded.u2netp_separated = True
                     used_parallax += 1
                     continue
-            still_img = load_skia_image_cover(media_path, w, h)
+            still_img = _pregrade_skia_image(load_skia_image_cover(media_path, w, h))
             if still_img is not None:
                 loaded.shot_layers.append(("photo_still", still_img))
                 if is_primary_match and loaded.primary_photo_layer_idx is None:
@@ -5412,12 +7009,14 @@ def _load_scene_skia_photos(
     if assets.extra_photo_paths:
         if scene.visual_mode == "cinema_multishot":
             ew, eh = w, h
+        elif scene.visual_mode == "video_over_video_collage":
+            ew, eh = (760, 520) if is_wide else (840, 480)
         elif scene.visual_mode == "red_string_board":
-            ew, eh = (260, 260)
+            ew, eh = (320, 320) if is_wide else (260, 260)
         elif scene.visual_mode == "sliding_timeline":
-            ew, eh = (460, 180) if is_wide else (260, 220)
+            ew, eh = (520, 260) if is_wide else (260, 220)
         else:
-            ew, eh = (480, 300)
+            ew, eh = (560, 360)
         for ep in assets.extra_photo_paths:
             img = load_skia_image_cover(ep, ew, eh)
             if img is not None:
@@ -5429,6 +7028,8 @@ def _load_scene_skia_photos(
 def _compute_pip_dimensions(visual_mode: VisualModeType, is_wide: bool) -> Tuple[int, int]:
     if visual_mode == "cinema_multishot":
         return (1920, 1080) if is_wide else (1080, 1920)
+    if visual_mode == "video_over_video_collage":
+        return (860, 540) if is_wide else (840, 472)
     if visual_mode == "broll_video_pip":
         return (780, 440) if is_wide else (908, 512)
     if visual_mode == "dark_map_route":
@@ -5457,12 +7058,15 @@ def _render_single_doc_scene_to_disk(
     thermal_limit_c: float,
     media_assets: Optional[SceneMediaAssets] = None,
     lang: str = "pt_br",
-    caption_style: str = "cinema_minimal",
+    caption_style: str = "selective_emphasis",
     cut_cadence_s: float = 2.6,
     prev_lower_third_title: Optional[str] = None,
+    abrupt_cut_black_at_local_t: Optional[float] = None,
 ) -> Tuple[Path, bool]:
-    """Render one documentary scene at 30fps in C++ Skia directly to disk with REAL moving B-roll video,
-    Video-over-Video PiP monitor, REAL photographs, kinetic captions, LUT 02_dark_wealth.cube & 35mm film grain.
+    """Render one documentary scene at 30fps in C++ Skia directly to disk with zero-copy BGRA surface
+    (`MakeRasterDirect` + `memoryview`), direct VAAPI hardware encode (65-160+ FPS, zero CPU lut3d/noise bottleneck),
+    0.85x slow-motion atmospheric B-roll, unified `master_color_grade` C++ ColorMatrix, 35mm film grain,
+    and all 5 Mixed-Media documentary visual categories!
     """
     try:
         os.nice(10)
@@ -5477,27 +7081,42 @@ def _render_single_doc_scene_to_disk(
     # Pre-load static Skia photos / u2netp 2.5D layers once before frame loop
     loaded_media = _load_scene_skia_photos(scene, assets, w, h)
 
-    # Open sequential low-RAM VideoLayerReaders for Main HD B-Roll + optional PiP Video-over-Video
+    # Open sequential low-RAM VideoLayerReaders at 0.85x atmospheric slow-motion playback!
     primary_reader: Optional[VideoLayerReader] = None
     pip_reader: Optional[VideoLayerReader] = None
     if assets.primary_broll_mp4 is not None and Path(assets.primary_broll_mp4).exists():
-        primary_reader = VideoLayerReader(assets.primary_broll_mp4, w, h, fps=fps)
+        primary_reader = VideoLayerReader(assets.primary_broll_mp4, w, h, fps=fps, playback_speed=0.85)
     if scene.visual_mode in PIP_ENABLED_MODES and assets.pip_broll_mp4 is not None and Path(assets.pip_broll_mp4).exists():
         pip_w, pip_h = _compute_pip_dimensions(scene.visual_mode, is_wide)
-        pip_reader = VideoLayerReader(assets.pip_broll_mp4, pip_w, pip_h, fps=fps)
+        pip_reader = VideoLayerReader(assets.pip_broll_mp4, pip_w, pip_h, fps=fps, playback_speed=0.85)
 
-    surface = skia.Surface(w, h)
+    # Zero-copy BGRA Skia surface backed directly by a NumPy array (exact kBGRA_8888 matches FFmpeg -pix_fmt bgra!)
+    frame_buf = np.zeros((h, w, 4), dtype=np.uint8)
+    surf_info = skia.ImageInfo.Make(
+        w,
+        h,
+        skia.ColorType.kBGRA_8888_ColorType,
+        skia.AlphaType.kPremul_AlphaType,
+    )
+    surface = skia.Surface.MakeRasterDirect(surf_info, frame_buf)
+    if surface is None:
+        surface = skia.Surface(w, h)
+        frame_mv = None
+    else:
+        frame_mv = memoryview(frame_buf)
+
     chunks = group_words_into_chunks(scene_words, max_words=3)
     total_frames = max(1, int(round(scene_dur * fps)))
     exact_dur = total_frames / float(fps)
     body_dur = max(0.5, exact_dur - chapter_intro_s)
+    eff_cadence = float(getattr(scene, "cut_cadence_s", None) or cut_cadence_s or 2.6)
 
     # Precompute bookended graphic window & non-repeating pre/post layers ONCE before frame loop
     bookend_win = _compute_bookended_graphic_window(
         scene.visual_mode,
         body_dur,
         len(loaded_media.shot_layers),
-        cut_cadence_s=cut_cadence_s,
+        cut_cadence_s=eff_cadence,
     )
     use_bookended_graphic = bookend_win is not None
     g_start = 0.0
@@ -5507,8 +7126,6 @@ def _render_single_doc_scene_to_disk(
     chapter_backdrop_layer: Optional[Tuple[str, Any]] = None
     graphic_backdrop_layer: Optional[Tuple[str, Any]] = None
     if chapter_intro_s > 0.0 and len(loaded_media.shot_layers) >= 2:
-        # Fix #98 Finding #2: Use shot_layers[-1] (or parallax_bg) for the Chapter Card backdrop
-        # so it is 100% distinct from the pre-graphic beat (shot_layers[0]) and graphic backdrop!
         chapter_backdrop_layer = loaded_media.shot_layers[-1]
 
     if bookend_win is not None:
@@ -5520,13 +7137,12 @@ def _render_single_doc_scene_to_disk(
                     card_photo_idx = i_l
                     break
         if scene.visual_mode == "newspaper_highlighter" and card_photo_idx is not None:
-            # Exclude the photo shown inside the newspaper card so it NEVER repeats full-screen right after the card!
             non_card_layers = [
                 lyr for i_l, lyr in enumerate(loaded_media.shot_layers)
                 if i_l != card_photo_idx
             ]
             if len(non_card_layers) >= 2:
-                eff_pre = max(1, min(len(non_card_layers) - 1, int(round(g_start / max(2.0, cut_cadence_s)))))
+                eff_pre = max(1, min(len(non_card_layers) - 1, int(round(g_start / max(2.0, eff_cadence)))))
                 pre_layers = non_card_layers[:eff_pre]
                 post_layers = non_card_layers[eff_pre:] or non_card_layers[-1:]
             elif len(non_card_layers) == 1:
@@ -5539,7 +7155,6 @@ def _render_single_doc_scene_to_disk(
             pre_layers = loaded_media.shot_layers[:pre_count]
             post_layers = loaded_media.shot_layers[pre_count:] or loaded_media.shot_layers[-1:]
 
-        # Guarantee pre_layers[0] is distinct from chapter_backdrop_layer and graphic_backdrop_layer is distinct from both!
         if len(loaded_media.shot_layers) >= 2:
             if chapter_intro_s > 0.0 and not pre_layers:
                 pre_layers = [loaded_media.shot_layers[0]]
@@ -5565,18 +7180,10 @@ def _render_single_doc_scene_to_disk(
         or (s_idx % 4 == 0)
     )
 
+    # Direct VAAPI hardware suffix (zero CPU lut3d+blend and zero CPU noise bottleneck -> 65-160+ FPS!)
+    # Master color grade (+12% contrast, -22% sat, #0D1B2A/#E0C097), 35mm grain & vignette run inside C++ Skia!
     pre_args, enc_args, hw_suffix = build_video_encode_args(qp=19)
-    vf_parts = []
-    if lut_path.exists():
-        # Subtle 32% LUT blend preserves crisp legibility of Gold/Lime/Pink UI overlays while imparting Dark Wealth cinema grade
-        vf_parts.append(
-            f"split[orig][lut_in];[lut_in]lut3d=file='{lut_path.as_posix()}':interp=trilinear[lut_out];"
-            f"[orig][lut_out]blend=all_mode=normal:all_opacity=0.32"
-        )
-    # Subtle 35mm cinema film grain
-    vf_parts.append("noise=alls=4:allf=t+u")
-    vf_parts.append(hw_suffix)
-    vf_chain = ",".join(vf_parts)
+    vf_chain = hw_suffix
 
     cmd = [
         "ffmpeg",
@@ -5603,7 +7210,6 @@ def _render_single_doc_scene_to_disk(
         str(out_scene_mp4),
     ]
 
-    # Redirect FFmpeg stderr to a file instead of PIPE so long 5-15 min renders can NEVER deadlock on a 64KB buffer!
     ffmpeg_err_path = out_scene_mp4.parent / f"ffmpeg_sc{s_idx:03d}.err"
     err_fh = open(ffmpeg_err_path, "wb")
     proc = subprocess.Popen(
@@ -5615,14 +7221,28 @@ def _render_single_doc_scene_to_disk(
     )
     assert proc.stdin is not None
 
-    # Darken level for primary video reader (crisp & vivid on video-first modes; full brightness on scrim modes so scrim alone controls visibility!)
-    primary_darken = 0.18 if scene.visual_mode in ("broll_video_pip", "parallax_25d_photo") else 0.0
+    primary_darken = 0.16 if scene.visual_mode in ("broll_video_pip", "parallax_25d_photo") else 0.0
+
+    # Pre-build slim 3px archival crimson-gold progress bar paint (replaces neon pink/lime bar!)
+    prog_bar_paint = skia.Paint(AntiAlias=True)
+    prog_bar_paint.setShader(
+        skia.GradientShader.MakeLinear(
+            [(0, 0), (w, 0)],
+            [hex_to_skia("#D9381E", 170), hex_to_skia("#EAB308", 170)],
+        )
+    )
 
     try:
         for fi in range(total_frames):
             local_t = fi / float(fps)
             global_t = global_t_offset + local_t
             c = surface.getCanvas()
+
+            # ACT_4_ABRUPT_ENDING: Hard cut to black cleanly after final spoken beat + 0.50s
+            if abrupt_cut_black_at_local_t is not None and local_t >= abrupt_cut_black_at_local_t:
+                c.clear(skia.ColorBLACK)
+                proc.stdin.write(frame_mv if frame_mv is not None else surface.makeImageSnapshot().tobytes())
+                continue
 
             in_chapter_intro = chapter_intro_s > 0.0 and local_t < chapter_intro_s
             body_t = 0.0 if in_chapter_intro else max(0.0, local_t - chapter_intro_s)
@@ -5643,7 +7263,7 @@ def _render_single_doc_scene_to_disk(
                     need_pip_video = (active_lyr is not None and active_lyr[0] == "video_secondary")
                 else:
                     need_primary_video = _layer_needs_primary_video(graphic_backdrop_layer) if graphic_backdrop_layer is not None else True
-                    need_pip_video = (scene.visual_mode == "dark_map_route")
+                    need_pip_video = scene.visual_mode in ("dark_map_route", "video_over_video_collage")
             elif scene.visual_mode in ("cinema_multishot", "parallax_25d_photo"):
                 if loaded_media.shot_layers:
                     active_lyr = _active_slice_layer(loaded_media.shot_layers, body_t, body_dur)
@@ -5665,7 +7285,6 @@ def _render_single_doc_scene_to_disk(
                 if (need_primary_video and primary_reader is not None)
                 else None
             )
-            # If Vision rejected stock B-roll video for this scene, cleanly use our hero Nano Banana 2.1 plate as backdrop!
             fallback_backdrop = primary_frame or loaded_media.parallax_bg or loaded_media.primary_photo
             chapter_backdrop = (
                 _extract_skia_image_from_shot_layer(chapter_backdrop_layer, primary_frame)
@@ -5685,11 +7304,12 @@ def _render_single_doc_scene_to_disk(
                     chapter_backdrop,
                     global_t,
                     local_t / max(0.1, chapter_intro_s),
-                    scrim_alpha=155,
+                    scrim_alpha=84,
                     ken_burns_zoom=0.04,
                     show_grid=False,
-                    show_dust=True,
+                    show_dust=False,
                 )
+                _draw_visual_cohesion_unifier_overlay(c, w, h, fi, global_t, vignette_intensity=0.35, grain_opacity=0.14, dust_opacity=0.16)
                 _draw_chapter_card_overlay(
                     c,
                     w,
@@ -5713,13 +7333,13 @@ def _render_single_doc_scene_to_disk(
                     if body_t < g_start:
                         _draw_unique_shot_slice(
                             c, w, h, pre_layers, body_t, g_start, global_t, primary_frame, pip_frame,
-                            s_idx=s_idx, scene=scene, title_tf=title_tf,
+                            s_idx=s_idx, scene=scene, title_tf=title_tf, allow_scene_depth_title=True,
                         )
                     elif body_t >= g_end:
                         _draw_unique_shot_slice(
                             c, w, h, post_layers, body_t - g_end, max(0.4, body_dur - g_end), global_t,
                             primary_frame, pip_frame, s_idx=s_idx + 1, cut_flash_on_first=True,
-                            scene=scene, title_tf=title_tf,
+                            scene=scene, title_tf=title_tf, allow_scene_depth_title=False,
                         )
                     else:
                         g_t = body_t - g_start
@@ -5730,15 +7350,21 @@ def _render_single_doc_scene_to_disk(
                             _draw_mode_dark_map_route(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, graphic_backdrop, pip_frame or graphic_backdrop, is_en=is_en)
                         elif scene.visual_mode == "sliding_timeline":
                             _draw_mode_sliding_timeline(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
+                        elif scene.visual_mode == "2d_schematic_over_realism":
+                            _draw_mode_2d_schematic_over_realism(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
+                        elif scene.visual_mode == "video_over_video_collage":
+                            _draw_mode_video_over_video_collage(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, graphic_backdrop, pip_frame, loaded_media, is_en=is_en)
+                        elif scene.visual_mode == "fern_3d_reconstruction":
+                            _draw_mode_fern_3d_reconstruction(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media.parallax_fg, is_en=is_en)
                         else:
                             _draw_mode_red_string_board(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
                         if g_t < 0.11:
                             ck = 1.0 - (g_t / 0.11)
-                            c.drawRect(skia.Rect.MakeXYWH(0, 0, w, h), skia.Paint(Color=skia.ColorSetARGB(int(95 * (ck ** 1.6)), 255, 224, 175)))
+                            c.drawRect(skia.Rect.MakeXYWH(0, 0, w, h), skia.Paint(Color=skia.ColorSetARGB(int(88 * (ck ** 1.6)), 224, 192, 151)))
                 elif scene.visual_mode == "cinema_multishot":
                     _draw_mode_cinema_multishot(
                         c, w, h, scene, prog, body_t, body_dur, global_t, primary_frame, pip_frame, loaded_media,
-                        cut_cadence_s=cut_cadence_s, s_idx=s_idx, title_tf=title_tf,
+                        cut_cadence_s=eff_cadence, s_idx=s_idx, title_tf=title_tf,
                     )
                 elif scene.visual_mode == "broll_video_pip":
                     _draw_mode_broll_video_pip(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, pip_frame, loaded_media, is_en=is_en)
@@ -5750,6 +7376,12 @@ def _render_single_doc_scene_to_disk(
                     _draw_mode_dark_map_route(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, graphic_backdrop, pip_frame or graphic_backdrop, is_en=is_en)
                 elif scene.visual_mode == "sliding_timeline":
                     _draw_mode_sliding_timeline(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
+                elif scene.visual_mode == "2d_schematic_over_realism":
+                    _draw_mode_2d_schematic_over_realism(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
+                elif scene.visual_mode == "video_over_video_collage":
+                    _draw_mode_video_over_video_collage(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, graphic_backdrop, pip_frame, loaded_media, is_en=is_en)
+                elif scene.visual_mode == "fern_3d_reconstruction":
+                    _draw_mode_fern_3d_reconstruction(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media.parallax_fg, is_en=is_en)
                 elif scene.visual_mode == "red_string_board":
                     _draw_mode_red_string_board(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
                 else:
@@ -5758,22 +7390,18 @@ def _render_single_doc_scene_to_disk(
                         is_en=is_en, body_dur=body_dur, s_idx=s_idx,
                     )
 
+                # Visual Cohesion Unifier Stack (vignette 0.35 + 35mm film grain 0.14 + dust motes 0.16)
+                _draw_visual_cohesion_unifier_overlay(c, w, h, fi, global_t, vignette_intensity=0.35, grain_opacity=0.14, dust_opacity=0.16)
+
                 if show_lower_third:
                     _draw_sleek_lower_third(c, w, h, scene, body_t, body_dur, title_tf, ui_tf, max_display_s=3.8)
                 _draw_doc_subtitles(c, w, h, chunks, local_t, caption_tf, caption_style=caption_style, mood=scene.mood)
 
-            # Top slim cinema progress bar
-            bar_w = max(8.0, w * min(1.0, global_t / max(0.1, total_est_dur)))
-            bar_p = skia.Paint(AntiAlias=True)
-            bar_p.setShader(
-                skia.GradientShader.MakeLinear(
-                    [(0, 0), (w, 0)],
-                    [hex_to_skia("#FFD166"), hex_to_skia("#FF2E93"), hex_to_skia("#B8FF01")],
-                )
-            )
-            c.drawRoundRect(skia.Rect.MakeXYWH(0, 0, bar_w, 8), 4.0, 4.0, bar_p)
+            # Subtle 3px archival crimson-gold progress thread (#D9381E -> #EAB308, alpha 170)
+            bar_w = max(6.0, w * min(1.0, global_t / max(0.1, total_est_dur)))
+            c.drawRect(skia.Rect.MakeXYWH(0.0, 0.0, bar_w, 3.0), prog_bar_paint)
 
-            proc.stdin.write(surface.makeImageSnapshot().tobytes())
+            proc.stdin.write(frame_mv if frame_mv is not None else surface.makeImageSnapshot().tobytes())
     except BrokenPipeError:
         pass
     finally:
@@ -5994,6 +7622,9 @@ def _prefetch_scene_media_sync(
             p_txt = prompt_candidates[sh_i]
             if is_vertical:
                 p_txt = _enforce_vertical_prompt_framing(p_txt)
+            # Mandatory Historical Era-Lock before Google Flow generation (blocks modern police/cars/hoodies/LEDs!)
+            if sc_mood in ("dark_horror", "epic_history"):
+                p_txt = _enforce_historical_era_prompt_lock(p_txt, sc.lower_third_title, sc.lower_third_subtitle)
             if p_txt.lower() in global_used_prompts:
                 p_txt = f"{p_txt} — alternate angle #{s_idx + 1}-{sh_i + 1}"
             global_used_prompts.add(p_txt.lower())
@@ -6020,7 +7651,7 @@ def _prefetch_scene_media_sync(
     flow_results: Dict[str, Path] = {}
     if batch_items:
         print(
-            f"[NetflixDoc] Generating {len(batch_items)} unique bespoke {aspect_ratio} cinema stills via Google Flow Pro (Nano Banana 2.1)...",
+            f"[NetflixDoc] Generating {len(batch_items)} unique era-locked {aspect_ratio} cinema stills via Google Flow Pro (Nano Banana 2.1)...",
             flush=True,
         )
         flow_results = generate_flow_batch_images_sync(
@@ -6035,25 +7666,66 @@ def _prefetch_scene_media_sync(
 
     # -------------------------------------------------------------------------
     # PHASE C: Assemble strictly UNIQUE, NON-REPEATING `shot_sequence` per scene
-    # (Fall back to Vision-verified Openverse/Wikimedia/Pixabay ONLY if Flow missed a slot!)
+    # + Screen Flow plates for historical anachronisms (replacing rejected plates
+    #   with Priority 1 Wikimedia Commons archival plates!)
     # -------------------------------------------------------------------------
+    anachronism_rejections = 0
+    wikimedia_archival_count = 0
     for s_idx, sc in enumerate(scenes):
         if s_idx in skip_set:
             continue
         item = assets_list[s_idx]
         sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
         scene_photos: List[Path] = []
+        _, is_pre_modern = _extract_historical_era_lock(sc.lower_third_title, sc.lower_third_subtitle, sc.narration)
 
         for spec in scene_slot_specs[s_idx]:
             key = spec["key"]
             ppath: Optional[Path] = spec["cached"] or flow_results.get(key)
             if ppath is not None and Path(ppath).exists():
-                if _register_dhash(Path(ppath)):
+                flow_ok = True
+                if sc_mood in ("dark_horror", "epic_history") and is_pre_modern:
+                    # Gemini Vision anachronism screening on bespoke Flow plates (rejects modern police/vans/hoodies!)
+                    ok_ana, ana_sc, ana_why = verify_historical_anachronism_vision(
+                        Path(ppath),
+                        query=spec["prompt_en"],
+                        lower_third_title=sc.lower_third_title,
+                        lower_third_subtitle=sc.lower_third_subtitle,
+                        mood=sc_mood,
+                        strict_vision=False,
+                    )
+                    if not ok_ana and ana_why != "no_vision_key":
+                        anachronism_rejections += 1
+                        flow_ok = False
+                        print(
+                            f"[NetflixDoc] Vision REJECTED anachronistic Flow plate {Path(ppath).name} "
+                            f"({ana_sc}/10: {ana_why}) -> replacing via Wikimedia Commons!",
+                            flush=True,
+                        )
+                if flow_ok and _register_dhash(Path(ppath)):
                     scene_photos.append(Path(ppath))
                     photos_used.append(str(ppath))
                     continue
 
-            # Clean Vision-verified archival stock fallback (score >= 7/10, dhash-unique, zero duplicates!)
+            # Priority 1 Free Archival Source: Wikimedia Commons API (public domain / CC, >=900px, Vision + dHash!)
+            wiki_path = fetch_wikimedia_commons_archival_photo(
+                query_en=spec["fallback_query"],
+                out_dir=work_dir,
+                prefix=f"wiki_{key}",
+                is_wide=(not is_vertical),
+                topic_context=f"{sc.lower_third_title} {sc.narration}",
+                mood=sc_mood,
+                used_urls=used_photo_urls,
+                used_dhashes=used_dhashes,
+                strict_vision=True,
+            )
+            if wiki_path is not None and wiki_path.exists():
+                wikimedia_archival_count += 1
+                scene_photos.append(wiki_path)
+                photos_used.append(str(wiki_path))
+                continue
+
+            # Secondary Vision-verified archival fallback (Openverse / Pixabay / era-locked Flow regen)
             fb_path = fetch_doc_hero_or_archival_photo(
                 spec["fallback_query"],
                 work_dir,
@@ -6064,7 +7736,7 @@ def _prefetch_scene_media_sync(
                 prefer_gemini=False,
                 aspect_ratio=aspect_ratio,
                 bespoke_prompt_en=spec["prompt_en"],
-                scene_context=sc.narration,
+                scene_context=f"{sc.lower_third_title} — {sc.narration}",
                 used_dhashes=used_dhashes,
                 strict_vision=True,
                 allow_duplicate=False,
@@ -6073,28 +7745,21 @@ def _prefetch_scene_media_sync(
                 scene_photos.append(fb_path)
                 photos_used.append(str(fb_path))
 
-        # Populate primary_photo_path & extra_photo_paths (for newspaper / board / timeline cards)
+        # Populate primary_photo_path & initial extra_photo_paths
         if scene_photos:
             item.primary_photo_path = scene_photos[0]
-            if sc.visual_mode in ("red_string_board", "sliding_timeline"):
-                # Feed evidence board / timeline cards with distinct bespoke scene photos (zero random Pixabay!)
+            if sc.visual_mode in ("red_string_board", "sliding_timeline", "video_over_video_collage"):
                 item.extra_photo_paths = list(scene_photos[:4])
             else:
                 item.extra_photo_paths = list(scene_photos[1:])
 
-        # Build chronological `item.shot_sequence`: interleave Vision-verified moving video cleanly among unique photos!
+        # ALWAYS open every scene on its strongest hero 2.5D parallax plate (Shot 0 = hero photo, NEVER weak stock B-roll!)
         seq: List[Tuple[str, Path]] = []
         if item.primary_broll_mp4 is not None and scene_photos:
-            # Put bespoke hero Nano Banana 2.1 plate first on odd scenes, Vision-verified B-roll first on even scenes
-            if s_idx % 2 == 0:
-                seq.append(("photo", scene_photos[0]))
-                seq.append(("video", item.primary_broll_mp4))
-                for p_rem in scene_photos[1:]:
-                    seq.append(("photo", p_rem))
-            else:
-                seq.append(("video", item.primary_broll_mp4))
-                for p_rem in scene_photos:
-                    seq.append(("photo", p_rem))
+            seq.append(("photo", scene_photos[0]))
+            seq.append(("video", item.primary_broll_mp4))
+            for p_rem in scene_photos[1:]:
+                seq.append(("photo", p_rem))
         elif scene_photos:
             for p_rem in scene_photos:
                 seq.append(("photo", p_rem))
@@ -6104,9 +7769,27 @@ def _prefetch_scene_media_sync(
         item.shot_sequence = seq
         print(
             f"[NetflixDoc] Scene {s_idx + 1}/{len(scenes)} ({sc.visual_mode}) assembled {len(seq)} UNIQUE non-repeating shots "
-            f"(video={1 if item.primary_broll_mp4 else 0}, bespoke/verified_photos={len(scene_photos)})",
+            f"(hero_first=True, video={1 if item.primary_broll_mp4 else 0}, bespoke/archival_photos={len(scene_photos)})",
             flush=True,
         )
+
+    # -------------------------------------------------------------------------
+    # PHASE D: Era-Matched Global Hero Plates for `sliding_timeline` & `red_string_board`
+    # Guarantees Saturnalia gets the Saturnalia plate, Sol Invictus gets 274/336 AD,
+    # São Nicolau gets Myra, Krampus gets Krampus — NEVER duplicating King Charles II!
+    # -------------------------------------------------------------------------
+    global_hero_photos_by_scene: List[Optional[Path]] = []
+    for s_idx, sc in enumerate(scenes):
+        hero_p = assets_list[s_idx].primary_photo_path
+        if hero_p is None:
+            hero_p = _find_cached_slot_photo(work_dir, f"sc{s_idx:02d}_shot00", min_bytes=8_000)
+        global_hero_photos_by_scene.append(hero_p)
+
+    _bind_global_era_matched_board_and_timeline_photos(
+        scenes=scenes,
+        assets_list=assets_list,
+        global_hero_photos_by_scene=global_hero_photos_by_scene,
+    )
 
     telemetry = {
         "broll_clips_used": broll_clips_used,
@@ -6117,9 +7800,92 @@ def _prefetch_scene_media_sync(
         "photos_count": len(photos_used),
         "unique_dhashes_count": len(used_dhashes),
         "google_flow_bespoke_count": len(flow_results),
+        "wikimedia_archival_count": wikimedia_archival_count,
+        "anachronism_rejections_count": anachronism_rejections,
         "video_over_video_active": len(pip_clips_used) > 0,
     }
     return assets_list, telemetry
+
+
+def _fold_ascii_lower(text: str) -> str:
+    norm = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in norm if not unicodedata.combining(ch)).lower()
+
+
+def _bind_global_era_matched_board_and_timeline_photos(
+    scenes: List[NetflixDocScene],
+    assets_list: List[SceneMediaAssets],
+    global_hero_photos_by_scene: List[Optional[Path]],
+) -> None:
+    """Populate `item.extra_photo_paths` for every `sliding_timeline` and `red_string_board` scene
+    with the ACTUAL matching historical scene hero plates corresponding to each milestone/node!
+    """
+    available_pairs: List[Tuple[int, Path, str]] = []
+    for idx_s, (sc, hero_p) in enumerate(zip(scenes, global_hero_photos_by_scene)):
+        if hero_p is not None and Path(hero_p).exists():
+            sig_text = _fold_ascii_lower(
+                f"{sc.lower_third_title} {sc.lower_third_subtitle} {sc.evidence_headline} {sc.photo_query_en} {sc.narration[:240]}"
+            )
+            available_pairs.append((idx_s, Path(hero_p), sig_text))
+    if not available_pairs:
+        return
+
+    stop_toks = {
+        "de", "da", "do", "dos", "das", "em", "no", "na", "e", "o", "a", "os", "as", "por", "para",
+        "com", "uma", "um", "que", "seu", "sua", "era", "ano", "anos", "the", "and", "of", "in",
+    }
+
+    def _pick_best_plate_for_text(item_text: str, used_paths: Set[str], exclude_scene_idx: int) -> Optional[Path]:
+        norm_q = _fold_ascii_lower(item_text)
+        tokens = [tok for tok in re.findall(r"[a-z0-9]{3,}", norm_q) if tok not in stop_toks]
+        year_tokens = re.findall(r"\b\d{3,4}\b", norm_q)
+        best_score = -1
+        best_path: Optional[Path] = None
+        for idx_s, path_s, sig_txt in available_pairs:
+            p_key = str(path_s.resolve()) if path_s.exists() else str(path_s)
+            if p_key in used_paths:
+                continue
+            score = 0
+            for yt in year_tokens:
+                if yt in sig_txt:
+                    score += 12
+            for tk in tokens:
+                if tk in sig_txt:
+                    score += 4
+                elif len(tk) >= 5 and tk[:5] in sig_txt:
+                    score += 2
+            if idx_s != exclude_scene_idx:
+                score += 1  # slight preference for the actual historical source scene over the recap scene itself
+            if score > best_score:
+                best_score = score
+                best_path = path_s
+        if best_path is not None and best_score >= 3:
+            used_paths.add(str(best_path.resolve()) if best_path.exists() else str(best_path))
+            return best_path
+        # Fallback: first unused distinct hero plate across the documentary
+        for _, path_s, _ in available_pairs:
+            p_key = str(path_s.resolve()) if path_s.exists() else str(path_s)
+            if p_key not in used_paths:
+                used_paths.add(p_key)
+                return path_s
+        return None
+
+    for s_idx, sc in enumerate(scenes):
+        if sc.visual_mode not in ("sliding_timeline", "red_string_board"):
+            continue
+        item = assets_list[s_idx]
+        used_p: Set[str] = set()
+        matched_paths: List[Path] = []
+        if sc.visual_mode == "sliding_timeline":
+            targets = [f"{pt.date} {pt.label} {pt.value}" for pt in (sc.timeline_points or [])[:6]]
+        else:
+            targets = [f"{nd.title} {nd.role} {nd.badge}" for nd in (sc.board_nodes or [])[:4]]
+        for t_txt in targets:
+            picked = _pick_best_plate_for_text(t_txt, used_p, exclude_scene_idx=s_idx)
+            if picked is not None:
+                matched_paths.append(picked)
+        if matched_paths:
+            item.extra_photo_paths = matched_paths
 
 
 def _pick_sfx(sfx_dir: Path, *names: str) -> Optional[Path]:
@@ -6362,6 +8128,187 @@ def _concat_scenes_with_xfade(
             return out_mp4, False
 
 
+def _fmt_edl_ts(seconds: float) -> str:
+    sec = max(0.0, float(seconds))
+    mins = int(sec // 60)
+    rem = sec - mins * 60.0
+    return f"{mins:02d}:{rem:04.1f}"
+
+
+def _map_xfade_to_edl_transition(tr_name: str, is_chapter: bool = False) -> str:
+    if is_chapter:
+        return "Light leak"
+    t = str(tr_name or "").strip().lower()
+    if t in ("smoothleft", "wiperight", "smoothright"):
+        return "Whip pan"
+    if t in ("fadeblack", "dissolve", "zoomin"):
+        return "Light leak"
+    return "Hard cut"
+
+
+def _build_edl_timeline_json(
+    plan_obj: NetflixDocPlan,
+    scene_records: List[Dict[str, Any]],
+    sfx_events: List[Tuple[Path, float, float]],
+    pattern_interrupt_times: List[float],
+    total_dur_s: float,
+) -> Dict[str, Any]:
+    """Export the complete shot-by-shot Reverse-Engineered JSON Edit Decision List (`edl_timeline.json`)
+    following the mandatory schema_version 3.0.0 EDL structure.
+    """
+    breakdown: List[Dict[str, Any]] = []
+    hook_cuts = 0
+    hook_shot_durs: List[float] = []
+
+    def _sfx_in_window(t0: float, t1: float) -> List[str]:
+        hits: List[str] = []
+        for s_p, s_t, _ in sfx_events:
+            if (t0 - 0.35) <= s_t <= (t1 + 0.10):
+                nm = Path(s_p).name
+                if nm not in hits:
+                    hits.append(nm)
+        return hits
+
+    for rec in scene_records:
+        s_idx = int(rec["s_idx"])
+        sc: NetflixDocScene = rec["scene"]
+        sc_start = float(rec["start_t"])
+        ch_intro = float(rec["chapter_intro_s"])
+        body_start = sc_start + ch_intro
+        body_dur = max(0.5, float(rec["body_dur"]))
+        tr_in = _map_xfade_to_edl_transition(str(rec.get("transition_type") or ""), is_chapter=bool(sc.chapter_card))
+        assets: SceneMediaAssets = rec.get("media_assets") or SceneMediaAssets()
+        seq = list(assets.shot_sequence or [])
+        n_shots = max(1, len(seq))
+        cad = float(getattr(sc, "cut_cadence_s", None) or 3.0)
+        bookend_w = _compute_bookended_graphic_window(sc.visual_mode, body_dur, n_shots, cut_cadence_s=cad)
+
+        is_pi = bool(getattr(sc, "pattern_interrupt", False)) or any(abs(sc_start - tp) <= 4.0 for tp in pattern_interrupt_times)
+        music_state = (
+            "Hard mute to absolute silence for 1.25s (Pattern Interrupt) then resume at -28 dB under voice"
+            if is_pi
+            else ("Slower reflective coda fading out abruptly 0.50s after final word" if sc.act_id == "ACT_4_ABRUPT_ENDING" else "Evolving 4-movement documentary score (-23 dB base, auto-ducked to -28 dB under voice)")
+        )
+
+        # Build shot-level EDL entries across pre-graphic, centerpiece graphic, and post-graphic slices (or multi-shot)
+        slices: List[Tuple[float, float, str, str, str, str, str, str]] = []
+        if bookend_w is not None:
+            g_start, g_end, pre_cnt = bookend_w
+            pre_shots = seq[:pre_cnt] or [("photo", Path("hero"))]
+            post_shots = seq[pre_cnt:] or seq[-1:] or [("photo", Path("still"))]
+            # Pre-graphic shots
+            pre_sd = max(0.4, g_start / float(len(pre_shots)))
+            for i_p, (k_p, _) in enumerate(pre_shots):
+                t0 = body_start + i_p * pre_sd
+                t1 = body_start + (i_p + 1) * pre_sd
+                vcat = "Atmospheric_B_Roll" if k_p == "video" else "2.5D_Parallax"
+                cam = "0.85x slow-motion push-in 1.00->1.09" if k_p == "video" else "Counter-directional 2.5D parallax (BG 1.06->1.00, FG 1.00->1.14)"
+                slices.append((
+                    t0, t1, vcat,
+                    "Desaturated 0.85x slow-motion B-roll (master_color_grade)" if k_p == "video" else "Inpainted 3px-DOF blurred archival plate (master_color_grade)",
+                    "Atmospheric dust motes + 35mm film grain (0.14)" if (k_p == "video" or i_p > 0) else "3D Depth Title in rule-of-thirds negative space behind subject",
+                    f"Date/Location Stamp ({sc.lower_third_title}) + Selective-Emphasis Captions",
+                    cam,
+                    tr_in if i_p == 0 else "Hard cut",
+                ))
+            # Centerpiece graphic slice
+            g_vcat = _resolve_visual_category(sc.visual_mode, is_broll_shot=False)
+            g_bg = {
+                "2D_Infographic_Over_Realism": "65%-brightness realistic plate or dark cartographic slate",
+                "Video_Over_Video_PiP": "Dark textured grid + 15px blurred B-roll (40% opacity)",
+                "Dark_3D_Reconstruction": "#121417 obsidian slate void with 3D perspective wireframe floor",
+            }.get(g_vcat, "Graded archival backdrop")
+            g_mid = f"Animated {sc.visual_mode} ({sc.evidence_headline[:48]})"
+            g_cam = "Virtual camera track / subtle push-in over mixed-media graphic"
+            slices.append((
+                body_start + g_start, body_start + g_end, g_vcat, g_bg, g_mid,
+                "Selective-Emphasis Courier Prime keyword captions + 3px crimson-gold progress thread",
+                g_cam, "Whip pan" if g_vcat == "2D_Infographic_Over_Realism" else "Hard cut",
+            ))
+            # Post-graphic shots
+            post_dur = max(0.4, body_dur - g_end)
+            post_sd = max(0.4, post_dur / float(len(post_shots)))
+            for i_q, (k_q, _) in enumerate(post_shots):
+                t0 = body_start + g_end + i_q * post_sd
+                t1 = body_start + g_end + (i_q + 1) * post_sd
+                vcat = "Atmospheric_B_Roll" if k_q == "video" else "2.5D_Parallax"
+                cam = "0.85x slow-motion drift" if k_q == "video" else "Slow Ken Burns push 1.00->1.07"
+                slices.append((
+                    t0, t1, vcat,
+                    "0.85x slow-motion period B-roll" if k_q == "video" else "Graded archival/bespoke historical still",
+                    "35mm grain (0.14) + floating dust motes (0.16)",
+                    "Selective-Emphasis keyword captions (depth title suppressed on Shot 1+)",
+                    cam, "Light leak" if i_q == 0 else "Hard cut",
+                ))
+        else:
+            sd = max(0.5, body_dur / float(n_shots))
+            for i_s in range(n_shots):
+                k_s = seq[i_s][0] if i_s < len(seq) else "photo"
+                t0 = body_start + i_s * sd
+                t1 = body_start + (i_s + 1) * sd
+                vcat = "Atmospheric_B_Roll" if k_s == "video" else _resolve_visual_category(sc.visual_mode, is_broll_shot=False)
+                cam = (
+                    "0.85x slow-motion drift 1.00->1.09"
+                    if k_s == "video"
+                    else ("Counter-directional 2.5D parallax (BG 1.06->1.00, FG 1.00->1.14)" if i_s == 0 else "Slow Ken Burns drift 1.00->1.07")
+                )
+                slices.append((
+                    t0, t1, vcat,
+                    "0.85x slow-motion B-roll (master_color_grade)" if k_s == "video" else "3px-DOF inpainted historical plate (master_color_grade)",
+                    f"3D Depth Title behind subject (Shot 0)" if (i_s == 0 and vcat == "2.5D_Parallax") else f"{sc.visual_mode} motion layer",
+                    f"Date/Location Stamp ({sc.lower_third_title}) + Selective-Emphasis Captions",
+                    cam,
+                    tr_in if i_s == 0 else "Hard cut",
+                ))
+
+        for t0, t1, vcat, bg_desc, mid_desc, fg_desc, cam_m, tr_lbl in slices:
+            dur_s = round(max(0.1, t1 - t0), 2)
+            if t0 < 45.0:
+                hook_cuts += 1
+                hook_shot_durs.append(dur_s)
+            breakdown.append({
+                "scene_id": sc.scene_id,
+                "act_id": sc.act_id,
+                "timestamp_start": _fmt_edl_ts(t0),
+                "timestamp_end": _fmt_edl_ts(t1),
+                "duration_sec": dur_s,
+                "visual_category": vcat,
+                "layer_composition": {
+                    "background": bg_desc,
+                    "midground_animation": mid_desc,
+                    "foreground_overlay": fg_desc,
+                },
+                "camera_motion": cam_m,
+                "transition_in": tr_lbl,
+                "audio_sync": {
+                    "music_state": music_state,
+                    "sfx_triggers": _sfx_in_window(t0, t1),
+                },
+            })
+
+    avg_hook_dur = round(sum(hook_shot_durs) / float(max(1, len(hook_shot_durs))), 2) if hook_shot_durs else 2.5
+    return {
+        "schema_version": "3.0.0",
+        "pipeline_name": plan_obj.pipeline_name,
+        "title": plan_obj.title,
+        "reference_source_url": "local://Mixed_Media_High_Retention_Documentary_Engine/v3.0.0",
+        "total_duration_sec": round(float(total_dur_s), 2),
+        "hook_metrics_00_to_45s": {
+            "total_cuts": hook_cuts,
+            "average_shot_duration_sec": avg_hook_dur,
+            "opening_hook_mechanic": "Names core topic keyword in first sentence, establishes central historical paradox across 2.5D parallax & dark 3D reconstruction, ends Cold Open with provocative interrogative hook.",
+        },
+        "timeline_breakdown": breakdown,
+        "reproducible_style_rules": [
+            "Open every scene on its strongest era-locked 2.5D hero plate (never weak stock B-roll).",
+            "Apply 3px Gaussian DOF blur to separated backgrounds and counter-directional scale (FG 1.00->1.14 vs BG 1.06->1.00).",
+            "Fire 3D Depth Title strictly on Shot 0 of a scene with alpha-aware >=88% unoccluded placement.",
+            "Enforce uniform Visual Cohesion Unifier Stack (contrast +12%, sat -22%, shadows #0D1B2A, highlights #E0C097, vignette 0.35, 35mm grain 0.14, dust 0.16).",
+            "Maintain -14 LUFS voice, -23 dB base / -28 dB ducked evolving score, 1.25s silence pattern interrupts @ 240s/480s/720s, and 0.50s abrupt zero-CTA ending.",
+        ],
+    }
+
+
 async def render_netflix_documentary(
     plan: Union[Dict[str, Any], NetflixDocPlan],
     work_dir: Path,
@@ -6378,17 +8325,18 @@ async def render_netflix_documentary(
     voice_engine: str = "auto",
     cut_cadence_s: float = 2.6,
 ) -> Dict[str, Any]:
-    """Render a complete Netflix / MagnatesMedia / Dark History cinema documentary scene-by-scene to disk
-    with REAL moving HD B-roll video in every scene, Video-over-Video (PiP), REAL/Bespoke Gemini photographs
-    + u2netp 2.5D parallax, 0.40s FFmpeg `xfade` cinema transitions, Hollywood multi-layered SFX,
-    mood-matched atmosphere music bed, kinetic captions, LUT 02_dark_wealth.cube, 35mm film grain,
-    per-scene voice leveling (-18 LUFS), and -14 LUFS broadcast audio mastering.
+    """Render a complete Mixed-Media High-Retention Documentary (`schema_version: 3.0.0`, 16:9 & 9:16)
+    scene-by-scene to disk with zero-copy BGRA Skia C++ surfaces, direct VAAPI hardware encoding,
+    Wikimedia Commons + era-locked Google Flow plates, 0.85x slow-motion Vision-gated B-roll,
+    all 5 Mixed-Media visual categories, 5-Act expressive TTS, 240s pattern interrupts, 0.50s abrupt ending,
+    and automatic export of `outputs/<job_id>/script.json` + `outputs/<job_id>/edl_timeline.json`.
     """
     fps = 30 if int(fps) <= 30 else 60
     work_dir = Path(work_dir)
     out_master_mp4 = Path(out_master_mp4)
+    out_dir = out_master_mp4.parent
     work_dir.mkdir(parents=True, exist_ok=True)
-    out_master_mp4.parent.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     plan_dict = plan.model_dump() if hasattr(plan, "model_dump") else dict(plan)
     plan_obj = NetflixDocPlan.model_validate(plan_dict)
@@ -6398,15 +8346,27 @@ async def render_netflix_documentary(
         if not sc.mood or (sc.mood == "corporate_thriller" and doc_mood != "corporate_thriller"):
             sc.mood = doc_mood
 
-    eff_caption_style = str(caption_style or plan_obj.caption_style or "cinema_minimal").strip()
+    # Always export `outputs/<job_id>/script.json` cleanly at the start of every documentary render
+    script_export_path = out_dir / "script.json"
+    try:
+        script_export_path.write_text(
+            json.dumps(plan_obj.model_dump(), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as exc_sc:
+        print(f"[NetflixDoc] Could not export script.json: {exc_sc}", flush=True)
+
+    default_cap = "selective_emphasis" if plan_obj.aspect_ratio == "16:9" else "cinema_minimal"
+    raw_cap_style = str(caption_style or plan_obj.caption_style or default_cap).strip()
     if resolve_caption_style is not None:
-        eff_caption_style = resolve_caption_style(eff_caption_style)
+        eff_caption_style = resolve_caption_style(raw_cap_style)
+    else:
+        eff_caption_style = raw_cap_style
 
     w, h = (1920, 1080) if plan_obj.aspect_ratio == "16:9" else (1080, 1920)
     lut_path = ASSETS_DIR / "luts" / (plan_obj.lut_file or "02_dark_wealth.cube")
     sfx_dir = ASSETS_DIR / "sfx"
 
-    # Guarantee Pro Cinema Hollywood SFX & dark_mystery_horror.mp3 exist before audio mastering
     if ensure_pro_cinema_sfx is not None:
         try:
             await asyncio.to_thread(ensure_pro_cinema_sfx, False, thermal_limit_c)
@@ -6414,14 +8374,18 @@ async def render_netflix_documentary(
             pass
 
     resolved_music_mp3 = _select_doc_music_bed(plan_obj, music_mp3=music_mp3, thermal_limit_c=thermal_limit_c)
-    eff_music_vol = max(0.33, min(0.50, float(music_volume if music_volume is not None else 0.34)))
+    eff_music_vol = max(0.28, min(0.50, float(music_volume if music_volume is not None else 0.34)))
 
-    title_tf, font_info = _load_verified_typeface("Montserrat-Black.ttf", role="doc_title")
-    ui_tf, _ = _load_verified_typeface("PlusJakartaSans-ExtraBold.ttf", role="doc_ui")
-    caption_tf, _ = _load_verified_typeface("Montserrat-Black.ttf", role="doc_caption")
+    # Prefer Cinzel-Bold.ttf & CourierPrime-Bold.ttf when available (v3.0.0 typography), fallback cleanly
+    fonts_dir = ASSETS_DIR / "fonts"
+    title_font_name = "Cinzel-Bold.ttf" if (fonts_dir / "Cinzel-Bold.ttf").exists() else "Montserrat-Black.ttf"
+    ui_font_name = "CourierPrime-Bold.ttf" if (fonts_dir / "CourierPrime-Bold.ttf").exists() else "PlusJakartaSans-ExtraBold.ttf"
+    cap_font_name = "CourierPrime-Bold.ttf" if (plan_obj.aspect_ratio == "16:9" and (fonts_dir / "CourierPrime-Bold.ttf").exists()) else "Montserrat-Black.ttf"
+    title_tf, font_info = _load_verified_typeface(title_font_name, role="doc_title")
+    ui_tf, _ = _load_verified_typeface(ui_font_name, role="doc_ui")
+    caption_tf, _ = _load_verified_typeface(cap_font_name, role="doc_caption")
 
-    # 1. AUDIO-FIRST: Synthesize narration + per-scene LUFS leveling + real Whisper word timestamps FIRST
-    # so we know each scene's exact `render_dur`, `body_dur`, `already_rendered_mask`, and `n_shots_for_scene`!
+    # 1. AUDIO-FIRST: Synthesize 5-Act expressive narration + per-scene LUFS leveling + Whisper word timestamps
     scene_records: List[Dict[str, Any]] = []
     scene_shot_counts: List[int] = []
     already_rendered_mask: List[bool] = []
@@ -6436,25 +8400,36 @@ async def render_netflix_documentary(
             sfx_events.append((p_sfx, round(t_s, 3), float(vol)))
 
     cursor_t = 0.0
-    pause_gap_s = 0.42
-    tail_pad_s = 1.25
+    pause_gap_within_act_s = 0.30
+    pause_gap_between_acts_s = 0.42
+    # Abrupt 0.50s ending per ACT_4_ABRUPT_ENDING specification
+    tail_pad_s = 0.50
     xfade_dur = CINEMA_XFADE_DURATION_S
-    gap_wav = work_dir / "_doc_gap.wav"
+    gap_short_wav = work_dir / "_doc_gap_short.wav"
+    gap_std_wav = work_dir / "_doc_gap.wav"
     run_ffmpeg_safe(
-        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", f"{pause_gap_s:.2f}", str(gap_wav)],
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", f"{pause_gap_within_act_s:.2f}", str(gap_short_wav)],
+        thermal_limit_c=thermal_limit_c,
+    )
+    run_ffmpeg_safe(
+        ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-t", f"{pause_gap_between_acts_s:.2f}", str(gap_std_wav)],
         thermal_limit_c=thermal_limit_c,
     )
 
     n_scenes = len(plan_obj.scenes)
     is_dark_mood = doc_mood in ("dark_horror", "investigative_crime")
-    eff_cad = max(1.8, min(3.8, float(cut_cadence_s or 2.5)))
+    default_cad = max(1.8, min(4.5, float(cut_cadence_s or 2.6)))
 
     for s_idx, sc in enumerate(plan_obj.scenes):
         if progress_cb:
             pct = 10 + int(18 * ((s_idx + 1) / float(max(1, n_scenes))))
-            progress_cb(pct, f"Sintetizando narração cinema cena {s_idx + 1}/{n_scenes} ({sc.visual_mode})...")
+            progress_cb(pct, f"Sintetizando narração 5-Atos cena {s_idx + 1}/{n_scenes} ({sc.act_id} | {sc.visual_mode})...")
 
         is_last_scene = s_idx == (n_scenes - 1)
+        next_act_differs = (not is_last_scene) and (plan_obj.scenes[s_idx + 1].act_id != sc.act_id)
+        sc_pause_s = 0.0 if is_last_scene else (pause_gap_between_acts_s if next_act_differs else pause_gap_within_act_s)
+        sc_gap_wav = None if is_last_scene else (gap_std_wav if next_act_differs else gap_short_wav)
+
         tr_name = sc.transition_type or _select_transition_for_scene(s_idx, sc.visual_mode, sc.chapter_card is not None)
         if s_idx > 0:
             transitions_plan.append(tr_name)
@@ -6479,9 +8454,8 @@ async def render_netflix_documentary(
         if resume and existing_sc_mp4.exists() and existing_vad_wav.exists():
             est_wav_d = _probe_wav_duration_s(existing_vad_wav)
             if est_wav_d > 0.3:
-                # Last scene includes tail_pad_s=0.40; scenes 0..N-2 include xfade_dur=0.40!
                 exp_sc_d = round(
-                    chapter_intro_s + est_wav_d + pause_gap_s + (tail_pad_s if is_last_scene else xfade_dur),
+                    chapter_intro_s + est_wav_d + sc_pause_s + (tail_pad_s if is_last_scene else xfade_dur),
                     3,
                 )
                 scene_already_rendered = _is_valid_cached_scene_mp4(existing_sc_mp4, w, h, fps, exp_sc_d, tol_s=0.35)
@@ -6499,9 +8473,9 @@ async def render_netflix_documentary(
             reuse_existing_wav_if_no_words=scene_already_rendered,
             voice_engine=voice_engine,
             mood=doc_mood,
+            act_id=str(getattr(sc, "act_id", "ACT_1_WORLD_BUILDING") or "ACT_1_WORLD_BUILDING"),
         )
 
-        # P1 #1: Per-Scene Voice Leveling (-18 LUFS) so narration loudness never swings 4-7 dB across scenes!
         if normalize_scene_wav_lufs is not None and wav_p is not None and Path(wav_p).exists():
             try:
                 norm_wav_p = await asyncio.to_thread(
@@ -6518,7 +8492,6 @@ async def render_netflix_documentary(
             except Exception as exc_norm:
                 print(f"[NetflixDoc] Per-scene voice LUFS leveling skipped on scene {s_idx + 1}: {exc_norm}", flush=True)
 
-        # Shift scene words by chapter_intro_s (local scene time) and cursor_t (master time)
         local_words: List[Dict[str, Any]] = []
         for wd in words:
             lw = {
@@ -6535,17 +8508,16 @@ async def render_netflix_documentary(
                 }
             )
 
-        audio_scene_dur = round(chapter_intro_s + speech_dur + pause_gap_s, 3)
+        audio_scene_dur = round(chapter_intro_s + speech_dur + sc_pause_s, 3)
         scene_dur_with_tail = round(audio_scene_dur + (tail_pad_s if is_last_scene else 0.0), 3)
         render_dur = round(scene_dur_with_tail + (xfade_dur if not is_last_scene else 0.0), 3)
         exact_dur = max(1, int(round(render_dur * fps))) / float(fps)
         body_dur = max(0.5, exact_dur - chapter_intro_s)
 
-        # Cap raised from min(7, ...) -> min(12, ...) so longer scenes preserve crisp ~2.5s visual cut cadence!
-        n_shots_for_scene = max(3, min(12, int(round(body_dur / eff_cad))))
+        sc_cad = float(getattr(sc, "cut_cadence_s", None) or default_cad)
+        n_shots_for_scene = max(3, min(12, int(round(body_dur / max(1.8, sc_cad)))))
         scene_shot_counts.append(n_shots_for_scene)
 
-        # Re-verify cached scene MP4 against exact `render_dur` BEFORE media prefetch!
         if resume and existing_sc_mp4.exists():
             scene_already_rendered = _is_valid_cached_scene_mp4(existing_sc_mp4, w, h, fps, render_dur, tol_s=0.35)
         already_rendered_mask.append(scene_already_rendered)
@@ -6555,6 +8527,7 @@ async def render_netflix_documentary(
                 "s_idx": s_idx,
                 "scene": sc,
                 "start_t": cursor_t,
+                "speech_end_local_t": round(chapter_intro_s + speech_dur, 3),
                 "scene_dur": scene_dur_with_tail,
                 "render_dur": render_dur,
                 "exact_dur": exact_dur,
@@ -6567,10 +8540,11 @@ async def render_netflix_documentary(
             }
         )
         audio_parts.append(wav_p)
-        audio_parts.append(gap_wav)
+        if sc_gap_wav is not None:
+            audio_parts.append(sc_gap_wav)
         cursor_t = round(cursor_t + audio_scene_dur, 3)
 
-    # 2. ZERO-REPETITION MEDIA ORCHESTRATOR: Skip already-rendered scenes completely on resume!
+    # 2. ZERO-REPETITION ERA-LOCKED MEDIA ORCHESTRATOR
     skip_scene_indices: Set[int] = {idx_r for idx_r, is_done in enumerate(already_rendered_mask) if is_done}
     total_planned_shots = sum(
         cnt for idx_c, cnt in enumerate(scene_shot_counts) if idx_c not in skip_scene_indices
@@ -6580,7 +8554,7 @@ async def render_netflix_documentary(
             30,
             f"♻️ Reaproveitando {len(skip_scene_indices)}/{n_scenes} cenas já renderizadas e mídias em cache..."
             if (resume and skip_scene_indices)
-            else f"Gerando {total_planned_shots} planos exclusivos sem repetição (Google Flow Pro Nano Banana 2.1 + Auditoria Visual Gemini)...",
+            else f"Gerando {total_planned_shots} planos históricos sem anacronismos (Wikimedia Commons + Google Flow Pro + Gemini Vision)...",
         )
     scene_media_list, media_telemetry = await asyncio.to_thread(
         _prefetch_scene_media_sync,
@@ -6596,9 +8570,8 @@ async def render_netflix_documentary(
         if idx_m < len(scene_media_list):
             rec["media_assets"] = scene_media_list[idx_m]
 
-    # 2.5 EXACT VISUAL-ALIGNED HOLLYWOOD SFX SCHEDULING (P1 #2)
-    # Scheduled AFTER media prefetch & exact `render_dur`/`body_dur` so EVERY riser, whoosh,
-    # graphic foley (`body_start_t + pre_dur`), and internal cut SFX hits the EXACT visual cut!
+    # 2.5 EXACT VISUAL-ALIGNED TACTILE MIXED-MEDIA FOLEY & PATTERN INTERRUPTS (Schema v3.0.0)
+    computed_pi_times: List[float] = []
     for rec in scene_records:
         s_idx = rec["s_idx"]
         sc: NetflixDocScene = rec["scene"]
@@ -6608,36 +8581,37 @@ async def render_netflix_documentary(
         body_dur = float(rec["body_dur"])
         tr_name = str(rec["transition_type"])
         is_last_scene = s_idx == (n_scenes - 1)
+        sc_cad = float(getattr(sc, "cut_cadence_s", None) or default_cad)
+
+        if bool(getattr(sc, "pattern_interrupt", False)) and sc_start_t >= 30.0:
+            computed_pi_times.append(round(sc_start_t, 2))
+            _add_sfx(sc_start_t + 0.02, 0.34, "pattern_interrupt_shutter.wav", "camera_shutter.wav", "ui_click.wav")
 
         if s_idx > 0:
-            # Transition SFX aligned to exact peak/cutoff at `sc_start_t`!
             if sc.chapter_card:
                 if sc_start_t >= 1.4:
-                    _add_sfx(max(0.0, sc_start_t - 2.48), 0.26, "riser_tension.wav")
+                    _add_sfx(max(0.0, sc_start_t - 2.48), 0.22, "riser_tension.wav")
             elif tr_name in ("smoothleft", "wiperight"):
-                _add_sfx(max(0.0, sc_start_t - 0.48), 0.36, "whoosh_deep.wav", "whoosh_fast.wav")
+                _add_sfx(max(0.0, sc_start_t - 0.42), 0.28, "whoosh_deep.wav", "whoosh_fast.wav")
             elif tr_name == "zoomin":
-                _add_sfx(max(0.0, sc_start_t - 0.04), 0.38, "flash_impact.wav", "cinematic_hit.wav")
-            else:
-                _add_sfx(max(0.0, sc_start_t - 0.48), 0.34, "whoosh_deep.wav")
-                _add_sfx(sc_start_t + 0.03, 0.28, "sub_boom.wav")
+                _add_sfx(max(0.0, sc_start_t - 0.04), 0.26, "scene_cut_sub_pulse.wav", "flash_impact.wav", "cinematic_hit.wav")
+            elif s_idx % 2 == 0:
+                _add_sfx(max(0.0, sc_start_t - 0.04), 0.24, "scene_cut_sub_pulse.wav", "sub_boom.wav")
 
         if chapter_intro_s > 0.0:
-            if doc_mood == "dark_horror":
-                _add_sfx(sc_start_t + 0.04, 0.34, "horror_braam.wav", "sub_boom.wav")
+            # Varied chapter stings (avoid repeating identical horror_braam 5x!)
+            if s_idx % 3 == 0:
+                _add_sfx(sc_start_t + 0.04, 0.32, "sub_boom.wav", "scene_cut_sub_pulse.wav")
+            elif doc_mood == "dark_horror" and sc.act_id != "ACT_3_CLIMAX_REVELATION":
+                _add_sfx(sc_start_t + 0.04, 0.28, "horror_braam.wav", "sub_boom.wav")
             else:
-                _add_sfx(sc_start_t + 0.04, 0.44, "sub_boom.wav", "cinematic_hit.wav")
+                _add_sfx(sc_start_t + 0.04, 0.30, "scene_cut_sub_pulse.wav", "cinematic_hit.wav", "sub_boom.wav")
 
         if s_idx == 0:
-            if is_dark_mood:
-                _add_sfx(0.04, 0.34, "horror_braam.wav", "sub_boom.wav")
-            else:
-                _add_sfx(0.04, 0.42, "cinematic_hit.wav", "sub_boom.wav")
+            _add_sfx(0.04, 0.28, "scene_cut_sub_pulse.wav", "sub_boom.wav", "cinematic_hit.wav")
 
-        # Determine actual rendered visual shot count for this scene (only emit cut SFX when real visual cuts exist!)
         seq_len = len(rec["media_assets"].shot_sequence or [])
         if seq_len == 0 and rec["already_rendered"]:
-            # Resumed skipped scene: estimate shot count from cached work assets, else planned count
             cached_shots = len(list(work_dir.glob(f"flow_sc{s_idx:02d}_shot*"))) + len(list(work_dir.glob(f"photo_sc{s_idx:02d}_shot*")))
             has_cached_broll = 1 if _find_cached_work_asset(work_dir, f"broll_sc{s_idx:02d}_main", min_bytes=32_768) else 0
             seq_len = (cached_shots + has_cached_broll) or scene_shot_counts[s_idx]
@@ -6645,7 +8619,6 @@ async def render_netflix_documentary(
         if sc.visual_mode in ("cinema_multishot", "parallax_25d_photo"):
             if seq_len >= 2:
                 shot_dur = max(0.8, body_dur / float(seq_len))
-                # Stop before xfade overlap on scenes 0..N-2 so internal cut whooshes never collide with scene transitions
                 safe_cut_limit = (body_dur - xfade_dur - 0.15) if not is_last_scene else (body_dur - 0.15)
                 for si_cut in range(1, seq_len):
                     cut_local_t = si_cut * shot_dur
@@ -6653,37 +8626,39 @@ async def render_netflix_documentary(
                         break
                     cut_t = body_start_t + cut_local_t
                     if si_cut % 2 == 1:
-                        _add_sfx(max(0.0, cut_t - 0.24), 0.16, "whoosh_fast.wav", "camera_shutter.wav")
-                    else:
-                        _add_sfx(max(0.0, cut_t - 0.03), 0.15, "flash_impact.wav", "whoosh_fast.wav")
-        elif sc.visual_mode == "broll_video_pip":
-            _add_sfx(max(0.0, body_start_t + 0.14 - 0.24), 0.22, "whoosh_fast.wav", "whoosh_deep.wav")
-        elif sc.visual_mode == "video_pip_evidence":
-            _add_sfx(body_start_t + 0.12, 0.28, "flash_impact.wav", "ui_click.wav")
+                        _add_sfx(max(0.0, cut_t - 0.18), 0.18, "scene_cut_sub_pulse.wav", "whoosh_fast.wav")
+        elif sc.visual_mode in ("broll_video_pip", "video_pip_evidence"):
+            _add_sfx(body_start_t + 0.12, 0.28, "pip_card_slide.wav", "whoosh_fast.wav")
         elif sc.visual_mode in GRAPHIC_BOOKEND_MODES:
             bookend_w = _compute_bookended_graphic_window(
                 sc.visual_mode,
                 body_dur,
                 seq_len,
-                cut_cadence_s=cut_cadence_s,
+                cut_cadence_s=sc_cad,
             )
-            # Schedule graphic foley RIGHT when the bookended graphic enters (`body_start_t + pre_dur`), NOT +0.10s!
             graphic_enter_t = (body_start_t + bookend_w[0]) if bookend_w is not None else (body_start_t + 0.10)
             if sc.visual_mode == "newspaper_highlighter":
-                _add_sfx(graphic_enter_t, 0.36, "paper_flip.wav", "whoosh_deep.wav")
-            elif sc.visual_mode == "dark_map_route":
-                _add_sfx(graphic_enter_t, 0.28, "ui_click.wav")
-                _add_sfx(max(0.0, graphic_enter_t - 0.24), 0.16, "whoosh_fast.wav")
+                _add_sfx(graphic_enter_t, 0.30, "pip_card_slide.wav", "paper_flip.wav")
+                _add_sfx(graphic_enter_t + 0.45, 0.32, "marker_highlight_stroke.wav", "paper_flip.wav")
+            elif sc.visual_mode in ("dark_map_route", "2d_schematic_over_realism"):
+                _add_sfx(graphic_enter_t, 0.28, "vector_draw_tick.wav", "ui_click.wav")
+                _add_sfx(max(0.0, graphic_enter_t - 0.20), 0.18, "whoosh_fast.wav")
             elif sc.visual_mode == "sliding_timeline":
-                if doc_mood == "corporate_thriller":
-                    _add_sfx(graphic_enter_t, 0.28, "cash_chime.wav", "ui_click.wav")
-                else:
-                    _add_sfx(graphic_enter_t, 0.30, "sub_boom.wav", "ui_click.wav")
+                _add_sfx(graphic_enter_t, 0.28, "vector_draw_tick.wav", "ui_click.wav", "sub_boom.wav")
+            elif sc.visual_mode == "video_over_video_collage":
+                _add_sfx(graphic_enter_t, 0.30, "pip_card_slide.wav", "paper_flip.wav")
+                _add_sfx(graphic_enter_t + 0.50, 0.30, "marker_highlight_stroke.wav", "ui_click.wav")
+            elif sc.visual_mode == "fern_3d_reconstruction":
+                _add_sfx(graphic_enter_t, 0.28, "scene_cut_sub_pulse.wav", "sub_boom.wav")
+                _add_sfx(graphic_enter_t + 0.32, 0.22, "vector_draw_tick.wav", "ui_click.wav")
             elif sc.visual_mode == "red_string_board":
-                _add_sfx(graphic_enter_t, 0.32, "heartbeat.wav", "sub_boom.wav")
-                _add_sfx(graphic_enter_t + 0.26, 0.24, "paper_flip.wav", "whoosh_fast.wav")
+                _add_sfx(graphic_enter_t, 0.30, "pip_card_slide.wav", "paper_flip.wav")
+                _add_sfx(graphic_enter_t + 0.24, 0.26, "vector_draw_tick.wav", "heartbeat.wav")
 
-    # Concatenate full narration WAV and master Broadcast Audio (-14 LUFS + 0.40s clean tail)
+    if not computed_pi_times and cursor_t >= 280.0:
+        computed_pi_times = [float(tp) for tp in (240.0, 480.0, 720.0) if tp < cursor_t - 20.0]
+
+    # Concatenate full narration WAV and master Broadcast Audio (-14 LUFS + -23/-28 dB music + PI mutes + 0.50s abrupt ending)
     concat_audio_txt = work_dir / "doc_audio_concat.txt"
     concat_audio_txt.write_text("\n".join(f"file '{p.resolve()}'" for p in audio_parts), encoding="utf-8")
     raw_full_wav = work_dir / "doc_narration_full.wav"
@@ -6693,6 +8668,16 @@ async def render_netflix_documentary(
     )
 
     master_audio = work_dir / "doc_master_audio.m4a"
+    master_kwargs: Dict[str, Any] = {"thermal_limit_c": thermal_limit_c}
+    try:
+        mba_params = inspect.signature(master_broadcast_audio).parameters
+        if "pattern_interrupt_times" in mba_params:
+            master_kwargs["pattern_interrupt_times"] = computed_pi_times
+        if "abrupt_ending_cut" in mba_params:
+            master_kwargs["abrupt_ending_cut"] = True
+    except Exception:
+        pass
+
     master_audio, final_dur = await asyncio.to_thread(
         master_broadcast_audio,
         raw_full_wav,
@@ -6702,10 +8687,9 @@ async def render_netflix_documentary(
         cursor_t,
         eff_music_vol,
         tail_pad_s,
-        thermal_limit_c=thermal_limit_c,
+        **master_kwargs,
     )
 
-    # Reconcile last scene duration in case `master_broadcast_audio` returned a slightly different `final_dur`
     if scene_records:
         actual_tail_delta = max(0.0, round(final_dur - cursor_t, 3))
         if abs(actual_tail_delta - tail_pad_s) > 0.005:
@@ -6713,13 +8697,28 @@ async def render_netflix_documentary(
             scene_records[-1]["scene_dur"] = round(base_last + actual_tail_delta, 3)
             scene_records[-1]["render_dur"] = scene_records[-1]["scene_dur"]
 
-    # 3. Render each scene to disk one-by-one (os.nice(10) + thermal_guard_wait -> flat RAM!)
+    # Export complete Reverse-Engineered EDL (`outputs/<job_id>/edl_timeline.json`)
+    edl_export_path = out_dir / "edl_timeline.json"
+    edl_payload = _build_edl_timeline_json(
+        plan_obj=plan_obj,
+        scene_records=scene_records,
+        sfx_events=sfx_events,
+        pattern_interrupt_times=computed_pi_times,
+        total_dur_s=final_dur,
+    )
+    try:
+        edl_export_path.write_text(json.dumps(edl_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc_edl:
+        print(f"[NetflixDoc] Could not export edl_timeline.json: {exc_edl}", flush=True)
+
+    # 3. Render each scene to disk one-by-one (zero-copy BGRA Skia + VAAPI 65+ FPS -> flat RAM!)
     scene_mp4_paths: List[Path] = []
     u2netp_25d_used = False
     for rec in scene_records:
         s_idx = rec["s_idx"]
         sc: NetflixDocScene = rec["scene"]
         out_sc_mp4 = work_dir / f"doc_scene_{s_idx:03d}.mp4"
+        is_last_scene = s_idx == (n_scenes - 1)
         if resume and (rec.get("already_rendered") or _is_valid_cached_scene_mp4(out_sc_mp4, w, h, fps, rec["render_dur"], tol_s=0.35)):
             if progress_cb:
                 pct = 45 + int(40 * ((s_idx + 1) / float(max(1, n_scenes))))
@@ -6736,9 +8735,15 @@ async def render_netflix_documentary(
             pct = 45 + int(40 * ((s_idx + 1) / float(max(1, n_scenes))))
             progress_cb(
                 pct,
-                f"Renderizando cena Skia C++ {s_idx + 1}/{n_scenes} [{sc.visual_mode}] ({w}x{h} @ {fps}fps | Vídeo Real + PiP + Fotos)...",
+                f"Renderizando cena Skia C++ Zero-Copy {s_idx + 1}/{n_scenes} [{sc.visual_mode}] ({w}x{h} @ {fps}fps)...",
             )
         prev_lt_title = plan_obj.scenes[s_idx - 1].lower_third_title if s_idx > 0 else None
+        sc_cad = float(getattr(sc, "cut_cadence_s", None) or default_cad)
+        abrupt_cut_t = (
+            round(float(rec["speech_end_local_t"]) + 0.45, 3)
+            if (is_last_scene and sc.act_id == "ACT_4_ABRUPT_ENDING")
+            else None
+        )
         rendered_p, did_u2netp = await asyncio.to_thread(
             _render_single_doc_scene_to_disk,
             sc,
@@ -6760,8 +8765,9 @@ async def render_netflix_documentary(
             rec["media_assets"],
             plan_obj.lang,
             eff_caption_style,
-            cut_cadence_s,
+            sc_cad,
             prev_lt_title,
+            abrupt_cut_t,
         )
         if did_u2netp:
             u2netp_25d_used = True
@@ -6801,9 +8807,13 @@ async def render_netflix_documentary(
     modes_used = [sc.visual_mode for sc in plan_obj.scenes]
 
     return {
+        "schema_version": "3.0.0",
+        "pipeline_name": plan_obj.pipeline_name,
         "master_mp4": str(out_master_mp4),
         "master_audio": str(master_audio),
         "base_scenes_mp4": str(base_scenes_mp4),
+        "script_json_path": str(script_export_path),
+        "edl_timeline_path": str(edl_export_path),
         "words": all_words,
         "duration_s": round(_probe_video_duration(out_master_mp4), 2),
         "aspect_ratio": plan_obj.aspect_ratio,
@@ -6817,12 +8827,13 @@ async def render_netflix_documentary(
         "channel_name": plan_obj.channel_name,
         "voice_id": plan_obj.voice_id,
         "lut_file": plan_obj.lut_file,
-        "film_grain": "35mm_active",
+        "film_grain": "35mm_skia_unifier_active",
         "xfade_active": xfade_active,
         "xfade_duration_s": xfade_dur if xfade_active else 0.0,
         "transitions_used": transitions_plan,
+        "pattern_interrupt_times": computed_pi_times,
         "sfx_events_count": len(sfx_events),
-        "doc_engine": "netflix_magnates_cinema_v3_open_topic_xfade",
+        "doc_engine": "mixed_media_high_retention_doc_engine_v3",
         "font_verified": font_info,
         "title": plan_obj.title,
         "subtitle": plan_obj.subtitle,
