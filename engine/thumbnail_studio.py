@@ -225,14 +225,14 @@ def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
 
 
 def _refine_soft_alpha_matte(raw_mask: np.ndarray) -> np.ndarray:
-    """Clean u2netp speckles, smooth silhouette edges with Gaussian feathering, ZERO jagged halos."""
+    """Clean u2netp speckles, smooth silhouette edges with tight feathering, ZERO jagged or chalky halos."""
     h, w = raw_mask.shape[:2]
-    # Soft S-curve ramp pushes background haze cleanly to 0 while keeping soft hair/fur transitions
-    ramped = _smoothstep(0.18, 0.76, raw_mask)
+    # Tighter S-curve ramp pushes bright background haze cleanly to 0 while keeping crisp shoulder contours
+    ramped = _smoothstep(0.24, 0.78, raw_mask)
 
     # Remove tiny isolated background specks using connected components on binary core
-    core = (ramped > 0.30).astype(np.uint8)
-    k_morph = max(3, int(round(min(h, w) * 0.008)) | 1)
+    core = (ramped > 0.34).astype(np.uint8)
+    k_morph = max(3, int(round(min(h, w) * 0.007)) | 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_morph, k_morph))
     core = cv2.morphologyEx(core, cv2.MORPH_CLOSE, kernel)
     core = cv2.morphologyEx(core, cv2.MORPH_OPEN, kernel)
@@ -245,20 +245,19 @@ def _refine_soft_alpha_matte(raw_mask: np.ndarray) -> np.ndarray:
         for lbl in range(1, num_labels):
             if stats[lbl, cv2.CC_STAT_AREA] >= max(250, int(max_area * 0.08)):
                 keep[labels == lbl] = 1.0
-        # Dilate keep region slightly so soft hair tendrils around the main subject stay intact
-        k_dil = max(7, int(round(min(h, w) * 0.022)) | 1)
+        # Keep only a tight halo margin around the subject silhouette so background edges don't leak
+        k_dil = max(5, int(round(min(h, w) * 0.014)) | 1)
         keep_soft = cv2.GaussianBlur(
             cv2.dilate(keep, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_dil, k_dil))),
             (0, 0),
-            sigmaX=max(2.0, min(h, w) * 0.006),
+            sigmaX=max(1.4, min(h, w) * 0.004),
         )
         ramped = ramped * np.clip(keep_soft, 0.0, 1.0)
 
-    # Silky Gaussian edge feathering so cutout boundaries never look jagged
-    sigma = max(2.0, min(h, w) * 0.0042)
+    # Tight cinema edge feathering prevents chalky outward background bleed around shoulders
+    sigma = max(1.2, min(h, w) * 0.0024)
     feathered = cv2.GaussianBlur(ramped.astype(np.float32), (0, 0), sigmaX=sigma, sigmaY=sigma)
-    # Slight gamma tightening preserves core opacity while keeping edges velvety smooth
-    feathered = np.clip(np.power(np.clip(feathered, 0.0, 1.0), 0.92), 0.0, 1.0)
+    feathered = np.clip(np.power(np.clip(feathered, 0.0, 1.0), 0.96), 0.0, 1.0)
     return feathered
 
 
@@ -288,6 +287,16 @@ def _cutout_subject_u2netp(
     if len(xs) < 600 or cov < 0.04 or cov > 0.92:
         return None, cov, {}
 
+    # Reject fragmented multi-blob architectural/landscape masks so thumb_B never floats chopped rooflines
+    bin_m = (alpha_f > 0.45).astype(np.uint8)
+    n_cc, _, cc_stats, _ = cv2.connectedComponentsWithStats(bin_m, connectivity=8)
+    if n_cc > 2:
+        cc_areas = cc_stats[1:, cv2.CC_STAT_AREA]
+        total_cc = float(np.sum(cc_areas))
+        largest_cc = float(np.max(cc_areas)) if len(cc_areas) > 0 else 0.0
+        if total_cc > 0 and (largest_cc / total_cc) < 0.72:
+            return None, cov, {}
+
     pad = max(14, int(round(min(h, w) * 0.02)))
     x0 = max(0, int(np.min(xs)) - pad)
     x1 = min(w, int(np.max(xs)) + pad)
@@ -298,16 +307,14 @@ def _cutout_subject_u2netp(
     crop_alpha = alpha_f[y0:y1, x0:x1].copy()
     ch, cw = crop_bgr.shape[:2]
 
-    # Edge color decontamination: pull translucent fringe pixels slightly darker/inward
-    # to eliminate bright background halo rings around hair/shoulders.
-    eroded_core = cv2.erode((crop_alpha > 0.85).astype(np.uint8), np.ones((5, 5), np.uint8))
+    # Edge color decontamination: pull translucent fringe pixels darker/inward
+    # to eliminate pale/chalky background halo rings around hair/shoulders.
+    eroded_core = cv2.erode((crop_alpha > 0.88).astype(np.uint8), np.ones((5, 5), np.uint8))
     fringe = (crop_alpha > 0.02) & (eroded_core == 0)
     if np.any(fringe):
-        # Smooth inward color bleed + gentle shadow pull on outer translucent edge
-        blur_bgr = cv2.GaussianBlur(crop_bgr, (0, 0), sigmaX=3.0)
+        blur_bgr = cv2.GaussianBlur(crop_bgr, (0, 0), sigmaX=2.4)
         edge_strength = np.clip(1.0 - crop_alpha, 0.0, 1.0)[:, :, np.newaxis]
-        # Darken outer fringe gently toward deep cinema shadow so bright halos vanish
-        decontam = crop_bgr * (1.0 - 0.35 * edge_strength) + blur_bgr * (0.20 * edge_strength)
+        decontam = crop_bgr * (1.0 - 0.55 * edge_strength) + blur_bgr * (0.14 * edge_strength)
         crop_bgr = np.where(fringe[:, :, np.newaxis], decontam, crop_bgr)
 
     touches_left = x0 <= 4
@@ -964,6 +971,37 @@ def _acquire_hero_assets(
         except Exception as exc:
             print(f"[ThumbStudio] Editorial photo fallback notice: {exc}", flush=True)
 
+    # 2b. Harvest distinct existing cinema hero stills from _work/ (photo_thumb_hero_*, flow_*.jpg, photo_*.jpg)
+    # whenever fewer than 3 distinct heroes were acquired, so thumb_A / thumb_B / thumb_C ALWAYS stay distinct!
+    if len(assets) < 3 and work_dir.exists():
+        existing_sigs = {
+            hashlib.md5(cv2.resize(existing_bgr, (32, 18)).tobytes()).hexdigest()
+            for _, existing_bgr, _ in assets
+        }
+        work_photo_cands: List[Path] = []
+        for pat in ("photo_thumb_hero_*.jpg", "flow_*.jpg", "photo_*.jpg"):
+            for cand_p in sorted(work_dir.glob(pat)):
+                if cand_p.is_file() and cand_p.stat().st_size > 8_000 and cand_p not in work_photo_cands:
+                    work_photo_cands.append(cand_p)
+        scored_work: List[Tuple[int, float, Path, np.ndarray, str]] = []
+        for cand_p in work_photo_cands[:18]:
+            bgr_w = cv2.imread(str(cand_p), cv2.IMREAD_COLOR)
+            if not _validate_decoded_bgr(bgr_w, min_w=480, min_h=340):
+                continue
+            h_sig = hashlib.md5(cv2.resize(bgr_w, (32, 18)).tobytes()).hexdigest()
+            if h_sig in existing_sigs:
+                continue
+            existing_sigs.add(h_sig)
+            is_landscape = 1 if bgr_w.shape[1] >= bgr_w.shape[0] else 0
+            scored_work.append((is_landscape, _score_cinema_drama_bgr(bgr_w), cand_p, bgr_w, f"work_photo:{cand_p.name}"))
+        scored_work.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        for _, _, cand_p, bgr_w, src_lbl in scored_work:
+            if len(assets) >= 3:
+                break
+            assets.append((cand_p, bgr_w, src_lbl))
+            if "work_photo" not in sources_used:
+                sources_used.append("work_photo")
+
     # 3. Fallback (b): Sharpest clean video frame from video_path
     if len(assets) < 1:
         v_frames = _pick_best_video_frames(video_path, work_dir)
@@ -1067,8 +1105,9 @@ def _relight_cutout_bgra(
     cold_bgr = np.array([pal["b_rim_cold_rgb"][2], pal["b_rim_cold_rgb"][1], pal["b_rim_cold_rgb"][0]], dtype=np.float32)
     warm_bgr = np.array([pal["b_rim_warm_rgb"][2], pal["b_rim_warm_rgb"][1], pal["b_rim_warm_rgb"][0]], dtype=np.float32)
 
-    # Subtle edge tint (screen-like gentle addition weighted by luminance)
-    bgr_graded = bgr_graded + left_kiss * cold_bgr * 0.14 + right_kiss * warm_bgr * 0.16
+    # Subtle edge tint weighted by foreground opacity so semi-transparent fringe never chalks white
+    alpha_w = (out[:, :, 3:4].astype(np.float32) / 255.0)
+    bgr_graded = bgr_graded + (left_kiss * cold_bgr * 0.11 + right_kiss * warm_bgr * 0.13) * alpha_w
     out[:, :, :3] = np.clip(bgr_graded, 0, 255).astype(np.uint8)
     return out
 
@@ -1194,16 +1233,30 @@ def _bgra_to_skia_image(bgra: np.ndarray) -> skia.Image:
     )
 
 
-def _make_colored_silhouette_skia(bgra: np.ndarray, rgb: Tuple[int, int, int]) -> skia.Image:
-    """Create a solid-colored silhouette image using the exact feathered alpha matte of `bgra`
+def _make_colored_silhouette_skia(
+    bgra: np.ndarray,
+    rgb: Tuple[int, int, int],
+    side: str = "full",
+) -> skia.Image:
+    """Create a solid-colored silhouette image using the feathered alpha matte of `bgra`
     for physically-grounded studio rim-light halos behind hair/shoulders.
+
+    `side` controls directional masking ('full', 'right', 'left') so warm right-rim and
+    cool left-rim lights never overlap into a chalky white wash across the shoulders.
     """
     h, w = bgra.shape[:2]
     sil = np.zeros((h, w, 4), dtype=np.uint8)
     sil[:, :, 0] = rgb[2]  # B
     sil[:, :, 1] = rgb[1]  # G
     sil[:, :, 2] = rgb[0]  # R
-    sil[:, :, 3] = bgra[:, :, 3]
+    alpha = bgra[:, :, 3].astype(np.float32)
+    if side == "right" and w > 1:
+        x_norm = np.linspace(0.0, 1.0, w, dtype=np.float32)[np.newaxis, :]
+        alpha = alpha * _smoothstep(0.38, 0.74, x_norm)
+    elif side == "left" and w > 1:
+        x_norm = np.linspace(0.0, 1.0, w, dtype=np.float32)[np.newaxis, :]
+        alpha = alpha * (1.0 - _smoothstep(0.26, 0.62, x_norm))
+    sil[:, :, 3] = np.clip(alpha, 0.0, 255.0).astype(np.uint8)
     return _bgra_to_skia_image(sil)
 
 
@@ -1711,27 +1764,36 @@ def _select_hero_roles(
         key=lambda x: x["drama_score"] + (95.0 if x["idx"] == 0 and x["drama_score"] >= 45.0 else 0.0),
     )
 
-    # Variant B Cutout Subject: cleanest prominent u2netp foreground silhouette, strongly preferring
-    # the primary iconic figure/portrait (idx=0) over secondary inanimate objects when it cuts cleanly.
-    cutout_candidates = [x for x in analyzed if x["cutout_bgra"] is not None]
-    if cutout_candidates:
-        best_b_subj = max(
-            cutout_candidates,
-            key=lambda x: x["cutout_score"] + (85.0 if x["idx"] == 0 and x["cutout_score"] > 0 else 0.0),
-        )
+    # Variant B Cutout Subject: ALWAYS select a DIFFERENT hero from thumb_A whenever >=2 assets exist
+    # (preferring photo_thumb_hero_2 / 2nd distinct photo with clean u2netp cutout so thumb_B NEVER duplicates thumb_A!).
+    distinct_from_a = [x for x in analyzed if x["idx"] != best_a["idx"]]
+    if distinct_from_a:
+        distinct_cutouts = [x for x in distinct_from_a if x["cutout_bgra"] is not None and x["cutout_score"] > 0]
+        if distinct_cutouts:
+            best_b_subj = max(
+                distinct_cutouts,
+                key=lambda x: x["cutout_score"]
+                + (35.0 if "thumb_hero_2" in str(x["path"].name).lower() or x["idx"] == 1 else 0.0),
+            )
+        else:
+            any_distinct_cutouts = [x for x in distinct_from_a if x["cutout_bgra"] is not None]
+            if any_distinct_cutouts:
+                best_b_subj = max(any_distinct_cutouts, key=lambda x: x["drama_score"])
+            else:
+                best_b_subj = max(distinct_from_a, key=lambda x: x["drama_score"])
     else:
         best_b_subj = best_a
 
     # Variant B Atmospheric Defocused Backdrop: prefer a distinct environment scene if available
     distinct_for_b_bg = [x for x in analyzed if x["idx"] != best_b_subj["idx"]]
-    best_b_bg = max(distinct_for_b_bg, key=lambda x: x["drama_score"]) if distinct_for_b_bg else best_a
+    non_a_b_bg = [x for x in distinct_for_b_bg if x["idx"] != best_a["idx"]]
+    best_b_bg = max(non_a_b_bg or distinct_for_b_bg, key=lambda x: x["drama_score"]) if distinct_for_b_bg else best_a
 
-    # Variant C (Intense 1.32x Close-Up Chiaroscuro): prefer a distinct dramatic scene if available and sharp,
-    # otherwise use best_a zoomed dramatically into its focal eyes/detail!
-    distinct_for_c = [x for x in analyzed if x["idx"] != best_a["idx"] and x["drama_score"] >= best_a["drama_score"] * 0.65]
+    # Variant C (Intense 1.32x Close-Up Chiaroscuro): prefer a distinct dramatic scene different from BOTH A and B
+    # when 3+ assets exist, otherwise distinct from A, falling back to A zoomed into focal detail.
+    distinct_for_c = [x for x in analyzed if x["idx"] != best_a["idx"] and x["drama_score"] >= best_a["drama_score"] * 0.55]
     if distinct_for_c:
-        # Prefer the atmospheric setting or 3rd distinct shot for genuine A/B/C visual diversity
-        unused_c = [x for x in distinct_for_c if x["idx"] != best_b_bg["idx"]]
+        unused_c = [x for x in distinct_for_c if x["idx"] != best_b_subj["idx"]]
         best_c = max(unused_c or distinct_for_c, key=lambda x: x["drama_score"])
     else:
         best_c = best_a
@@ -1979,45 +2041,58 @@ def generate_ab_thumbnails_16x9(
     sy = (H - target_h + 10.0) if cut_meta.get("touches_bottom") else max(28.0, (H - target_h) * 0.68)
     dst_rect = skia.Rect.MakeXYWH(sx, sy, target_w, target_h)
 
-    # Multi-layered soft feathered rim-light halo BEHIND the shoulders/head
-    sil_outer = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_outer_rgb"])
-    sil_warm = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_warm_rgb"])
-    sil_cold = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_cold_rgb"])
+    # Physically separated directional rim-light contours BEHIND shoulders/head (ZERO chalky white halo!)
+    # Warm right-side rim & cool left-side rim are masked to opposite sides so they never additively clip white.
+    sil_outer = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_outer_rgb"], side="right")
+    sil_warm = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_warm_rgb"], side="right")
+    sil_cold = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_cold_rgb"], side="left")
+    sil_shadow = _make_colored_silhouette_skia(relit_bgra, (4, 6, 10), side="full")
 
-    # Outer volumetric crimson/amber aura
+    # Restrained outer atmospheric crimson/amber backlight on right contour
     rim_outer_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
-    rim_outer_p.setAlphaf(0.72)
-    rim_outer_p.setImageFilter(skia.ImageFilters.Blur(44.0, 44.0))
+    rim_outer_p.setAlphaf(0.36)
+    rim_outer_p.setImageFilter(skia.ImageFilters.Blur(24.0, 24.0))
     cb.drawImageRect(
         sil_outer,
-        skia.Rect.MakeXYWH(sx + 10.0, sy - 6.0, target_w, target_h),
+        skia.Rect.MakeXYWH(sx + 6.0, sy - 4.0, target_w, target_h),
         skia.SamplingOptions(skia.FilterMode.kLinear),
         rim_outer_p,
     )
 
-    # Sculpted warm rim-light halo kissing right contour of hair/shoulders
+    # Sculpted tight warm rim-light kissing ONLY the right contour of hair/shoulders
     rim_warm_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
-    rim_warm_p.setAlphaf(0.78)
-    rim_warm_p.setImageFilter(skia.ImageFilters.Blur(14.0, 14.0))
+    rim_warm_p.setAlphaf(0.42)
+    rim_warm_p.setImageFilter(skia.ImageFilters.Blur(6.0, 6.0))
     cb.drawImageRect(
         sil_warm,
-        skia.Rect.MakeXYWH(sx + 8.0, sy - 3.0, target_w, target_h),
+        skia.Rect.MakeXYWH(sx + 4.5, sy - 1.5, target_w, target_h),
         skia.SamplingOptions(skia.FilterMode.kLinear),
         rim_warm_p,
     )
 
-    # Subtle cold-teal studio rim kiss on left edge of subject
+    # Subtle restrained cold-teal rim kiss ONLY on the left edge of subject
     rim_cold_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
-    rim_cold_p.setAlphaf(0.42)
-    rim_cold_p.setImageFilter(skia.ImageFilters.Blur(12.0, 12.0))
+    rim_cold_p.setAlphaf(0.22)
+    rim_cold_p.setImageFilter(skia.ImageFilters.Blur(5.0, 5.0))
     cb.drawImageRect(
         sil_cold,
-        skia.Rect.MakeXYWH(sx - 7.0, sy - 2.0, target_w, target_h),
+        skia.Rect.MakeXYWH(sx - 3.5, sy - 1.0, target_w, target_h),
         skia.SamplingOptions(skia.FilterMode.kLinear),
         rim_cold_p,
     )
 
-    # Grounding dark shadow behind subject + crisp feathered subject on top
+    # Subtle dark grounding shadow directly behind cutout eliminates any pale cutout fringe
+    ground_p = skia.Paint(AntiAlias=True)
+    ground_p.setAlphaf(0.55)
+    ground_p.setImageFilter(skia.ImageFilters.Blur(10.0, 10.0))
+    cb.drawImageRect(
+        sil_shadow,
+        skia.Rect.MakeXYWH(sx - 2.0, sy + 5.0, target_w, target_h),
+        skia.SamplingOptions(skia.FilterMode.kLinear),
+        ground_p,
+    )
+
+    # Crisp feathered subject on top
     subj_img = _bgra_to_skia_image(relit_bgra)
     cb.drawImageRect(subj_img, dst_rect, skia.SamplingOptions(skia.FilterMode.kLinear))
 

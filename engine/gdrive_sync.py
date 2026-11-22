@@ -35,7 +35,7 @@ import subprocess
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from database import get_settings
 
@@ -49,6 +49,10 @@ DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 # Files/folders to upload for each completed project
 UPLOAD_TOP_FILES = (
     "master.mp4",
+    "master_tiktok.mp4",
+    "master_reels.mp4",
+    "master_shorts.mp4",
+    "capcut_project.zip",
     "thumb_A_mystery.jpg",
     "thumb_B_contrast.jpg",
     "thumb_C_zoom.jpg",
@@ -60,7 +64,8 @@ UPLOAD_TOP_FILES = (
 )
 UPLOAD_SUBDIRS = ("shorts_cascade", "dubbed")
 
-# Heavy local files safe to prune ONLY after confirmed Drive upload (keeps preview + thumbs for UI)
+# Heavy local files safe to prune ONLY after confirmed Drive upload of that exact filename
+# (always preserves lightweight preview_540p.mp4 + thumbnails + words.json + quality_report.json)
 PRUNABLE_HEAVY_FILES = (
     "master_tiktok.mp4",
     "master_reels.mp4",
@@ -221,18 +226,21 @@ def _upload_via_rclone(
 
     uploaded = 0
     total_bytes = 0
+    uploaded_files: List[str] = []
     for src, rel in files:
         rel_dir = str(Path(rel).parent).replace("\\", "/")
         dest_dir = remote_base if rel_dir in ("", ".") else f"{remote_base}/{rel_dir}"
-        subprocess.run(
+        proc = subprocess.run(
             [rclone_bin, "copy", str(src), dest_dir, "--transfers", "2", "--retries", "3"],
             check=True,
             capture_output=True,
             text=True,
             timeout=600,
         )
-        uploaded += 1
-        total_bytes += src.stat().st_size
+        if proc.returncode == 0:
+            uploaded += 1
+            total_bytes += src.stat().st_size
+            uploaded_files.append(rel)
 
     # Try fetching shareable folder link (non-fatal if Drive permissions restrict)
     drive_url = ""
@@ -255,6 +263,7 @@ def _upload_via_rclone(
         "folder_name": folder_name,
         "drive_url": drive_url,
         "files_uploaded": uploaded,
+        "uploaded_files": uploaded_files,
         "total_mb": round(total_bytes / (1024 * 1024), 2),
     }
 
@@ -297,6 +306,7 @@ def _upload_via_google_api(
 
     uploaded = 0
     total_bytes = 0
+    uploaded_files: List[str] = []
     for src, rel in files:
         parent_rel = str(Path(rel).parent).replace("\\", "/")
         if parent_rel not in sub_cache:
@@ -307,13 +317,15 @@ def _upload_via_google_api(
         target_parent = sub_cache[parent_rel]
 
         media = MediaFileUpload(str(src), resumable=True, chunksize=8 * 1024 * 1024)
-        service.files().create(
+        created_file = service.files().create(
             body={"name": src.name, "parents": [target_parent]},
             media_body=media,
             fields="id",
         ).execute()
-        uploaded += 1
-        total_bytes += src.stat().st_size
+        if isinstance(created_file, dict) and created_file.get("id"):
+            uploaded += 1
+            total_bytes += src.stat().st_size
+            uploaded_files.append(rel)
 
     return {
         "backend": "google_api",
@@ -322,6 +334,7 @@ def _upload_via_google_api(
         "folder_id": proj_id,
         "drive_url": f"https://drive.google.com/drive/folders/{proj_id}",
         "files_uploaded": uploaded,
+        "uploaded_files": uploaded_files,
         "total_mb": round(total_bytes / (1024 * 1024), 2),
     }
 
@@ -336,12 +349,16 @@ def _upload_via_mounted_folder(
     dest_root.mkdir(parents=True, exist_ok=True)
     uploaded = 0
     total_bytes = 0
+    uploaded_files: List[str] = []
     for src, rel in files:
         target = dest_root / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, target)
-        uploaded += 1
-        total_bytes += src.stat().st_size
+        src_size = src.stat().st_size
+        if target.exists() and target.stat().st_size == src_size:
+            uploaded += 1
+            total_bytes += src_size
+            uploaded_files.append(rel)
 
     return {
         "backend": "mounted_folder",
@@ -349,17 +366,41 @@ def _upload_via_mounted_folder(
         "folder_name": folder_name,
         "drive_url": "",
         "files_uploaded": uploaded,
+        "uploaded_files": uploaded_files,
         "total_mb": round(total_bytes / (1024 * 1024), 2),
     }
 
 
-def prune_local_heavy_files(job_dir: Path, *, remove_master: bool = False) -> Dict[str, Any]:
-    """Free local Acer Aspire 5 disk space after verified backup, keeping preview_540p + thumbnails."""
+def prune_local_heavy_files(
+    job_dir: Path,
+    *,
+    remove_master: bool = False,
+    uploaded_files: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    """Free local Acer Aspire 5 disk space ONLY for files confirmed uploaded to Google Drive.
+
+    NEVER deletes any deliverable file unless its exact filename is present in `uploaded_files`
+    (verified remote upload success). Preserves preview_540p.mp4, thumbnails, cover, and metadata.
+    """
+    confirmed: Set[str] = {
+        str(item).replace("\\", "/").lstrip("./")
+        for item in (uploaded_files or ())
+        if str(item).strip()
+    }
     freed_bytes = 0
     removed: List[str] = []
+    pruned_files: List[str] = []
 
+    if not confirmed:
+        return {
+            "freed_mb": 0.0,
+            "removed": [],
+            "pruned_files": [],
+        }
+
+    # Only delete scratch _work/ after master.mp4 itself is confirmed backed up on Drive
     work_dir = job_dir / "_work"
-    if work_dir.exists() and work_dir.is_dir():
+    if "master.mp4" in confirmed and work_dir.exists() and work_dir.is_dir():
         for f in work_dir.rglob("*"):
             if f.is_file():
                 try:
@@ -372,18 +413,23 @@ def prune_local_heavy_files(job_dir: Path, *, remove_master: bool = False) -> Di
     for fname in PRUNABLE_HEAVY_FILES:
         if fname == "master.mp4" and not remove_master:
             continue
+        if fname not in confirmed:
+            # Strict safety guard: never delete a file that was not confirmed uploaded!
+            continue
         p = job_dir / fname
         if p.exists() and p.is_file():
             try:
                 freed_bytes += p.stat().st_size
                 p.unlink(missing_ok=True)
                 removed.append(fname)
+                pruned_files.append(fname)
             except Exception:
                 pass
 
     return {
         "freed_mb": round(freed_bytes / (1024 * 1024), 2),
         "removed": removed,
+        "pruned_files": pruned_files,
     }
 
 
@@ -409,6 +455,8 @@ def upload_job_to_gdrive(
             "folder_name": folder_name,
             "detail": status["detail"],
             "setup_command": "./setup_gdrive.sh",
+            "uploaded_files": [],
+            "pruned_files": [],
         }
 
     files = _collect_project_files(job_dir)
@@ -417,6 +465,8 @@ def upload_job_to_gdrive(
             "status": "empty",
             "folder_name": folder_name,
             "detail": "Nenhum arquivo final encontrado para upload.",
+            "uploaded_files": [],
+            "pruned_files": [],
         }
 
     try:
@@ -431,17 +481,26 @@ def upload_job_to_gdrive(
             "status": "error",
             "folder_name": folder_name,
             "detail": f"Erro ao enviar para o Google Drive: {str(exc)[:220]}",
+            "uploaded_files": [],
+            "pruned_files": [],
         }
 
+    uploaded_files: List[str] = list(res.get("uploaded_files") or [])
     should_prune = status["prune_local"] if prune_after_upload is None else bool(prune_after_upload)
-    prune_info: Dict[str, Any] = {"freed_mb": 0.0, "removed": []}
-    if should_prune and res.get("files_uploaded", 0) > 0:
-        prune_info = prune_local_heavy_files(job_dir, remove_master=True)
+    prune_info: Dict[str, Any] = {"freed_mb": 0.0, "removed": [], "pruned_files": []}
+    if should_prune and uploaded_files and res.get("files_uploaded", 0) > 0:
+        prune_info = prune_local_heavy_files(
+            job_dir,
+            remove_master=True,
+            uploaded_files=uploaded_files,
+        )
 
     return {
         "status": "uploaded",
         **res,
-        "pruned_local": should_prune,
+        "uploaded_files": uploaded_files,
+        "pruned_local": bool(should_prune and prune_info["removed"]),
         "freed_mb": prune_info["freed_mb"],
         "removed_local": prune_info["removed"],
+        "pruned_files": prune_info["pruned_files"],
     }

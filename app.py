@@ -19,7 +19,7 @@ import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -868,6 +868,7 @@ async def api_bootstrap_data(request: Request):
     is_local = is_direct_local_request(request)
     auth_user = extract_authenticated_user(request, raw_settings)
     tailscale = probe_tailscale_status()
+    gdrive_status = await asyncio.to_thread(probe_gdrive_status)
     return {
         "settings": sanitize_settings_for_client(raw_settings),
         "auth_status": {
@@ -879,7 +880,7 @@ async def api_bootstrap_data(request: Request):
             "username": auth_user or (raw_settings.get("auth_username") or "frimerise"),
         },
         "tailscale": tailscale,
-        "gdrive": probe_gdrive_status(),
+        "gdrive": gdrive_status,
         "presets": list_presets(),
         "clients": list_clients(),
         "skills": list_skills(),
@@ -1373,6 +1374,11 @@ async def api_resume_job(job_id: str):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
+    if job.get("status") in ("running", "queued"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job '{job_id}' já está em estado '{job.get('status')}' e não pode ser retomado em duplicidade.",
+        )
     if job.get("status") == "completed":
         return {"status": "already_completed", "job_id": job_id}
     try:
@@ -1405,7 +1411,17 @@ async def api_resume_job(job_id: str):
 
 @app.get("/api/gdrive/status")
 async def api_gdrive_status():
-    return probe_gdrive_status()
+    return await asyncio.to_thread(probe_gdrive_status)
+
+
+_PRUNED_FILE_TO_DB_COLS: Dict[str, Tuple[str, ...]] = {
+    "master.mp4": ("master_path", "hook_a_path"),
+    "master_tiktok.mp4": ("tiktok_path",),
+    "master_reels.mp4": ("reels_path",),
+    "master_shorts.mp4": ("shorts_path",),
+    "capcut_project.zip": ("capcut_zip_path",),
+    "master_hook_b.mp4": ("hook_b_path",),
+}
 
 
 @app.post("/api/jobs/{job_id}/gdrive-upload")
@@ -1424,9 +1440,38 @@ async def api_job_gdrive_upload(job_id: str, prune_local: Optional[bool] = None)
         prune_after_upload=prune_local,
     )
     if res.get("status") == "uploaded":
+        pruned_files = list(res.get("pruned_files") or [])
+        db_updates: Dict[str, Any] = {}
+        for fname in pruned_files:
+            for col in _PRUNED_FILE_TO_DB_COLS.get(str(fname), ()):
+                if col == "hook_a_path":
+                    cur_val = str(job.get(col) or "")
+                    if cur_val and (
+                        cur_val.endswith(f"/{fname}")
+                        or cur_val == fname
+                        or not (BASE_DIR / cur_val).exists()
+                    ):
+                        db_updates[col] = ""
+                else:
+                    db_updates[col] = ""
+        if db_updates:
+            update_job(job_id, **db_updates)
+        res["db_cleared_fields"] = sorted(db_updates.keys())
+
+        qr_path = job_dir / "quality_report.json"
+        try:
+            qr = json.loads(qr_path.read_text(encoding="utf-8")) if qr_path.exists() else {}
+            if not isinstance(qr, dict):
+                qr = {}
+            qr["gdrive_backup"] = dict(res)
+            qr_path.write_text(json.dumps(qr, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
         append_job_log(
             job_id,
-            f"☁️ Enviado manualmente ao Google Drive: {res.get('remote_path')} ({res.get('files_uploaded')} arquivos, {res.get('total_mb')} MB)",
+            f"☁️ Enviado manualmente ao Google Drive: {res.get('remote_path')} ({res.get('files_uploaded')} arquivos, {res.get('total_mb')} MB)"
+            + (f" | Liberados {res.get('freed_mb')} MB no SSD!" if res.get("pruned_local") else ""),
         )
     return res
 

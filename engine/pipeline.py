@@ -713,6 +713,171 @@ def _rel_output(path: Path) -> str:
         return str(path)
 
 
+def _trim_directives_word_boundary(text: str, max_chars: int = 600) -> str:
+    """Trim custom creative directives cleanly on a word boundary up to `max_chars` (never mid-word)."""
+    clean = " ".join(str(text or "").strip().split())
+    if len(clean) <= max_chars:
+        return clean
+    clipped = clean[:max_chars]
+    if clean[max_chars : max_chars + 1] and not clean[max_chars].isspace():
+        last_sp = clipped.rfind(" ")
+        if last_sp >= max_chars // 2:
+            clipped = clipped[:last_sp]
+    return clipped.rstrip(" ,;:-—")
+
+
+def _filter_doc_scenes_by_visual_libraries(
+    scenes: List[Dict[str, Any]],
+    explicit_libs: List[str],
+) -> None:
+    """Filter documentary scene `visual_mode`s to strictly respect enabled `explicit_libs`.
+
+    Covers `cinema_multishot` and guarantees disabled modes are ONLY remapped to modes whose
+    backing visual library is enabled.
+    """
+    if not explicit_libs or not scenes:
+        return
+
+    allow_broll = ("real_broll" in explicit_libs) or ("bespoke_ai" in explicit_libs)
+    allow_pip = "video_over_video" in explicit_libs
+    allow_25d = "photos_25d" in explicit_libs
+    allow_skia = "skia_graphics" in explicit_libs
+
+    pip_modes = ("broll_video_pip", "video_pip_evidence")
+    skia_modes = ("newspaper_highlighter", "dark_map_route", "red_string_board", "sliding_timeline")
+
+    enabled_fallbacks: List[str] = []
+    if allow_broll:
+        enabled_fallbacks.append("cinema_multishot")
+    if allow_25d:
+        enabled_fallbacks.append("parallax_25d_photo")
+    if allow_pip:
+        enabled_fallbacks.extend(pip_modes)
+    if allow_skia:
+        enabled_fallbacks.extend(skia_modes)
+
+    if not enabled_fallbacks:
+        return
+
+    def _is_mode_enabled(mode: str) -> bool:
+        if mode == "cinema_multishot":
+            return allow_broll
+        if mode in pip_modes:
+            return allow_pip
+        if mode == "parallax_25d_photo":
+            return allow_25d
+        if mode in skia_modes:
+            return allow_skia
+        return False
+
+    for idx, sc_d in enumerate(scenes):
+        if not isinstance(sc_d, dict):
+            continue
+        vm = str(sc_d.get("visual_mode") or "")
+        if _is_mode_enabled(vm):
+            continue
+        sc_d["visual_mode"] = enabled_fallbacks[idx % len(enabled_fallbacks)]
+
+
+def _is_valid_skia_photo(path: Path) -> Tuple[bool, int, int]:
+    """Verify a candidate still exists, is non-trivial, and decodes cleanly in Skia."""
+    try:
+        if not path.exists() or not path.is_file() or path.stat().st_size < 512:
+            return False, 0, 0
+        img = skia.Image.open(str(path))
+        if img is None:
+            return False, 0, 0
+        w, h = int(img.width()), int(img.height())
+        if w < 100 or h < 100:
+            return False, 0, 0
+        return True, w, h
+    except Exception:
+        return False, 0, 0
+
+
+def _select_clean_cover_bg_photo(work_dir: Path, aspect_ratio: str = "9:16") -> Optional[Path]:
+    """Select the cleanest raw hero still from `_work/` (ZERO burned-in captions/lower-third/bars).
+
+    Priority:
+      1. `_work/flow_sc00_shot00.jpg`
+      2. Valid `_work/flow_*.jpg` (preferring portrait stills for 9:16)
+      3. Valid `_work/photo_*.jpg` (preferring scene stills & portrait orientation for 9:16)
+    Returns `None` only if no valid raw photo exists in `_work/`.
+    """
+    if not work_dir or not work_dir.exists():
+        return None
+
+    want_portrait = str(aspect_ratio or "9:16").strip() in ("9:16", "4:5")
+
+    primary = work_dir / "flow_sc00_shot00.jpg"
+    ok, _, _ = _is_valid_skia_photo(primary)
+    if ok:
+        return primary
+
+    def _pick_from(paths: List[Path]) -> Optional[Path]:
+        first_valid: Optional[Path] = None
+        for cand in paths:
+            valid, cw, ch = _is_valid_skia_photo(cand)
+            if not valid:
+                continue
+            if first_valid is None:
+                first_valid = cand
+            if not want_portrait or ch >= cw:
+                return cand
+        return first_valid
+
+    flow_cands = sorted(work_dir.glob("flow_*.jpg")) + sorted(work_dir.glob("flow_*.png"))
+    picked_flow = _pick_from(flow_cands)
+    if picked_flow is not None:
+        return picked_flow
+
+    photo_all = sorted(work_dir.glob("photo_*.jpg")) + sorted(work_dir.glob("photo_*.png"))
+    photo_cands = sorted(photo_all, key=lambda p: (0 if p.name.startswith("photo_sc") else 1, p.name))
+    return _pick_from(photo_cands)
+
+
+async def _maybe_auto_upload_job_to_gdrive(
+    settings: Dict[str, Any],
+    job_id: str,
+    job_dir: Path,
+    title: str,
+    quality_report: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run optional automatic Google Drive backup strictly AFTER words.json & quality_report.json exist."""
+    gdrive_backup: Dict[str, Any] = {"status": "skipped", "uploaded_files": [], "pruned_files": []}
+    if settings.get("gdrive_auto_upload", "1") == "1":
+        append_job_log(
+            job_id,
+            "☁️ Verificando backup automático em pasta nomeada no Google Drive...",
+            progress=98,
+            stage="Sincronizando Google Drive",
+        )
+        try:
+            gdrive_backup = await asyncio.to_thread(upload_job_to_gdrive, job_dir, title, job_id)
+        except Exception as exc:
+            gdrive_backup = {
+                "status": "error",
+                "detail": f"Falha no backup automático: {str(exc)[:200]}",
+                "uploaded_files": [],
+                "pruned_files": [],
+            }
+        if gdrive_backup.get("status") == "uploaded":
+            append_job_log(
+                job_id,
+                f"☁️ Backup salvo no Google Drive: {gdrive_backup.get('remote_path')} ({gdrive_backup.get('files_uploaded')} arquivos, {gdrive_backup.get('total_mb')} MB)"
+                + (f" | Liberados {gdrive_backup.get('freed_mb')} MB no SSD!" if gdrive_backup.get("pruned_local") else ""),
+            )
+    quality_report["gdrive_backup"] = gdrive_backup
+    try:
+        (job_dir / "quality_report.json").write_text(
+            json.dumps(quality_report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    return gdrive_backup
+
+
 def _call_generate_ab_thumbnails(
     master_mp4: Path,
     title: str,
@@ -987,7 +1152,8 @@ async def run_video_job(
                     progress=15,
                     stage="Roteirizando Diálogos Multi-Personagens",
                 )
-                eff_cartoon_topic = f"{topic} ({custom_directives[:120]})" if custom_directives else topic
+                safe_cartoon_directives = _trim_directives_word_boundary(custom_directives, max_chars=600)
+                eff_cartoon_topic = f"{topic} ({safe_cartoon_directives})" if safe_cartoon_directives else topic
                 plan, llm_meta = await asyncio.to_thread(
                     generate_cartoon_episode_plan,
                     topic=eff_cartoon_topic,
@@ -1158,9 +1324,12 @@ async def run_video_job(
                 "ab_thumbnails": ab_thumbs,
                 "dubbed_languages": dubbed_langs,
                 "shorts_cascade": [],
+                "gdrive_backup": {"status": "pending" if settings.get("gdrive_auto_upload", "1") == "1" else "skipped"},
                 "dna_detected": {k: v for k, v in (detected_dna or {}).items() if k not in ("scenes", "segments")},
             }
             (job_dir / "quality_report.json").write_text(json.dumps(quality_report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            await _maybe_auto_upload_job_to_gdrive(settings, job_id, job_dir, ep_title, quality_report)
 
             now_done = datetime.now().isoformat(timespec="seconds")
             update_job(
@@ -1168,15 +1337,15 @@ async def run_video_job(
                 status="completed",
                 progress=100,
                 stage="Animação 2D Concluída • Pronta para Entrega",
-                master_path=_rel_output(master_mp4),
-                hook_a_path=_rel_output(master_mp4),
+                master_path=_rel_output(master_mp4) if master_mp4.exists() else _rel_output(preview_mp4),
+                hook_a_path=_rel_output(master_mp4) if master_mp4.exists() else _rel_output(preview_mp4),
                 hook_b_path="",
-                tiktok_path=_rel_output(Path(sh_variants["tiktok"]["path"])),
-                reels_path=_rel_output(Path(sh_variants["reels"]["path"])),
-                shorts_path=_rel_output(Path(sh_variants["shorts"]["path"])),
+                tiktok_path=_rel_output(Path(sh_variants["tiktok"]["path"])) if Path(sh_variants["tiktok"]["path"]).exists() else "",
+                reels_path=_rel_output(Path(sh_variants["reels"]["path"])) if Path(sh_variants["reels"]["path"]).exists() else "",
+                shorts_path=_rel_output(Path(sh_variants["shorts"]["path"])) if Path(sh_variants["shorts"]["path"]).exists() else "",
                 preview_path=_rel_output(preview_mp4),
-                capcut_zip_path=_rel_output(capcut_zip),
-                otio_path=_rel_output(otio_path),
+                capcut_zip_path=_rel_output(capcut_zip) if capcut_zip.exists() else "",
+                otio_path=_rel_output(otio_path) if otio_path.exists() else "",
                 cover_path=_rel_output(cover_png),
                 duration_s=round(duration_s, 2),
                 completed_at=now_done,
@@ -1242,13 +1411,22 @@ async def run_video_job(
                     progress=14,
                     stage="Estruturando Cold Open & Capítulos Netflix Doc",
                 )
-                eff_doc_topic = f"{topic} — {custom_directives[:140]}" if custom_directives else topic
-                maybe_plan = generate_netflix_doc_plan(
-                    topic=eff_doc_topic,
-                    aspect_ratio=studio_ar,
-                    target_minutes=doc_target_minutes,
-                    lang=doc_lang,
-                )
+                safe_directives = _trim_directives_word_boundary(custom_directives, max_chars=600)
+                plan_kwargs: Dict[str, Any] = {
+                    "topic": topic,
+                    "aspect_ratio": studio_ar,
+                    "target_minutes": doc_target_minutes,
+                    "lang": doc_lang,
+                }
+                plan_sig = inspect.signature(generate_netflix_doc_plan)
+                has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in plan_sig.parameters.values())
+                if "custom_directives" in plan_sig.parameters or has_varkw:
+                    plan_kwargs["custom_directives"] = safe_directives
+                elif safe_directives:
+                    plan_kwargs["topic"] = f"{topic} — {safe_directives}"
+                if "caption_style" in plan_sig.parameters or has_varkw:
+                    plan_kwargs["caption_style"] = caption_style
+                maybe_plan = generate_netflix_doc_plan(**plan_kwargs)
                 if inspect.isawaitable(maybe_plan):
                     doc_plan = await maybe_plan
                 else:
@@ -1262,27 +1440,14 @@ async def run_video_job(
                 if eff_voice_id:
                     doc_plan["voice_id"] = eff_voice_id
                 doc_plan["caption_style"] = caption_style
-                if custom_directives:
-                    doc_plan["custom_directives"] = custom_directives
+                if safe_directives:
+                    doc_plan["custom_directives"] = safe_directives
 
                 if explicit_libs and isinstance(doc_plan.get("scenes"), list):
-                    allow_pip = "video_over_video" in explicit_libs
-                    allow_25d = "photos_25d" in explicit_libs
-                    allow_skia = "skia_graphics" in explicit_libs
-                    for sc_d in doc_plan["scenes"]:
-                        vm = str(sc_d.get("visual_mode") or "")
-                        if not allow_pip and vm in ("broll_video_pip", "video_pip_evidence"):
-                            sc_d["visual_mode"] = "parallax_25d_photo" if allow_25d else "newspaper_highlighter"
-                        elif not allow_25d and vm == "parallax_25d_photo":
-                            sc_d["visual_mode"] = "broll_video_pip" if allow_pip else "sliding_timeline"
-                        elif not allow_skia and vm in ("newspaper_highlighter", "dark_map_route", "red_string_board", "sliding_timeline"):
-                            sc_d["visual_mode"] = "broll_video_pip" if allow_pip else "parallax_25d_photo"
+                    _filter_doc_scenes_by_visual_libraries(doc_plan["scenes"], explicit_libs)
 
-                if audit_netflix_doc_plan is not None:
-                    try:
-                        doc_plan = audit_netflix_doc_plan(doc_plan)
-                    except Exception:
-                        pass
+                # Preserve doc_plan["retention_audit"] already computed inside generate_netflix_doc_plan()
+                # (do NOT run a redundant 2nd audit_netflix_doc_plan call that zeroes open_loops_injected).
 
                 update_job(
                     job_id,
@@ -1372,24 +1537,32 @@ async def run_video_job(
                     otio_path,
                 )
 
-            frame_snap = work_dir / "cover_bg.png"
-            try:
-                await asyncio.to_thread(
-                    run_ffmpeg_safe,
-                    ["ffmpeg", "-y", "-v", "error", "-ss", f"{min(2.5, duration_s * 0.25):.2f}", "-i", str(master_mp4), "-frames:v", "1", str(frame_snap)],
-                    thermal_limit_c=thermal_limit,
-                )
-            except Exception:
-                frame_snap = Path("")
+            # Prefer clean raw hero photo from _work/ (zero burned-in captions/lower-third/progress bar);
+            # fall back to master.mp4 frame ONLY if no raw hero photo exists.
+            cover_bg_path = _select_clean_cover_bg_photo(work_dir, aspect_ratio=aspect_ratio)
+            if cover_bg_path is None:
+                frame_snap = work_dir / "cover_bg.png"
+                try:
+                    await asyncio.to_thread(
+                        run_ffmpeg_safe,
+                        ["ffmpeg", "-y", "-v", "error", "-ss", f"{min(2.5, duration_s * 0.25):.2f}", "-i", str(master_mp4), "-frames:v", "1", str(frame_snap)],
+                        thermal_limit_c=thermal_limit,
+                    )
+                    if frame_snap.exists() and frame_snap.stat().st_size > 0:
+                        cover_bg_path = frame_snap
+                except Exception:
+                    cover_bg_path = None
 
             cover_png = job_dir / "cover_9x16.png"
+            doc_mood = str(doc_plan.get("mood") or "dark_horror")
             await asyncio.to_thread(
                 render_cover_9x16,
                 doc_title,
                 "",
                 preset,
                 cover_png,
-                frame_snap if frame_snap.exists() else None,
+                cover_bg_path,
+                mood=doc_mood,
             )
 
             # 3 Magnetic 1280x720 A/B/C Thumbnails with custom 3-word hook
@@ -1437,18 +1610,6 @@ async def run_video_job(
                 except Exception as exc:
                     append_job_log(job_id, f"Aviso na dublagem documental: {exc}")
 
-            # Optional automatic Google Drive backup into named project folder (saves local disk space!)
-            gdrive_backup: Dict[str, Any] = {"status": "skipped"}
-            if settings.get("gdrive_auto_upload", "1") == "1":
-                append_job_log(job_id, "☁️ Verificando backup automático em pasta nomeada no Google Drive...", progress=98, stage="Sincronizando Google Drive")
-                gdrive_backup = await asyncio.to_thread(upload_job_to_gdrive, job_dir, doc_title, job_id)
-                if gdrive_backup.get("status") == "uploaded":
-                    append_job_log(
-                        job_id,
-                        f"☁️ Backup salvo no Google Drive: {gdrive_backup.get('remote_path')} ({gdrive_backup.get('files_uploaded')} arquivos, {gdrive_backup.get('total_mb')} MB)"
-                        + (f" | Liberados {gdrive_backup.get('freed_mb')} MB no SSD!" if gdrive_backup.get("pruned_local") else ""),
-                    )
-
             (job_dir / "words.json").write_text(json.dumps(words_a, ensure_ascii=False), encoding="utf-8")
             quality_report = {
                 "job_id": job_id,
@@ -1467,11 +1628,14 @@ async def run_video_job(
                 "ab_thumbnails": ab_thumbs_doc,
                 "shorts_cascade": shorts_cascade,
                 "dubbed_languages": dubbed_langs_doc,
-                "gdrive_backup": gdrive_backup,
+                "gdrive_backup": {"status": "pending" if settings.get("gdrive_auto_upload", "1") == "1" else "skipped"},
                 "scenes_count": render_info.get("scenes_count", len(doc_plan.get("scenes", []))),
                 "duration_s": round(duration_s, 2),
             }
             (job_dir / "quality_report.json").write_text(json.dumps(quality_report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            # Optional automatic Google Drive backup strictly AFTER words.json & quality_report.json are on disk!
+            await _maybe_auto_upload_job_to_gdrive(settings, job_id, job_dir, doc_title, quality_report)
 
             now_done = datetime.now().isoformat(timespec="seconds")
             done_stage = (
@@ -2122,6 +2286,7 @@ async def run_video_job(
             "ab_thumbnails": ab_thumbs_live,
             "dubbed_languages": dubbed_langs_live,
             "shorts_cascade": [],
+            "gdrive_backup": {"status": "pending" if settings.get("gdrive_auto_upload", "1") == "1" else "skipped"},
             "scenes_count": len(quality_clips),
             "clips": quality_clips,
             "duration_s": round(duration_s, 2),
@@ -2130,21 +2295,23 @@ async def run_video_job(
             json.dumps(quality_report, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
+        await _maybe_auto_upload_job_to_gdrive(settings, job_id, job_dir, str(script.get("title", topic)), quality_report)
+
         now_done = datetime.now().isoformat(timespec="seconds")
         update_job(
             job_id,
             status="completed",
             progress=100,
             stage="Concluído • Pronto para Entrega & Publicação",
-            master_path=_rel_output(master_mp4),
-            hook_a_path=_rel_output(hook_a_mp4),
+            master_path=_rel_output(master_mp4) if master_mp4.exists() else _rel_output(preview_mp4),
+            hook_a_path=_rel_output(hook_a_mp4) if hook_a_mp4.exists() else _rel_output(preview_mp4),
             hook_b_path=_rel_output(hook_b_mp4) if hook_b_mp4 and hook_b_mp4.exists() else "",
-            tiktok_path=_rel_output(Path(sh_variants["tiktok"]["path"])),
-            reels_path=_rel_output(Path(sh_variants["reels"]["path"])),
-            shorts_path=_rel_output(Path(sh_variants["shorts"]["path"])),
+            tiktok_path=_rel_output(Path(sh_variants["tiktok"]["path"])) if Path(sh_variants["tiktok"]["path"]).exists() else "",
+            reels_path=_rel_output(Path(sh_variants["reels"]["path"])) if Path(sh_variants["reels"]["path"]).exists() else "",
+            shorts_path=_rel_output(Path(sh_variants["shorts"]["path"])) if Path(sh_variants["shorts"]["path"]).exists() else "",
             preview_path=_rel_output(preview_mp4),
-            capcut_zip_path=_rel_output(capcut_zip),
-            otio_path=_rel_output(otio_path),
+            capcut_zip_path=_rel_output(capcut_zip) if capcut_zip.exists() else "",
+            otio_path=_rel_output(otio_path) if otio_path.exists() else "",
             cover_path=_rel_output(cover_png),
             duration_s=round(duration_s, 2),
             completed_at=now_done,

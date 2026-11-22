@@ -30,6 +30,7 @@ import math
 import os
 import re
 import subprocess
+import unicodedata
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,10 @@ from engine.audio_dsp import (
     master_broadcast_audio,
     trim_silence_vad,
 )
+try:
+    from engine.audio_dsp import normalize_scene_wav_lufs
+except Exception:
+    normalize_scene_wav_lufs = None  # type: ignore
 from engine.gemini_tts import (
     GEMINI_EXPRESSIVE_VOICES,
     has_valid_gemini_key,
@@ -130,7 +135,6 @@ VISUAL_MODES: Tuple[VisualModeType, ...] = (
 )
 
 PIP_ENABLED_MODES: Tuple[VisualModeType, ...] = (
-    "cinema_multishot",
     "broll_video_pip",
     "dark_map_route",
     "video_pip_evidence",
@@ -175,7 +179,7 @@ VALID_DOC_MOODS: Tuple[str, ...] = (
     "corporate_thriller",
 )
 
-CINEMA_XFADE_DURATION_S: float = 0.35
+CINEMA_XFADE_DURATION_S: float = 0.40
 CINEMA_XFADE_POOL: Tuple[str, ...] = (
     "fadeblack",
     "smoothleft",
@@ -220,11 +224,16 @@ def _sanitize_glyphs(
     return " ".join(s.split())
 
 
+def _normalize_upper(text: str) -> str:
+    """Return clean Unicode NFC uppercase text (e.g. 'ALPES AUSTRÍacos' -> 'ALPES AUSTRÍACOS')."""
+    return unicodedata.normalize("NFC", str(text or "")).upper()
+
+
 def _spaced_chapter_label(roman: str, lang: str = "pt_br") -> str:
     """Return wide letter-spaced cinema chapter title with generous gap before the Roman numeral."""
     r_spaced = " ".join(list(roman.strip()))
-    if lang == "en_us":
-        return f"C A P Í T U L O     {r_spaced}   •   C H A P T E R     {r_spaced}"
+    if str(lang).lower().startswith("en"):
+        return f"C H A P T E R     {r_spaced}"
     return f"C A P Í T U L O     {r_spaced}"
 
 
@@ -1019,9 +1028,43 @@ _HISTORY_TOPIC_RE = re.compile(
 _FORBIDDEN_FINANCE_LEFTOVERS_RE = re.compile(
     r"\b(barings|leeson|88888|singapura|singapore|zurique|zurich|londres\s*[•\-]\s*singapura|"
     r"conta\s+secreta|holding\s+offshore|auditoria\s+forense|stock\s+market\s+trading|"
-    r"historic\s+bank\s+building\s+london|london\s+financial\s+district)\b",
+    r"historic\s+bank\s+building\s+london|london\s+financial\s+district|"
+    r"dossi[eê]\s+capital|vault\s+files)\b",
     re.IGNORECASE,
 )
+
+
+def _enforce_vertical_prompt_framing(prompt: str) -> str:
+    """Replace landscape/wide framing cues with vertical 9:16 portrait cues so Google Flow never flips to landscape."""
+    p = str(prompt or "").strip()
+    if not p:
+        return p
+    p = re.sub(
+        r"\b(?:dramatic\s+)?wide\s+establishing(?:\s+35mm)?(?:\s+cinema)?(?:\s+still)?(?:\s+shot)?\b",
+        "vertical full-bleed 9:16 35mm cinema still",
+        p,
+        flags=re.IGNORECASE,
+    )
+    p = re.sub(
+        r"\b(?:dramatic\s+)?wide[\s-]+(?:angle|shot|cinematic|establishing|view|vista)\b",
+        "intimate vertical 9:16 cinema shot",
+        p,
+        flags=re.IGNORECASE,
+    )
+    p = re.sub(r"\b(?:widescreen|panoramic|landscape|16:9)\b", "vertical 9:16", p, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", p).strip()
+
+
+def _estimate_chapter_count(n_scenes: int) -> int:
+    """Return exact number of chapter cards assigned for a documentary of `n_scenes` scenes."""
+    if n_scenes <= 1:
+        return 0
+    chapter_step = max(2, n_scenes // min(4, max(2, n_scenes // 2)))
+    count = 0
+    for idx in range(1, n_scenes):
+        if idx == 1 or (idx >= 3 and (idx - 1) % chapter_step == 0 and count < 4):
+            count += 1
+    return count
 
 _OPEN_TOPIC_FALLBACK_MEDIA: Dict[str, Dict[str, List[str]]] = {
     "dark_horror": {
@@ -1300,21 +1343,29 @@ def _ensure_topic_open_loops(
         ),
     }
     pool = bridges_by_mood.get(mood, bridges_by_mood["epic_history"])
+    # Skip artificial open-loop injection whenever the plan already has >= 2 natural '?' hooks
+    existing_q_hooks = sum(1 for sc in scenes if "?" in str(sc.narration or ""))
+    if existing_q_hooks >= 2:
+        return
+
     since_loop_s = 0.0
     b_idx = 0
     for idx, sc in enumerate(scenes):
+        if existing_q_hooks >= 2:
+            break
         txt = sc.narration.strip()
-        dur_est = max(2.2, len(txt.split()) / 2.65)
+        dur_est = max(2.2, len(txt.split()) / 2.05)
         since_loop_s += dur_est
-        if OPEN_LOOP_MARKERS_RE.search(txt):
+        if "?" in txt or OPEN_LOOP_MARKERS_RE.search(txt):
             since_loop_s = 0.0
             continue
-        # Inject an authentic mood-matched question on scene 0 or whenever >= 18s elapsed without a hook
-        # (never repeat the same bridge question twice in one video!)
-        if (idx == 0 or (idx < len(scenes) - 1 and since_loop_s >= 18.0)) and b_idx < len(pool):
+        # Inject at most up to 2 total '?' hooks, only on scene 0 or when >= 24.0s elapsed without a hook
+        if (idx == 0 or (idx < len(scenes) - 1 and since_loop_s >= 24.0)) and b_idx < len(pool):
             q = pool[b_idx]
             b_idx += 1
-            sc.narration = f"{txt.rstrip('.!?')}... {q}"
+            base_clean = txt.rstrip(".!?…—- ").strip()
+            sc.narration = f"{base_clean}. {q}" if base_clean else q
+            existing_q_hooks += 1
             since_loop_s = 0.0
 
 
@@ -1324,6 +1375,10 @@ def _call_open_topic_director_llm(
     clean_lang: str,
     mood_hint: str,
     custom_directives: str = "",
+    aspect_ratio: str = "16:9",
+    min_scene_words: int = 18,
+    max_scene_words: int = 22,
+    target_seconds: float = 60.0,
 ) -> Optional[Tuple[Dict[str, Any], str, int, float]]:
     """Call LIVE DeepSeek (`deepseek-chat`) OR Google Gemini (`gemini-flash-lite-latest` via
     `headers={"x-goog-api-key": gkey}`) with automatic failover to author a 100% original, deeply
@@ -1337,26 +1392,56 @@ def _call_open_topic_director_llm(
         return None
 
     is_en = clean_lang == "en_us"
+    is_vertical = str(aspect_ratio).strip() == "9:16"
     lang_label = "American English" if is_en else "Brazilian Portuguese (PT-BR)"
     skill_path = SKILLS_DIR / "10_netflix_investigative_doc.md"
     skill_excerpt = skill_path.read_text(encoding="utf-8")[:900] if skill_path.exists() else ""
+    if mood_hint != "corporate_thriller" and skill_excerpt:
+        skill_excerpt = re.sub(
+            r"(?:Canal\s+)?[\"']?(?:Dossi[eê]\s+Capital|Vault\s+Files)[\"']?",
+            "",
+            skill_excerpt,
+            flags=re.IGNORECASE,
+        )
+        skill_excerpt = re.sub(r"\s*—\s*\)", ")", skill_excerpt)
+        skill_excerpt = re.sub(r"[ \t]{2,}", " ", skill_excerpt)
+
+    total_min_w = min_scene_words * n_scenes
+    total_max_w = max_scene_words * n_scenes
+    if is_vertical:
+        framing_rule = (
+            "   - `bespoke_image_prompt_en`: vivid 16-26 word English VERTICAL 9:16 full-bleed dark-cinema portrait still prompt depicting THAT scene's opening historical moment, dramatic candlelight/chiaroscuro, 35mm film grain, ZERO text/words/letters. NEVER use 'wide', 'widescreen', 'panoramic', 'landscape', or 'wide establishing'!\n"
+            "   - `shot_prompts_en`: array of 4 to 5 DISTINCT chronological English VERTICAL 9:16 35mm cinema still prompts (14-24 words EACH) — ONE bespoke vertical shot for EACH phrase/beat of that scene's narration! Every single prompt MUST depict a DIFFERENT vertical camera angle/subject matching that exact moment (e.g., 'Vertical full-bleed 9:16 35mm cinema still...' -> 'Intimate vertical close-up detail...' -> 'Tall dramatic portrait silhouette...' -> 'Moody vertical low-angle atmospheric frame...'), NEVER 'wide establishing' or 'wide angle', ZERO text/words/letters, ZERO modern anachronisms!\n"
+        )
+        shot_example_json = (
+            '      "bespoke_image_prompt_en": "Vertical full-bleed 9:16 dark cinema photorealistic portrait still, chiaroscuro lighting, no text",\n'
+            '      "shot_prompts_en": ["Vertical full-bleed 9:16 35mm cinema still matching phrase 1, no text", "Intimate vertical close-up detail matching phrase 2, no text", "Tall dramatic vertical portrait matching phrase 3, no text", "Moody vertical 9:16 atmospheric still matching phrase 4, no text"],\n'
+        )
+    else:
+        framing_rule = (
+            "   - `bespoke_image_prompt_en`: vivid 16-26 word English dark-cinema photographic still prompt depicting THAT scene's opening historical moment, dramatic candlelight/chiaroscuro, 35mm film grain, ZERO text/words/letters.\n"
+            "   - `shot_prompts_en`: array of 4 to 5 DISTINCT chronological English 35mm cinema still prompts (14-24 words EACH) — ONE bespoke shot for EACH phrase/beat of that scene's narration! Every single prompt MUST depict a DIFFERENT camera angle/subject matching that exact moment of the story (e.g., wide establishing shot -> tense close-up object -> dramatic character/silhouettes -> eerie symbolic detail), ZERO text/words/letters, ZERO modern anachronisms!\n"
+        )
+        shot_example_json = (
+            '      "bespoke_image_prompt_en": "dark cinema photorealistic scene description, no text",\n'
+            '      "shot_prompts_en": ["chronological shot 1 matching phrase 1, 35mm cinema, no text", "shot 2 matching phrase 2, close-up detail, no text", "shot 3 matching phrase 3, dramatic wide angle, no text", "shot 4 matching phrase 4, moody atmospheric still, no text"],\n'
+        )
 
     sys_prompt = (
         f"You are an Emmy-winning Netflix / A24 / Nostalgia / MagnatesMedia Documentary Showrunner & Historian writing in {lang_label}.\n"
         "Create a 100% ORIGINAL, deeply researched, spine-tingling, cinematic documentary script strictly about the user's EXACT TOPIC.\n"
         "ABSOLUTE STORYTELLING & VOICE RULES:\n"
-        "1. CONTINUOUS HUMAN NARRATIVE: Write like a master human storyteller telling ONE gripping, continuous story from Cold Open to unforgettable ending — NEVER disjointed bullet points, NEVER repeating ideas across scenes, and NEVER pasting the user's raw prompt text inside narration or headlines!\n"
+        "1. CONTINUOUS HUMAN NARRATIVE & STRICT CHRONOLOGICAL PROGRESSION: Write like a master human storyteller telling ONE gripping, continuous story from Cold Open to unforgettable ending — NEVER disjointed bullet points, NEVER repeating ideas across scenes, and NEVER pasting the user's raw prompt text inside narration or headlines! Scenes MUST progress STRICTLY FORWARD in historical time from earliest era to modern day (e.g., 4th century BCE -> 4th century CE -> 11th century -> 17th century -> Modern Day). NEVER jump backwards in time across scenes, and NEVER connect two different centuries with 'Enquanto isso' / 'Meanwhile'! Verify historical geography and climate accurately.\n"
         "2. REAL HISTORICAL DEPTH: Cite real eras, real years (e.g., 1647, 4th century, 1890s), real places (Rome, Austrian Alps, Myra, London, Iceland), real historical figures/folklore/edicts, and genuine plot twists!\n"
-        "3. NATURAL SPOKEN RHYTHM FOR VOICE ACTING: Each scene narration MUST be 16-24 crisp, visceral spoken words. Write spoken Portuguese/English naturally with commas and occasional ellipses (...) so the voice actor breathes and pauses dramatically. Spell out centuries naturally (write 'século quatro' instead of 'SÉC. IV', 'antes de Cristo' instead of 'a.C.').\n"
-        "4. ZERO ROBOTIC AI CLICHÉS: NEVER write 'Em um mundo onde', 'Vamos mergulhar', 'Em conclusão', 'Por trás da imagem familiar', 'As crônicas históricas conectaram', 'In a world where', or 'Let's dive in'.\n"
-        "5. RETENTION HOOKS: Scene 0 MUST be an explosive, chilling Cold Open that grabs attention in 2 seconds and ends with a sharp open-loop question (?). Keep building curiosity with natural unanswered tension every 2-3 scenes.\n"
+        f"3. STRICT DURATION & NATURAL SPOKEN RHYTHM (~{int(round(target_seconds))}s TOTAL): Each scene narration MUST be strictly {min_scene_words}-{max_scene_words} crisp, visceral spoken words (total script ~{total_min_w}-{total_max_w} words across all {n_scenes} scenes so final video hits ~{int(round(target_seconds))}s cleanly!). Write spoken Portuguese/English naturally with commas and clean periods — NEVER em-dashes ('—'). Spell out centuries naturally using Portuguese ordinals for I-X and cardinals for XI+ (write 'século quarto' instead of 'SÉC. IV' or 'século quatro', 'século onze' instead of 'SÉC. XI', and 'antes de Cristo' instead of 'a.C.').\n"
+        "4. ZERO ROBOTIC AI CLICHÉS & ZERO OFF-TOPIC BRANDING: NEVER write 'Em um mundo onde', 'Vamos mergulhar', 'Em conclusão', 'Por trás da imagem familiar', 'As crônicas históricas conectaram', 'In a world where', or 'Let's dive in'. Invent a topic-authentic `channel_name` matching the mood (NEVER 'Dossiê Capital' or 'Vault Files' unless mood is 'corporate_thriller').\n"
+        "5. ORGANIC OPEN-LOOP TRANSITIONS WITH REAL PAYOFFS: Scene 0 MUST be an explosive, chilling Cold Open that grabs attention in 2 seconds and ends with a sharp open-loop question (?) directly answered by Scene 1. Include 1-2 natural mid-story open-loop questions (?) whose EXACT narrative payoff/answer is explicitly delivered in the opening line of the VERY NEXT scene! Never tack on generic unrelated questions.\n"
         "6. VISUAL PRECISION (ZERO OFF-TOPIC STOCK!): Every scene needs concrete, atmospheric English visual queries:\n"
         "   - `broll_query_en` and `pip_broll_query_en` (MUST differ from each other): concrete, real atmospheric stock video phrases that exist on Pixabay (e.g., 'snow pine forest night', 'burning candle dark shadow', 'medieval stone castle fog', 'gothic cathedral interior', 'crackling fireplace dark', 'winter snow village night', 'old leather book candle', 'ancient roman stone ruins'). NEVER use abstract words like 'floor', 'butterfly', 'background', 'texture', or 'darkness' alone.\n"
         "   - `photo_query_en` and `extra_photo_queries_en` (3-4 distinct concrete English museum/historical/photographic subjects matching THAT exact scene — e.g., 'Krampus Austrian folklore mask', 'Roman Saturnalia festival painting', 'Saint Nicholas Byzantine icon', 'Puritan Oliver Cromwell 17th century engraving', 'Victorian gothic winter postcard').\n"
-        "   - `bespoke_image_prompt_en`: vivid 16-26 word English dark-cinema photographic still prompt depicting THAT scene's opening historical moment, dramatic candlelight/chiaroscuro, 35mm film grain, ZERO text/words/letters.\n"
-        "   - `shot_prompts_en`: array of 4 to 5 DISTINCT chronological English 35mm cinema still prompts (14-24 words EACH) — ONE bespoke shot for EACH phrase/beat of that scene's narration! Every single prompt MUST depict a DIFFERENT camera angle/subject matching that exact moment of the story (e.g., wide establishing shot -> tense close-up object -> dramatic character/silhouettes -> eerie symbolic detail), ZERO text/words/letters, ZERO modern anachronisms!\n"
+        f"{framing_rule}"
         "   - `prefer_gemini_photo`: true for vivid historical/macabre/folklore scenes where custom AI cinema art beats generic stock.\n"
-        "7. UNIQUE PER-SCENE UI METADATA: Give every scene its OWN specific `evidence_headline` (<= 48 chars, punchy newspaper headline), `evidence_quote` (1 gripping historical fact for THAT scene), and `lower_third_title` (`LOCATION • ERA`).\n"
+        "7. UNIQUE PER-SCENE UI METADATA & CHAPTER SUBTITLE: Give EVERY scene its OWN specific `chapter_subtitle` (a crisp 2-4 word UPPERCASE thematic chapter title matching THAT EXACT scene's subject/era — e.g. 'O MONSTRO DOS ALPES' for a Krampus scene, 'O NATAL PROIBIDO' for a 1647 London Puritans scene), its OWN `evidence_headline` (<= 48 chars, punchy newspaper headline), `evidence_quote` (1 gripping historical fact for THAT scene), and `lower_third_title` (`LOCATION • ERA`, clean ALL-CAPS).\n"
         "8. Classify `mood` strictly as ONE of: \"dark_horror\", \"investigative_crime\", \"epic_history\", \"corporate_thriller\".\n"
         "Return ONLY valid JSON matching this exact schema:\n"
         "{\n"
@@ -1365,7 +1450,6 @@ def _call_open_topic_director_llm(
         '  "channel_name": "Topic-authentic cinema channel name",\n'
         '  "mood": "dark_horror | investigative_crime | epic_history | corporate_thriller",\n'
         '  "thumbnail_hook": "2-3 PUNCHY WORDS",\n'
-        '  "chapter_subtitles": ["CHAPTER 1 SUBTITLE", "CHAPTER 2 SUBTITLE", "CHAPTER 3 SUBTITLE", "CHAPTER 4 SUBTITLE"],\n'
         '  "map_origin": "REAL ORIGIN PLACE",\n'
         '  "map_destination": "REAL DESTINATION PLACE",\n'
         '  "map_metric": "DRAMATIC HISTORICAL METRIC/ERA",\n'
@@ -1379,7 +1463,8 @@ def _call_open_topic_director_llm(
         "  ],\n"
         '  "scenes": [\n'
         "    {\n"
-        '      "narration": "18-26 gripping words...",\n'
+        '      "chapter_subtitle": "2-4 WORD CHAPTER TITLE FOR THIS EXACT SCENE",\n'
+        f'      "narration": "{min_scene_words}-{max_scene_words} gripping spoken words (no em-dashes)...",\n'
         '      "lower_third_title": "SPECIFIC LOCATION • REAL ERA/YEAR",\n'
         '      "lower_third_subtitle": "SPECIFIC ARCHIVAL CONTEXT • DETAIL",\n'
         '      "evidence_headline": "Scene-specific dramatic headline",\n'
@@ -1391,8 +1476,7 @@ def _call_open_topic_director_llm(
         '      "pip_broll_query_en": "different 3-4 word English video query",\n'
         '      "photo_query_en": "2-4 word concrete English photo query",\n'
         '      "extra_photo_queries_en": ["photo q1", "photo q2", "photo q3", "photo q4"],\n'
-        '      "bespoke_image_prompt_en": "dark cinema photorealistic scene description, no text",\n'
-        '      "shot_prompts_en": ["chronological shot 1 matching phrase 1, 35mm cinema, no text", "shot 2 matching phrase 2, close-up detail, no text", "shot 3 matching phrase 3, dramatic wide angle, no text", "shot 4 matching phrase 4, moody atmospheric still, no text"],\n'
+        f"{shot_example_json}"
         '      "prefer_gemini_photo": true\n'
         "    }\n"
         "  ],\n"
@@ -1570,18 +1654,18 @@ def _build_open_topic_offline_dossier(topic: str, clean_lang: str, mood: str) ->
         ]
         narr = (
             [
-                f"Por trás da imagem familiar de {clean_t}, arquivos antigos escondem uma origem muito mais sombria — o que realmente acontecia no começo?",
+                f"Por trás da imagem familiar de {clean_t}, arquivos antigos escondem uma origem muito mais sombria. O que realmente acontecia no começo?",
                 f"Manuscritos e crônicas de séculos passados mostram que {clean_t} nasceu em meio a temores antigos e rituais de inverno hoje quase esquecidos.",
                 "À medida que essas tradições cruzavam fronteiras pela Europa, figuras temidas e advertências noturnas moldaram o imaginário popular.",
-                "Com o passar dos séculos, relatos desconfortáveis foram reescritos para parecerem inofensivos — mas qual detalhe sobreviveu nas entrelinhas?",
+                "Com o passar dos séculos, relatos desconfortáveis foram reescritos para parecerem inofensivos. Mas qual detalhe sobreviveu nas entrelinhas?",
                 f"Ao revisitar os documentos originais de {clean_t}, fica claro que a história verdadeira nunca foi tão inocente quanto parecia.",
             ]
             if not is_en
             else [
-                f"Behind the familiar image of {clean_t}, ancient archives conceal a far darker origin — what truly happened in the beginning?",
+                f"Behind the familiar image of {clean_t}, ancient archives conceal a far darker origin. What truly happened in the beginning?",
                 f"Centuries-old chronicles reveal that {clean_t} took shape amid forgotten winter fears and stark ancient rituals.",
                 "As these traditions traveled across borders, grim folkloric figures and midnight warnings haunted entire villages.",
-                "Over generations, unsettling records were softened into harmless tales — yet which chilling trace survived intact?",
+                "Over generations, unsettling records were softened into harmless tales. Yet which chilling trace survived intact?",
                 f"Reopening the primary archives of {clean_t} proves the real history was never as innocent as modern memory claims.",
             ]
         )
@@ -1611,18 +1695,18 @@ def _build_open_topic_offline_dossier(topic: str, clean_lang: str, mood: str) ->
         ]
         narr = (
             [
-                f"A história oficial sobre {clean_t} deixa de fora um capítulo decisivo — o que os arquivos antigos realmente escondem?",
+                f"A história oficial sobre {clean_t} deixa de fora um capítulo decisivo. O que os arquivos antigos realmente escondem?",
                 f"Documentos de época mostram que as raízes de {clean_t} surgiram sob circunstâncias muito mais tensas do que se imagina.",
                 "Cada testemunho preservado conecta lugares distantes e revela como pequenas decisões alteraram o destino de milhares de pessoas.",
-                "Quando a cronologia completa é colocada lado a lado, o contraste entre mito e realidade chama atenção — por que isso foi esquecido?",
+                "Quando a cronologia completa é colocada lado a lado, o contraste entre mito e realidade chama atenção. Por que isso foi esquecido?",
                 f"Entender a verdadeira trajetória de {clean_t} muda completamente a forma como enxergamos esse episódio até hoje.",
             ]
             if not is_en
             else [
-                f"The familiar story of {clean_t} leaves out its most decisive chapter — what do the original archives actually reveal?",
+                f"The familiar story of {clean_t} leaves out its most decisive chapter. What do the original archives actually reveal?",
                 f"Period records show the roots of {clean_t} emerged under far more dramatic circumstances than most people realize.",
                 "Each preserved testimony connects distant places and exposes how pivotal turning points reshaped an entire generation.",
-                "When the complete timeline is placed side by side, myth separates sharply from reality — why was this forgotten?",
+                "When the complete timeline is placed side by side, myth separates sharply from reality. Why was this forgotten?",
                 f"Uncovering the true chronicle of {clean_t} transforms how we understand its lasting legacy today.",
             ]
         )
@@ -1704,9 +1788,26 @@ def generate_netflix_doc_plan(
     is_en = clean_lang == "en_us"
     t_min = max(0.35, min(15.0, float(target_minutes or 0.5)))
     target_seconds = max(25.0, t_min * 60.0)
-    # Each narrated cinema beat (~20-26 words with natural human breathing at ~2.1 w/s + pauses) lasts ~11.5s
-    # and cuts visually every ~2.5s across 4-5 UNIQUE non-repeating bespoke shots!
-    n_scenes = max(4, min(60, int(round(target_seconds / 11.5))))
+    # Subtract real structural audio overhead (chapter cards 1.65s + inter-scene gaps 0.24s + 0.40s tail)
+    # and budget spoken narration at realistic ~2.05 w/s cinema voice-acting pace (60s -> 5 tight scenes x 18-22w = ~95-110w ≈ 56-66s!).
+    pace_wps = 2.05
+    rough_scenes = max(4, min(60, int(round(max(20.0, target_seconds - 4.5) / 10.5))))
+    est_chapters = _estimate_chapter_count(rough_scenes)
+    overhead_s = est_chapters * 1.65 + rough_scenes * 0.24 + 0.40
+    spoken_budget_s = max(14.0, target_seconds - overhead_s)
+    total_target_words = max(48, int(round(spoken_budget_s * pace_wps)))
+    n_scenes = max(4, min(60, int(round(total_target_words / 21.0))))
+    est_chapters = _estimate_chapter_count(n_scenes)
+    overhead_s = est_chapters * 1.65 + n_scenes * 0.24 + 0.40
+    spoken_budget_s = max(14.0, target_seconds - overhead_s)
+    total_target_words = max(48, int(round(spoken_budget_s * pace_wps)))
+    avg_words_per_scene = total_target_words / float(n_scenes)
+    if avg_words_per_scene >= 19.0:
+        min_scene_words = max(14, int(math.floor(avg_words_per_scene)) - 4)
+        max_scene_words = min(26, int(math.floor(avg_words_per_scene)))
+    else:
+        min_scene_words = max(11, int(round(avg_words_per_scene)) - 2)
+        max_scene_words = min(24, int(round(avg_words_per_scene)) + 2)
     voice_id = "en-US-AndrewMultilingualNeural" if is_en else "pt-BR-AntonioNeural"
     resolved_cap_style = (
         resolve_caption_style(caption_style)
@@ -1823,8 +1924,8 @@ def generate_netflix_doc_plan(
                     visual_mode=vmode,
                     mood=mood,
                     narration=_clean_doc_text(line_txt),
-                    lower_third_title=_clean_doc_text(lt_title),
-                    lower_third_subtitle=_clean_doc_text(lt_sub),
+                    lower_third_title=_normalize_upper(_clean_doc_text(lt_title)),
+                    lower_third_subtitle=_normalize_upper(_clean_doc_text(lt_sub)),
                     highlight_color="#FFD166" if idx % 2 == 0 else "#FF2E93",
                     evidence_headline=_clean_doc_text(dossier["headline"]),
                     evidence_quote=_clean_doc_text(dossier["quote_en"] if is_en else dossier["quote_pt"]),
@@ -1875,6 +1976,10 @@ def generate_netflix_doc_plan(
         clean_lang=clean_lang,
         mood_hint=mood_hint,
         custom_directives=custom_directives,
+        aspect_ratio=ar,
+        min_scene_words=min_scene_words,
+        max_scene_words=max_scene_words,
+        target_seconds=target_seconds,
     )
 
     if llm_res is not None:
@@ -1899,14 +2004,7 @@ def generate_netflix_doc_plan(
         if len(thumb_hook.split()) > 4:
             thumb_hook = " ".join(thumb_hook.split()[:3])
 
-        raw_chap_subs = raw_plan.get("chapter_subtitles")
         default_chap_subs = _default_chapter_subtitles_for_mood(mood, is_en)
-        if isinstance(raw_chap_subs, list) and len(raw_chap_subs) >= 2:
-            chapter_subs = [_safe_field(c, default_chap_subs[i % len(default_chap_subs)]).upper() for i, c in enumerate(raw_chap_subs[:4])]
-            while len(chapter_subs) < 4:
-                chapter_subs.append(default_chap_subs[len(chapter_subs)])
-        else:
-            chapter_subs = default_chap_subs
 
         global_origin = _safe_field(raw_plan.get("map_origin"), off_seed["map_origin"])
         global_dest = _safe_field(raw_plan.get("map_destination"), off_seed["map_destination"])
@@ -1979,9 +2077,10 @@ def generate_netflix_doc_plan(
                 else f"Em {tp_p.date}, os registros envolvendo {nd_p.title} ({nd_p.role}) revelaram uma virada decisiva marcada por {tp_p.label}."
             )
             raw_scenes.append({
+                "chapter_subtitle": _normalize_upper(tp_p.label)[:36],
                 "narration": narr_pad,
-                "lower_third_title": f"{global_origin} • {global_dest} • {tp_p.date}",
-                "lower_third_subtitle": f"{nd_p.title} • {tp_p.value}",
+                "lower_third_title": _normalize_upper(f"{global_origin} • {global_dest} • {tp_p.date}"),
+                "lower_third_subtitle": _normalize_upper(f"{nd_p.title} • {tp_p.value}"),
                 "evidence_headline": global_headline,
                 "evidence_quote": global_quote,
                 "map_origin": global_origin,
@@ -1991,7 +2090,11 @@ def generate_netflix_doc_plan(
                 "pip_broll_query_en": media_defaults["pip"][idx_pad % len(media_defaults["pip"])],
                 "photo_query_en": topic_photo_pool[idx_pad % len(topic_photo_pool)],
                 "extra_photo_queries_en": [topic_photo_pool[(idx_pad + k) % len(topic_photo_pool)] for k in range(4)],
-                "bespoke_image_prompt_en": f"dark atmospheric 35mm documentary still of {nd_p.title} in {global_origin}, chiaroscuro lighting, no text",
+                "bespoke_image_prompt_en": (
+                    f"Vertical full-bleed 9:16 dark atmospheric 35mm documentary still of {nd_p.title} in {global_origin}, chiaroscuro lighting, no text"
+                    if ar == "9:16"
+                    else f"dark atmospheric 35mm documentary still of {nd_p.title} in {global_origin}, chiaroscuro lighting, no text"
+                ),
                 "prefer_gemini_photo": mood in ("dark_horror", "epic_history"),
             })
 
@@ -2001,6 +2104,16 @@ def generate_netflix_doc_plan(
 
         for idx, rs in enumerate(raw_scenes[:n_scenes]):
             vmode = VISUAL_MODES[idx % len(VISUAL_MODES)]
+            tp_cur = timeline_pts[idx % len(timeline_pts)]
+            sc_orig = _safe_field(rs.get("map_origin"), global_origin)
+            sc_dest = _safe_field(rs.get("map_destination"), global_dest)
+            sc_metric = _safe_field(rs.get("map_metric"), global_metric)
+            lt_title = _normalize_upper(_safe_field(rs.get("lower_third_title"), f"{sc_orig} • {sc_dest} • {tp_cur.date}"))
+            lt_sub = _normalize_upper(_safe_field(rs.get("lower_third_subtitle"), f"{subtitle} • {tp_cur.value}"))
+            sc_head = _safe_field(rs.get("evidence_headline"), global_headline)
+            sc_quote = _safe_field(rs.get("evidence_quote"), global_quote)
+            sc_narr = _safe_field(rs.get("narration"), off_seed["narr"][idx % len(off_seed["narr"])])
+
             chap_card = None
             chap_sub = None
             if idx == 0:
@@ -2008,22 +2121,25 @@ def generate_netflix_doc_plan(
             elif idx == 1 or (idx >= 3 and (idx - 1) % chapter_step == 0 and chapter_counter < 4):
                 roman = ROMAN_NUMERALS[min(chapter_counter, len(ROMAN_NUMERALS) - 1)]
                 chap_card = _spaced_chapter_label(roman, lang=clean_lang)
-                chap_sub = chapter_subs[min(chapter_counter, len(chapter_subs) - 1)]
+                # Read chapter_subtitle DIRECTLY from THIS opening scene (NEVER shift a detached top-level array!)
+                raw_sc_chap_sub = _safe_field(rs.get("chapter_subtitle"), "")
+                if raw_sc_chap_sub:
+                    chap_sub = _normalize_upper(raw_sc_chap_sub)
+                else:
+                    head_toks = [w_tok for w_tok in _normalize_upper(sc_head).split() if w_tok]
+                    if head_toks and sc_head.strip().lower() != global_headline.strip().lower():
+                        chap_sub = " ".join(head_toks[:4])
+                    else:
+                        lt_lead = lt_title.split("•")[0].strip()
+                        if lt_lead and len(lt_lead) >= 3:
+                            chap_sub = lt_lead
+                        else:
+                            chap_sub = _normalize_upper(default_chap_subs[min(chapter_counter, len(default_chap_subs) - 1)])
                 act_lbl = f"CAPÍTULO {roman}" if not is_en else f"CHAPTER {roman}"
                 chapter_counter += 1
             else:
                 roman = ROMAN_NUMERALS[max(0, min(chapter_counter - 1, len(ROMAN_NUMERALS) - 1))]
                 act_lbl = f"CAPÍTULO {roman}" if not is_en else f"CHAPTER {roman}"
-
-            tp_cur = timeline_pts[idx % len(timeline_pts)]
-            sc_orig = _safe_field(rs.get("map_origin"), global_origin)
-            sc_dest = _safe_field(rs.get("map_destination"), global_dest)
-            sc_metric = _safe_field(rs.get("map_metric"), global_metric)
-            lt_title = _safe_field(rs.get("lower_third_title"), f"{sc_orig} • {sc_dest} • {tp_cur.date}")
-            lt_sub = _safe_field(rs.get("lower_third_subtitle"), f"{subtitle.upper()} • {tp_cur.value}")
-            sc_head = _safe_field(rs.get("evidence_headline"), global_headline)
-            sc_quote = _safe_field(rs.get("evidence_quote"), global_quote)
-            sc_narr = _safe_field(rs.get("narration"), off_seed["narr"][idx % len(off_seed["narr"])])
 
             broll_q = _safe_field(rs.get("broll_query_en"), media_defaults["broll"][idx % len(media_defaults["broll"])])
             pip_q = _safe_field(rs.get("pip_broll_query_en"), media_defaults["pip"][idx % len(media_defaults["pip"])])
@@ -2045,27 +2161,42 @@ def generate_netflix_doc_plan(
                 if cand.lower() not in {x.lower() for x in extra_photos}:
                     extra_photos.append(cand)
 
-            bespoke_p = _safe_field(
-                rs.get("bespoke_image_prompt_en"),
-                f"cinematic 35mm dark documentary still of {photo_q}, dramatic chiaroscuro lighting, no text",
+            default_bespoke = (
+                f"Vertical full-bleed 9:16 35mm dark documentary still of {photo_q}, dramatic chiaroscuro lighting, no text"
+                if ar == "9:16"
+                else f"cinematic 35mm dark documentary still of {photo_q}, dramatic chiaroscuro lighting, no text"
             )
+            bespoke_p = _safe_field(rs.get("bespoke_image_prompt_en"), default_bespoke)
+            if ar == "9:16":
+                bespoke_p = _enforce_vertical_prompt_framing(bespoke_p)
             raw_shots = rs.get("shot_prompts_en")
             shot_prompts: List[str] = []
             if isinstance(raw_shots, list):
                 for sp in raw_shots:
                     sp_c = _safe_field(sp, "")
+                    if ar == "9:16":
+                        sp_c = _enforce_vertical_prompt_framing(sp_c)
                     if sp_c and sp_c.lower() not in {x.lower() for x in shot_prompts}:
                         shot_prompts.append(sp_c)
             if bespoke_p and bespoke_p.lower() not in {x.lower() for x in shot_prompts}:
                 shot_prompts.insert(0, bespoke_p)
             # Ensure at least 5 distinct chronological bespoke shot prompts per scene (zero repetition!)
-            angle_cues = (
-                "dramatic wide establishing 35mm cinema still of",
-                "tense atmospheric close-up detail shot of",
-                "moody chiaroscuro candlelight documentary frame of",
-                "shadowy nocturnal cinema still of",
-                "haunting historic archival 35mm film still of",
-            )
+            if ar == "9:16":
+                angle_cues = (
+                    "Vertical full-bleed 9:16 35mm cinema still of",
+                    "Intimate vertical close-up detail shot of",
+                    "Moody vertical chiaroscuro candlelight documentary frame of",
+                    "Shadowy nocturnal 9:16 portrait cinema still of",
+                    "Haunting vertical historic archival 35mm film still of",
+                )
+            else:
+                angle_cues = (
+                    "dramatic wide establishing 35mm cinema still of",
+                    "tense atmospheric close-up detail shot of",
+                    "moody chiaroscuro candlelight documentary frame of",
+                    "shadowy nocturnal cinema still of",
+                    "haunting historic archival 35mm film still of",
+                )
             for eq_i, eq in enumerate([photo_q, *extra_photos]):
                 if len(shot_prompts) >= 6:
                     break
@@ -2192,8 +2323,8 @@ def generate_netflix_doc_plan(
                 visual_mode=vmode,
                 mood=mood,
                 narration=_clean_doc_text(line_txt),
-                lower_third_title=_clean_doc_text(f"{off['map_origin']} • {off['map_destination']} • {tp_cur['date']}"),
-                lower_third_subtitle=_clean_doc_text(f"{off['subtitle'].upper()} • {tp_cur['value']}"),
+                lower_third_title=_normalize_upper(_clean_doc_text(f"{off['map_origin']} • {off['map_destination']} • {tp_cur['date']}")),
+                lower_third_subtitle=_normalize_upper(_clean_doc_text(f"{off['subtitle']} • {tp_cur['value']}")),
                 highlight_color="#FFD166" if idx % 2 == 0 else "#FF2E93",
                 evidence_headline=_clean_doc_text(off["evidence_headline"]),
                 evidence_quote=_clean_doc_text(off["evidence_quote"]),
@@ -2203,7 +2334,11 @@ def generate_netflix_doc_plan(
                 timeline_points=[TimelinePoint(**pt) for pt in off["timeline_points"]],
                 board_nodes=[BoardNode(**nd) for nd in off["board_nodes"]],
                 image_prompt_en=photo_q,
-                bespoke_image_prompt_en=f"dark atmospheric 35mm documentary still of {photo_q}, chiaroscuro lighting, no text",
+                bespoke_image_prompt_en=(
+                    f"Vertical full-bleed 9:16 dark atmospheric 35mm documentary still of {photo_q}, chiaroscuro lighting, no text"
+                    if ar == "9:16"
+                    else f"dark atmospheric 35mm documentary still of {photo_q}, chiaroscuro lighting, no text"
+                ),
                 prefer_gemini_photo=(mood == "dark_horror"),
                 broll_query_en=broll_pool[idx % len(broll_pool)],
                 pip_broll_query_en=pip_pool[idx % len(pip_pool)],
@@ -2537,7 +2672,71 @@ class LoadedSceneSkiaMedia:
     # Ordered UNIQUE visual layers matching assets.shot_sequence (ZERO modulo repetition!):
     # Each tuple is ("video_primary", None) | ("photo_25d", (bg_img, fg_img)) | ("photo_still", skia_img)
     shot_layers: List[Tuple[str, Any]] = field(default_factory=list)
+    primary_photo_layer_idx: Optional[int] = None
     u2netp_separated: bool = False
+
+
+def _draw_image_cover(
+    canvas: skia.Canvas,
+    img: skia.Image,
+    dst_rect: skia.Rect,
+    paint: Optional[skia.Paint] = None,
+    y_bias: float = 0.5,
+) -> None:
+    """Draw `img` into `dst_rect` with aspect-cover cropping (ZERO stretching!).
+    `y_bias` in [0.0, 1.0]: 0.5 = center crop, 0.15 = top-weighted crop (preserves heads/faces/horns).
+    """
+    iw = float(img.width())
+    ih = float(img.height())
+    dw = float(dst_rect.width())
+    dh = float(dst_rect.height())
+    if iw <= 0.0 or ih <= 0.0 or dw <= 0.0 or dh <= 0.0:
+        return
+    src_ar = iw / ih
+    dst_ar = dw / dh
+    if src_ar > dst_ar + 1e-4:
+        crop_w = ih * dst_ar
+        sx0 = (iw - crop_w) * 0.5
+        src_r = skia.Rect.MakeXYWH(sx0, 0.0, crop_w, ih)
+    elif src_ar < dst_ar - 1e-4:
+        crop_h = iw / dst_ar
+        sy0 = (ih - crop_h) * max(0.0, min(1.0, float(y_bias)))
+        src_r = skia.Rect.MakeXYWH(0.0, sy0, iw, crop_h)
+    else:
+        src_r = skia.Rect.MakeWH(iw, ih)
+    canvas.drawImageRect(
+        img,
+        src_r,
+        dst_rect,
+        _LINEAR_SAMPLING,
+        paint,
+        skia.Canvas.SrcRectConstraint.kFast_SrcRectConstraint,
+    )
+
+
+def _load_skia_image_cover_biased(
+    img_path: Path,
+    target_w: int,
+    target_h: int,
+    y_bias: float = 0.16,
+) -> Optional[skia.Image]:
+    """Load an image with top-weighted aspect-cover crop into `(target_w, target_h)` so faces/heads/horns are never decapitated."""
+    if img_path is None:
+        return None
+    p = Path(img_path)
+    if not p.exists():
+        return None
+    tw = max(16, int(target_w))
+    th = max(16, int(target_h))
+    try:
+        raw = skia.Image.open(str(p))
+        if raw is not None and raw.width() > 0 and raw.height() > 0:
+            surf = skia.Surface(tw, th)
+            _draw_image_cover(surf.getCanvas(), raw, skia.Rect.MakeWH(tw, th), y_bias=y_bias)
+            return surf.makeImageSnapshot()
+    except Exception:
+        pass
+    return load_skia_image_cover(p, tw, th)
 
 
 def _draw_obsidian_cinema_backdrop(canvas: skia.Canvas, w: int, h: int, t: float) -> None:
@@ -2630,6 +2829,7 @@ def _draw_monochrome_sepia_photo(
     rect: skia.Rect,
     radius: float = 6.0,
     halftone_lines: bool = True,
+    y_bias: float = 0.15,
 ) -> None:
     """Draw a real photograph in authentic high-contrast monochrome/sepia newspaper halftone print style."""
     # High-contrast warm archival newsprint monochrome/sepia 4x5 color matrix
@@ -2645,7 +2845,7 @@ def _draw_monochrome_sepia_photo(
     canvas.save()
     rrect = skia.RRect.MakeRectXY(rect, radius, radius)
     canvas.clipRRect(rrect, doAntiAlias=True)
-    canvas.drawImageRect(img, rect, _LINEAR_SAMPLING, photo_paint)
+    _draw_image_cover(canvas, img, rect, paint=photo_paint, y_bias=y_bias)
 
     # Subtle newsprint halftone horizontal print grain
     if halftone_lines:
@@ -3214,18 +3414,18 @@ def _draw_fullbleed_parallax_shot(
     t: float,
     pan_dir: float = 1.0,
 ) -> None:
-    """Render an unobstructed full-bleed edge-to-edge 2.5D parallax cinema shot with subtle embers & vignette."""
+    """Render an unobstructed full-bleed edge-to-edge 2.5D parallax cinema shot with crisp 16px depth (zero blurry halo!) & subtle embers."""
     full_r = skia.Rect.MakeXYWH(0, 0, w, h)
     canvas.clear(skia.ColorSetARGB(255, 9, 7, 16))
     if bg_img is not None:
-        bg_zoom = 1.05 + 0.08 * shot_prog
-        bg_pan_x = (shot_prog - 0.5) * (-26.0 * pan_dir)
-        bg_pan_y = (shot_prog - 0.5) * -10.0
+        bg_zoom = 1.03 + 0.045 * shot_prog
+        bg_pan_x = (shot_prog - 0.5) * (-6.0 * pan_dir)
+        bg_pan_y = (shot_prog - 0.5) * -3.0
         canvas.save()
         canvas.translate(w * 0.5 + bg_pan_x, h * 0.42 + bg_pan_y)
         canvas.scale(bg_zoom, bg_zoom)
         canvas.translate(-w * 0.5, -h * 0.42)
-        canvas.drawImageRect(bg_img, full_r, _LINEAR_SAMPLING)
+        _draw_image_cover(canvas, bg_img, full_r)
         canvas.restore()
 
         # Atmospheric floating dust / warm candlelight embers
@@ -3236,16 +3436,15 @@ def _draw_fullbleed_parallax_shot(
             canvas.drawCircle(mx_m, my_m, 2.0 + (mi % 3) * 1.2, mote_p)
 
         if fg_img is not None:
-            fg_zoom = 1.07 + 0.145 * shot_prog
-            fg_pan_x = (shot_prog - 0.5) * (44.0 * pan_dir)
-            fg_pan_y = (shot_prog - 0.5) * -14.0
+            fg_zoom = 1.05 + 0.065 * shot_prog
+            fg_pan_x = (shot_prog - 0.5) * (10.0 * pan_dir)
+            fg_pan_y = (shot_prog - 0.5) * -5.0
             canvas.save()
             canvas.translate(w * 0.5 + fg_pan_x, h * 0.42 + fg_pan_y)
             canvas.scale(fg_zoom, fg_zoom)
             canvas.translate(-w * 0.5, -h * 0.42)
             fg_paint = skia.Paint(AntiAlias=True)
-            fg_paint.setImageFilter(skia.ImageFilters.DropShadow(0, 14, 28, 28, skia.ColorSetARGB(145, 0, 0, 0)))
-            canvas.drawImageRect(fg_img, full_r, _LINEAR_SAMPLING, fg_paint)
+            _draw_image_cover(canvas, fg_img, full_r, paint=fg_paint)
             canvas.restore()
 
     # Subtle cinematic edge vignette (keeps center bright and dramatic)
@@ -3439,26 +3638,28 @@ def _draw_mode_parallax_25d_photo(
     body_dur: float = 10.0,
     s_idx: int = 0,
 ) -> None:
-    """Mode 4 (Cinema v4): Multi-shot 2.5D u2netp Parallax & Bespoke Cinema cuts!
-    NEVER freezes 18s on a single photo — cuts smoothly across all unique shots in `media.shot_layers`!
+    """Mode 4 (Cinema v5): Multi-shot 2.5D u2netp Parallax & Bespoke Cinema cuts across BOTH 16:9 and 9:16!
+    NEVER freezes 18s on a single photo and NEVER stretches into a mismatched matte — cuts smoothly across
+    all unique shots in `media.shot_layers`!
     """
     is_wide = w >= h
+    if media.shot_layers:
+        _draw_unique_shot_slice(
+            canvas,
+            w,
+            h,
+            media.shot_layers,
+            slice_t=body_t,
+            slice_dur=max(0.5, body_dur),
+            t=t,
+            primary_frame=primary_frame,
+            pip_frame=None,
+            s_idx=s_idx,
+            cut_flash_on_first=False,
+        )
+        return
+
     if not is_wide:
-        if media.shot_layers:
-            _draw_unique_shot_slice(
-                canvas,
-                w,
-                h,
-                media.shot_layers,
-                slice_t=body_t,
-                slice_dur=max(0.5, body_dur),
-                t=t,
-                primary_frame=primary_frame,
-                pip_frame=None,
-                s_idx=s_idx,
-                cut_flash_on_first=False,
-            )
-            return
         _draw_fullbleed_parallax_shot(
             canvas,
             w,
@@ -3471,7 +3672,7 @@ def _draw_mode_parallax_25d_photo(
         )
         return
 
-    # 16:9 widescreen cinema matte presentation over moving dark HD B-roll
+    # 16:9 widescreen fallback when no multi-shot layers exist (aspect-cover crop -> ZERO stretch!)
     _draw_video_backdrop_layer(
         canvas,
         w,
@@ -3485,10 +3686,9 @@ def _draw_mode_parallax_25d_photo(
         show_dust=True,
     )
 
-    is_wide = w >= h
-    frame_w = w * (0.76 if is_wide else 0.88)
-    frame_h = h * (0.61 if is_wide else 0.45)
-    fy = h * (0.06 if is_wide else 0.14)
+    frame_w = w * 0.76
+    frame_h = h * 0.61
+    fy = h * 0.06
 
     plate_r = skia.Rect.MakeXYWH(-frame_w * 0.5, -frame_h * 0.5, frame_w, frame_h)
     plate_rr = skia.RRect.MakeRectXY(plate_r, 20.0, 20.0)
@@ -3508,10 +3708,9 @@ def _draw_mode_parallax_25d_photo(
     bg_img = media.parallax_bg or media.primary_photo
     fg_img = media.parallax_fg
 
-    # Background plate moves at 1.0x speed; foreground subject cutout moves 2.2x faster!
-    # Anchor scale pivot near upper-third (-0.16 * frame_h) so portraits/architecture heads never crop at top edge.
-    bg_pan_x = (prog - 0.5) * -22.0
-    bg_zoom = 1.02 + 0.045 * prog
+    # Crisp 16px parallax without blurry foreground DropShadow or aspect-ratio stretch
+    bg_pan_x = (prog - 0.5) * -6.0
+    bg_zoom = 1.03 + 0.045 * prog
     pivot_y = -frame_h * 0.16
 
     if bg_img is not None:
@@ -3519,7 +3718,7 @@ def _draw_mode_parallax_25d_photo(
         canvas.translate(bg_pan_x, pivot_y)
         canvas.scale(bg_zoom, bg_zoom)
         canvas.translate(0.0, -pivot_y)
-        canvas.drawImageRect(bg_img, plate_r, _LINEAR_SAMPLING)
+        _draw_image_cover(canvas, bg_img, plate_r, y_bias=0.35)
         canvas.restore()
 
         # Atmospheric depth haze & warm projector motes sandwiched BETWEEN background and 2.5D foreground!
@@ -3531,18 +3730,16 @@ def _draw_mode_parallax_25d_photo(
             my_m = -frame_h * 0.46 + ((mi * 119 - t * (14 + (mi % 3) * 6)) % (frame_h * 0.92))
             canvas.drawCircle(mx_m, my_m, 2.0 + (mi % 3) * 1.1, mote_p)
 
-        # Foreground u2netp subject cutout moving 2.2x faster with higher parallax zoom!
         if fg_img is not None:
-            fg_pan_x = (prog - 0.5) * 48.4   # exact 2.2x relative displacement vs bg_pan_x (-22 -> +48.4)
-            fg_pan_y = (prog - 0.5) * -6.0
-            fg_zoom = 1.03 + 0.099 * prog    # exact 2.2x zoom velocity vs bg_zoom (0.045 -> 0.099)
+            fg_pan_x = (prog - 0.5) * 10.0
+            fg_pan_y = (prog - 0.5) * -4.0
+            fg_zoom = 1.05 + 0.065 * prog
             canvas.save()
             canvas.translate(fg_pan_x, pivot_y + fg_pan_y)
             canvas.scale(fg_zoom, fg_zoom)
             canvas.translate(0.0, -pivot_y)
             fg_paint = skia.Paint(AntiAlias=True)
-            fg_paint.setImageFilter(skia.ImageFilters.DropShadow(0, 12, 24, 24, skia.ColorSetARGB(155, 0, 0, 0)))
-            canvas.drawImageRect(fg_img, plate_r, _LINEAR_SAMPLING, fg_paint)
+            _draw_image_cover(canvas, fg_img, plate_r, paint=fg_paint, y_bias=0.35)
             canvas.restore()
     else:
         # Fallback archival tone plate if completely offline with no photo
@@ -3667,8 +3864,39 @@ def _draw_mode_newspaper_highlighter(
 
     is_wide = w >= h
     paper_w = min(w - 130.0, 1460.0 if is_wide else 940.0)
-    paper_h = h * (0.61 if is_wide else 0.50)
-    py = h * (0.075 if is_wide else 0.145)
+    inner_w = paper_w - 92.0
+
+    # Pre-measure headline & quote so `paper_h` hugs the actual content tightly (ZERO 45% empty beige bottom!)
+    h_font, h_lines = _wrap_text_to_width(_normalize_upper(scene.evidence_headline), title_tf, 44.0 if is_wide else 42.0, 24.0, inner_w, 2)
+    n_h_lines = max(1, len(h_lines))
+    headline_step = h_font.getSize() * 1.15
+    # Distance from card top to `content_top` (masthead + double rule + headline + divider + 18px gap)
+    header_height = 42.0 + 66.0 + (n_h_lines * headline_step) - 12.0 + 18.0
+
+    if is_wide:
+        paper_h = h * 0.61
+        py = h * 0.075
+        q_font_v = None
+        q_lines_v: List[str] = []
+        v_photo_h = 0.0
+        v_q_box_h = 0.0
+    else:
+        # 9:16 Vertical Broadsheet: balanced editorial inset (~1.40:1 aspect, top-weighted crop) + tight height
+        q_font_v, q_lines_v = _wrap_text_to_width(scene.evidence_quote, ui_tf, 28.0, 18.0, inner_w - 40.0, 4)
+        v_line_step = q_font_v.getSize() * 1.38
+        v_q_box_h = max(1, len(q_lines_v)) * v_line_step + 40.0
+        # Target ~1.40:1 editorial aspect (inside 1.35:1-1.45:1) so portraits keep head/horns intact
+        v_photo_h = round(inner_w / 1.40)
+        cap_and_gap = 38.0
+        bottom_pad = 32.0
+        max_paper_h = h * 0.66
+        raw_paper_h = header_height + v_photo_h + cap_and_gap + v_q_box_h + bottom_pad
+        if raw_paper_h > max_paper_h:
+            shrink = raw_paper_h - max_paper_h
+            v_photo_h = max(round(inner_w / 1.45), v_photo_h - shrink)
+        paper_h = header_height + v_photo_h + cap_and_gap + v_q_box_h + bottom_pad
+        # Center cleanly inside the clear vertical window between lower-third (~170px) and captions (~1520px)
+        py = max(170.0, min(h * 0.16, (h * 0.78 - paper_h) * 0.5 + 85.0))
 
     # Slow 2.5D editorial camera push-in
     cam_scale = 1.0 + 0.05 * prog
@@ -3690,7 +3918,6 @@ def _draw_mode_newspaper_highlighter(
 
     left_x = -paper_w * 0.5 + 46.0
     right_x = paper_w * 0.5 - 46.0
-    inner_w = paper_w - 92.0
     top_y = -paper_h * 0.5 + 42.0
 
     # Mood-aware Archival Masthead (NEVER force Financial masthead on Horror/History/Crime docs!)
@@ -3722,17 +3949,16 @@ def _draw_mode_newspaper_highlighter(
     canvas.drawLine(left_x, top_y + 19.0, right_x, top_y + 19.0, rule_p)
 
     # Bold Newspaper Headline (auto-wrapped to 2 lines, never clips)
-    h_font, h_lines = _wrap_text_to_width(scene.evidence_headline.upper(), title_tf, 44.0, 24.0, inner_w, 2)
     hy = top_y + 66.0
     for ln in h_lines:
         _draw_safe_string(canvas, ln, left_x, hy, h_font, ink_dark)
-        hy += h_font.getSize() * 1.15
+        hy += headline_step
 
     rule_y = hy - 12.0
     canvas.drawLine(left_x, rule_y, right_x, rule_y, rule_p)
 
     content_top = rule_y + 18.0
-    content_bottom = paper_h * 0.5 - 30.0
+    content_bottom = paper_h * 0.5 - 32.0
     content_h = max(140.0, content_bottom - content_top)
 
     if is_wide:
@@ -3745,7 +3971,7 @@ def _draw_mode_newspaper_highlighter(
         photo_h = max(160.0, content_h - 32.0)
         photo_rect = skia.Rect.MakeXYWH(left_x, content_top, photo_col_w, photo_h)
         if media.primary_photo is not None:
-            _draw_monochrome_sepia_photo(canvas, media.primary_photo, photo_rect, radius=6.0, halftone_lines=True)
+            _draw_monochrome_sepia_photo(canvas, media.primary_photo, photo_rect, radius=6.0, halftone_lines=True, y_bias=0.16)
         else:
             canvas.drawRect(photo_rect, skia.Paint(Color=skia.ColorSetARGB(40, 30, 25, 35)))
             canvas.drawRect(photo_rect, rule_p)
@@ -3798,17 +4024,28 @@ def _draw_mode_newspaper_highlighter(
                 canvas.drawRoundRect(hl_rect, 8.0, 8.0, hl_paint)
             qy += line_step
     else:
-        # 9:16 Vertical Broadsheet: Real monochrome/sepia photo banner on top, highlighted quote below
-        photo_h = min(310.0, content_h * 0.48)
-        photo_rect = skia.Rect.MakeXYWH(left_x, content_top, inner_w, photo_h)
+        # 9:16 Vertical Broadsheet: Balanced ~1.40:1 editorial inset photo (top-weighted crop) + archival caption + tight quote box
+        photo_rect = skia.Rect.MakeXYWH(left_x, content_top, inner_w, v_photo_h)
         if media.primary_photo is not None:
-            _draw_monochrome_sepia_photo(canvas, media.primary_photo, photo_rect, radius=6.0, halftone_lines=True)
+            _draw_monochrome_sepia_photo(canvas, media.primary_photo, photo_rect, radius=6.0, halftone_lines=True, y_bias=0.14)
+        else:
+            canvas.drawRect(photo_rect, skia.Paint(Color=skia.ColorSetARGB(40, 30, 25, 35)))
+            canvas.drawRect(photo_rect, rule_p)
 
-        q_box_y = content_top + photo_h + 24.0
-        rem_h = max(120.0, content_bottom - q_box_y)
-        q_font, q_lines = _wrap_text_to_width(scene.evidence_quote, ui_tf, 28.0, 18.0, inner_w - 40.0, 4)
-        line_step = q_font.getSize() * 1.38
-        callout_r = skia.Rect.MakeXYWH(left_x, q_box_y, inner_w, min(rem_h, len(q_lines) * line_step + 40.0))
+        # Concise archival photo caption underneath inset photo
+        photo_cap = (
+            f"ARCHIVAL EXHIBIT • {_normalize_upper(scene.lower_third_title)}"
+            if is_en
+            else f"ARQUIVO FOTOGRÁFICO • {_normalize_upper(scene.lower_third_title)}"
+        )
+        pc_f, pc_l = _wrap_text_to_width(photo_cap, ui_tf, 15.0, 11.5, inner_w, 1)
+        if pc_l:
+            _draw_safe_string(canvas, pc_l[0], left_x, content_top + v_photo_h + 22.0, pc_f, ink_muted)
+
+        q_box_y = content_top + v_photo_h + 38.0
+        assert q_font_v is not None
+        line_step = q_font_v.getSize() * 1.38
+        callout_r = skia.Rect.MakeXYWH(left_x, q_box_y, inner_w, v_q_box_h)
         canvas.drawRoundRect(callout_r, 10.0, 10.0, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(250, 251, 247, 236)))
         canvas.drawRoundRect(callout_r, 10.0, 10.0, rule_p)
 
@@ -3817,15 +4054,15 @@ def _draw_mode_newspaper_highlighter(
         hl_paint = skia.Paint(AntiAlias=True, Color=hex_to_skia(hl_hex, alpha=215 if hl_hex == "#FFD166" else 178))
         hl_paint.setBlendMode(skia.BlendMode.kMultiply)
 
-        n_lns = max(1, len(q_lines))
+        n_lns = max(1, len(q_lines_v))
         qy = q_box_y + 42.0
-        for idx_l, qln in enumerate(q_lines):
-            _draw_safe_string(canvas, qln, left_x + 20.0, qy, q_font, ink_dark)
+        for idx_l, qln in enumerate(q_lines_v):
+            _draw_safe_string(canvas, qln, left_x + 20.0, qy, q_font_v, ink_dark)
             line_prog = max(0.0, min(1.0, sweep_total * n_lns - idx_l))
             if line_prog > 0.01:
-                lw = float(q_font.measureText(qln))
+                lw = float(q_font_v.measureText(qln))
                 canvas.drawRoundRect(
-                    skia.Rect.MakeXYWH(left_x + 12.0, qy - q_font.getSize() * 0.88, (lw + 16.0) * line_prog, q_font.getSize() * 1.16),
+                    skia.Rect.MakeXYWH(left_x + 12.0, qy - q_font_v.getSize() * 0.88, (lw + 16.0) * line_prog, q_font_v.getSize() * 1.16),
                     8.0,
                     8.0,
                     hl_paint,
@@ -4481,7 +4718,7 @@ def _draw_chapter_card_overlay(
         _draw_safe_string(canvas, clean_ct, (w - cw) * 0.5, h * 0.39, c_font, cp, preserve_spacing=True)
 
     if chapter_subtitle:
-        clean_sub = _sanitize_glyphs(chapter_subtitle.upper(), typeface=ui_tf)
+        clean_sub = _sanitize_glyphs(_normalize_upper(chapter_subtitle), typeface=ui_tf)
         s_font, s_lns = _wrap_text_to_width(clean_sub, ui_tf, 42.0, 24.0, w - 180.0, 1)
         if s_lns:
             sw = float(s_font.measureText(s_lns[0]))
@@ -4526,12 +4763,12 @@ def _draw_sleek_lower_third(
     bar_r = skia.Rect.MakeXYWH(bx, by + 10.0, 8.0, box_h - 20.0)
     canvas.drawRoundRect(bar_r, 4.0, 4.0, skia.Paint(AntiAlias=True, Color=hex_to_skia(scene.highlight_color, alpha)))
 
-    lt_title_clean = _sanitize_glyphs(scene.lower_third_title.upper(), typeface=title_tf)
+    lt_title_clean = _sanitize_glyphs(_normalize_upper(scene.lower_third_title), typeface=title_tf)
     t_font, t_lns = _wrap_text_to_width(lt_title_clean, title_tf, 26.0, 16.0, box_w - 44.0, 1)
     if t_lns:
         _draw_safe_string(canvas, t_lns[0], bx + 26.0, by + 39.0, t_font, skia.Paint(AntiAlias=True, Color=hex_to_skia("#FFD166", alpha)))
 
-    lt_sub_clean = _sanitize_glyphs(scene.lower_third_subtitle.upper(), typeface=ui_tf)
+    lt_sub_clean = _sanitize_glyphs(_normalize_upper(scene.lower_third_subtitle), typeface=ui_tf)
     s_font, s_lns = _wrap_text_to_width(lt_sub_clean, ui_tf, 19.0, 13.5, box_w - 44.0, 1)
     if s_lns:
         _draw_safe_string(canvas, s_lns[0], bx + 26.0, by + 71.0, s_font, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(alpha, 218, 212, 238)))
@@ -4645,6 +4882,59 @@ def _draw_doc_subtitles(
 # ---------------------------------------------------------------------------
 # 7. Scene-by-Scene Documentary Render Engine (Real Video + PiP + Photos + Flat RAM)
 # ---------------------------------------------------------------------------
+GRAPHIC_BOOKEND_MODES: Tuple[VisualModeType, ...] = (
+    "newspaper_highlighter",
+    "dark_map_route",
+    "sliding_timeline",
+    "red_string_board",
+)
+
+
+def _compute_bookended_graphic_window(
+    visual_mode: str,
+    body_dur: float,
+    n_shot_layers: int,
+    cut_cadence_s: float = 2.6,
+) -> Optional[Tuple[float, float, int]]:
+    """Return `(g_start, g_end, pre_count)` when a graphic mode bookends its centerpiece with cinema shots, else `None`.
+    Shared between `_render_single_doc_scene_to_disk` and SFX scheduling so graphic foley aligns to the exact frame!
+    """
+    if visual_mode not in GRAPHIC_BOOKEND_MODES or body_dur <= 7.2 or n_shot_layers < 2:
+        return None
+    g_dur = min(5.4, max(4.4, body_dur * 0.42))
+    pre_dur = max(2.2, min(3.2, (body_dur - g_dur) * 0.48))
+    g_start = pre_dur
+    g_end = min(body_dur - 1.8, g_start + g_dur)
+    pre_count = max(1, min(n_shot_layers - 1, int(round(pre_dur / max(2.0, float(cut_cadence_s or 2.6))))))
+    return g_start, g_end, pre_count
+
+
+def _active_slice_layer(
+    layers: List[Tuple[str, Any]],
+    slice_t: float,
+    slice_dur: float,
+) -> Optional[Tuple[str, Any]]:
+    """Return the exact layer tuple active at `slice_t` inside `_draw_unique_shot_slice`."""
+    if not layers:
+        return None
+    n_shots = len(layers)
+    shot_dur = max(0.8, slice_dur / float(n_shots))
+    shot_idx = min(n_shots - 1, max(0, int(slice_t / shot_dur)))
+    return layers[shot_idx]
+
+
+def _layer_needs_primary_video(layer: Optional[Tuple[str, Any]]) -> bool:
+    """Return False when `layer` is a self-contained static/2.5D photo so H.264 B-roll decoding can be skipped."""
+    if layer is None:
+        return True
+    kind, payload = layer
+    if kind == "photo_still":
+        return payload is None
+    if kind == "photo_25d":
+        return not (isinstance(payload, tuple) and len(payload) == 2 and payload[0] is not None)
+    return True
+
+
 def _load_scene_skia_photos(
     scene: NetflixDocScene,
     assets: SceneMediaAssets,
@@ -4654,6 +4944,12 @@ def _load_scene_skia_photos(
     """Pre-load real & bespoke Google Flow photographs into Skia Images once before the 30fps loop (zero per-frame I/O)."""
     loaded = LoadedSceneSkiaMedia()
     is_wide = w >= h
+    primary_resolved: Optional[Path] = None
+    if assets.primary_photo_path is not None:
+        try:
+            primary_resolved = Path(assets.primary_photo_path).resolve()
+        except Exception:
+            primary_resolved = Path(assets.primary_photo_path)
 
     # 1. Load every UNIQUE shot in assets.shot_sequence (ZERO modulo wrap-around!)
     # Apply genuine u2netp 2.5D foreground/background separation to up to 2 hero photo shots per scene!
@@ -4663,10 +4959,18 @@ def _load_scene_skia_photos(
         if kind == "video":
             loaded.shot_layers.append(("video_primary", None))
         elif kind == "photo" and media_path is not None and Path(media_path).exists():
+            is_primary_match = False
+            if primary_resolved is not None:
+                try:
+                    is_primary_match = Path(media_path).resolve() == primary_resolved
+                except Exception:
+                    is_primary_match = Path(media_path) == primary_resolved
             if used_parallax < parallax_budget:
                 bg_img, fg_img = separate_photo_25d_u2netp(media_path, w, h)
                 if bg_img is not None:
                     loaded.shot_layers.append(("photo_25d", (bg_img, fg_img)))
+                    if is_primary_match and loaded.primary_photo_layer_idx is None:
+                        loaded.primary_photo_layer_idx = len(loaded.shot_layers) - 1
                     if loaded.parallax_bg is None:
                         loaded.parallax_bg = bg_img
                         loaded.parallax_fg = fg_img
@@ -4677,6 +4981,8 @@ def _load_scene_skia_photos(
             still_img = load_skia_image_cover(media_path, w, h)
             if still_img is not None:
                 loaded.shot_layers.append(("photo_still", still_img))
+                if is_primary_match and loaded.primary_photo_layer_idx is None:
+                    loaded.primary_photo_layer_idx = len(loaded.shot_layers) - 1
                 if loaded.parallax_bg is None:
                     loaded.parallax_bg = still_img
 
@@ -4696,14 +5002,22 @@ def _load_scene_skia_photos(
                 loaded.primary_photo = load_skia_image_cover(assets.primary_photo_path, matte_w, matte_h)
     elif assets.primary_photo_path is not None:
         if scene.visual_mode == "newspaper_highlighter":
-            pw, ph = (620, 420) if is_wide else (840, 360)
-        elif scene.visual_mode == "video_pip_evidence":
-            pw, ph = (760, 340) if is_wide else (880, 340)
-        elif scene.visual_mode == "broll_video_pip":
-            pw, ph = (720, 240) if is_wide else (860, 260)
+            # Balanced ~1.40:1 editorial aspect with top-weighted crop so faces/horns are NEVER decapitated!
+            pw, ph = (600, 420) if is_wide else (848, 606)
+            loaded.primary_photo = _load_skia_image_cover_biased(
+                assets.primary_photo_path,
+                pw,
+                ph,
+                y_bias=0.16 if is_wide else 0.14,
+            )
         else:
-            pw, ph = (640, 400)
-        loaded.primary_photo = load_skia_image_cover(assets.primary_photo_path, pw, ph)
+            if scene.visual_mode == "video_pip_evidence":
+                pw, ph = (760, 340) if is_wide else (880, 340)
+            elif scene.visual_mode == "broll_video_pip":
+                pw, ph = (720, 240) if is_wide else (860, 260)
+            else:
+                pw, ph = (640, 400)
+            loaded.primary_photo = load_skia_image_cover(assets.primary_photo_path, pw, ph)
 
     if assets.extra_photo_paths:
         if scene.visual_mode == "cinema_multishot":
@@ -4755,6 +5069,7 @@ def _render_single_doc_scene_to_disk(
     lang: str = "pt_br",
     caption_style: str = "cinema_minimal",
     cut_cadence_s: float = 2.6,
+    prev_lower_third_title: Optional[str] = None,
 ) -> Tuple[Path, bool]:
     """Render one documentary scene at 30fps in C++ Skia directly to disk with REAL moving B-roll video,
     Video-over-Video PiP monitor, REAL photographs, kinetic captions, LUT 02_dark_wealth.cube & 35mm film grain.
@@ -4785,6 +5100,58 @@ def _render_single_doc_scene_to_disk(
     chunks = group_words_into_chunks(scene_words, max_words=3)
     total_frames = max(1, int(round(scene_dur * fps)))
     exact_dur = total_frames / float(fps)
+    body_dur = max(0.5, exact_dur - chapter_intro_s)
+
+    # Precompute bookended graphic window & non-repeating pre/post layers ONCE before frame loop
+    bookend_win = _compute_bookended_graphic_window(
+        scene.visual_mode,
+        body_dur,
+        len(loaded_media.shot_layers),
+        cut_cadence_s=cut_cadence_s,
+    )
+    use_bookended_graphic = bookend_win is not None
+    g_start = 0.0
+    g_end = 0.0
+    pre_layers: List[Tuple[str, Any]] = []
+    post_layers: List[Tuple[str, Any]] = []
+    if bookend_win is not None:
+        g_start, g_end, pre_count = bookend_win
+        card_photo_idx = loaded_media.primary_photo_layer_idx
+        if card_photo_idx is None and scene.visual_mode == "newspaper_highlighter":
+            for i_l, (k_l, _) in enumerate(loaded_media.shot_layers):
+                if k_l in ("photo_25d", "photo_still"):
+                    card_photo_idx = i_l
+                    break
+        if scene.visual_mode == "newspaper_highlighter" and card_photo_idx is not None:
+            # Exclude the photo shown inside the newspaper card so it NEVER repeats full-screen right after the card!
+            non_card_layers = [
+                lyr for i_l, lyr in enumerate(loaded_media.shot_layers)
+                if i_l != card_photo_idx
+            ]
+            if len(non_card_layers) >= 2:
+                eff_pre = max(1, min(len(non_card_layers) - 1, int(round(g_start / max(2.0, cut_cadence_s)))))
+                pre_layers = non_card_layers[:eff_pre]
+                post_layers = non_card_layers[eff_pre:] or non_card_layers[-1:]
+            elif len(non_card_layers) == 1:
+                pre_layers = loaded_media.shot_layers[:pre_count]
+                post_layers = non_card_layers
+            else:
+                pre_layers = loaded_media.shot_layers[:pre_count]
+                post_layers = loaded_media.shot_layers[pre_count:] or loaded_media.shot_layers[-1:]
+        else:
+            pre_layers = loaded_media.shot_layers[:pre_count]
+            post_layers = loaded_media.shot_layers[pre_count:] or loaded_media.shot_layers[-1:]
+
+    # Show sleek Lower-Third on Scene 0, Chapter Starts, ANY Location/Era Change, or every 4th scene
+    cur_lt_norm = _normalize_upper(_clean_doc_text(scene.lower_third_title))
+    prev_lt_norm = _normalize_upper(_clean_doc_text(prev_lower_third_title or "")) if prev_lower_third_title is not None else ""
+    location_changed = bool(cur_lt_norm) and (prev_lower_third_title is not None) and (cur_lt_norm != prev_lt_norm)
+    show_lower_third = (
+        s_idx == 0
+        or scene.chapter_card is not None
+        or location_changed
+        or (s_idx % 4 == 0)
+    )
 
     pre_args, enc_args, hw_suffix = build_video_encode_args(qp=19)
     vf_parts = []
@@ -4824,10 +5191,13 @@ def _render_single_doc_scene_to_disk(
         str(out_scene_mp4),
     ]
 
+    # Redirect FFmpeg stderr to a file instead of PIPE so long 5-15 min renders can NEVER deadlock on a 64KB buffer!
+    ffmpeg_err_path = out_scene_mp4.parent / f"ffmpeg_sc{s_idx:03d}.err"
+    err_fh = open(ffmpeg_err_path, "wb")
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=err_fh,
         env=get_vaapi_env(),
         preexec_fn=nice_preexec,
     )
@@ -4842,11 +5212,51 @@ def _render_single_doc_scene_to_disk(
             global_t = global_t_offset + local_t
             c = surface.getCanvas()
 
-            primary_frame = primary_reader.read_skia_frame(darken_alpha=primary_darken) if primary_reader is not None else None
+            in_chapter_intro = chapter_intro_s > 0.0 and local_t < chapter_intro_s
+            body_t = 0.0 if in_chapter_intro else max(0.0, local_t - chapter_intro_s)
+
+            # Skip H.264 video decoding on frames where a static/2.5D photo shot is active (3x+ CPU speedup!)
+            need_primary_video = False
+            need_pip_video = False
+            if in_chapter_intro:
+                need_primary_video = True
+            elif use_bookended_graphic:
+                if body_t < g_start:
+                    active_lyr = _active_slice_layer(pre_layers, body_t, g_start)
+                    need_primary_video = _layer_needs_primary_video(active_lyr)
+                    need_pip_video = (active_lyr is not None and active_lyr[0] == "video_secondary")
+                elif body_t >= g_end:
+                    active_lyr = _active_slice_layer(post_layers, body_t - g_end, max(0.4, body_dur - g_end))
+                    need_primary_video = _layer_needs_primary_video(active_lyr)
+                    need_pip_video = (active_lyr is not None and active_lyr[0] == "video_secondary")
+                else:
+                    need_primary_video = True
+                    need_pip_video = (scene.visual_mode == "dark_map_route")
+            elif scene.visual_mode in ("cinema_multishot", "parallax_25d_photo"):
+                if loaded_media.shot_layers:
+                    active_lyr = _active_slice_layer(loaded_media.shot_layers, body_t, body_dur)
+                    need_primary_video = _layer_needs_primary_video(active_lyr)
+                    need_pip_video = (active_lyr is not None and active_lyr[0] == "video_secondary")
+                else:
+                    need_primary_video = (
+                        scene.visual_mode == "cinema_multishot"
+                        or is_wide
+                        or (loaded_media.parallax_bg is None and loaded_media.primary_photo is None)
+                    )
+                    need_pip_video = (scene.visual_mode == "cinema_multishot")
+            else:
+                need_primary_video = True
+                need_pip_video = (scene.visual_mode in PIP_ENABLED_MODES)
+
+            primary_frame = (
+                primary_reader.read_skia_frame(darken_alpha=primary_darken)
+                if (need_primary_video and primary_reader is not None)
+                else None
+            )
             # If Vision rejected stock B-roll video for this scene, cleanly use our hero Nano Banana 2.1 plate as backdrop!
             fallback_backdrop = primary_frame or loaded_media.parallax_bg or loaded_media.primary_photo
 
-            if chapter_intro_s > 0.0 and local_t < chapter_intro_s:
+            if in_chapter_intro:
                 _draw_video_backdrop_layer(
                     c,
                     w,
@@ -4863,7 +5273,7 @@ def _render_single_doc_scene_to_disk(
                     c,
                     w,
                     h,
-                    scene.chapter_card or _spaced_chapter_label("I"),
+                    scene.chapter_card or _spaced_chapter_label("I", lang=lang),
                     scene.chapter_subtitle or "",
                     local_t,
                     chapter_intro_s,
@@ -4871,28 +5281,14 @@ def _render_single_doc_scene_to_disk(
                     ui_tf,
                 )
             else:
-                body_t = max(0.0, local_t - chapter_intro_s)
-                body_dur = max(0.5, exact_dur - chapter_intro_s)
                 prog = min(1.0, body_t / body_dur)
-                pip_frame = pip_reader.read_skia_frame(darken_alpha=0.0) if pip_reader is not None else None
-
-                # Cinema v4: Graphic modes NEVER stay frozen 15-20s! Bookend graphic centerpiece (4.8-5.4s)
-                # with fresh full-screen UNIQUE cinema shots before and after!
-                graphic_modes = ("newspaper_highlighter", "dark_map_route", "sliding_timeline", "red_string_board")
-                use_bookended_graphic = (
-                    scene.visual_mode in graphic_modes
-                    and body_dur > 7.2
-                    and len(loaded_media.shot_layers) >= 2
+                pip_frame = (
+                    pip_reader.read_skia_frame(darken_alpha=0.0)
+                    if (need_pip_video and pip_reader is not None)
+                    else None
                 )
+
                 if use_bookended_graphic:
-                    g_dur = min(5.4, max(4.4, body_dur * 0.42))
-                    pre_dur = max(2.2, min(3.2, (body_dur - g_dur) * 0.48))
-                    g_start = pre_dur
-                    g_end = min(body_dur - 1.8, g_start + g_dur)
-                    n_layers = len(loaded_media.shot_layers)
-                    pre_count = max(1, min(n_layers - 1, int(round(pre_dur / max(2.0, cut_cadence_s)))))
-                    pre_layers = loaded_media.shot_layers[:pre_count]
-                    post_layers = loaded_media.shot_layers[pre_count:] or loaded_media.shot_layers[-1:]
                     if body_t < g_start:
                         _draw_unique_shot_slice(
                             c, w, h, pre_layers, body_t, g_start, global_t, primary_frame, pip_frame, s_idx=s_idx
@@ -4939,8 +5335,7 @@ def _render_single_doc_scene_to_disk(
                         is_en=is_en, body_dur=body_dur, s_idx=s_idx,
                     )
 
-                # Show sleek Lower-Third ONLY on Act/Location shifts (prevents repetitive dashboard clutter!)
-                if s_idx == 0 or scene.chapter_card is not None or (s_idx % 4 == 0):
+                if show_lower_third:
                     _draw_sleek_lower_third(c, w, h, scene, body_t, body_dur, title_tf, ui_tf, max_display_s=3.2)
                 _draw_doc_subtitles(c, w, h, chunks, local_t, caption_tf, caption_style=caption_style)
 
@@ -4967,11 +5362,21 @@ def _render_single_doc_scene_to_disk(
             proc.stdin.close()
         except Exception:
             pass
+        try:
+            proc.wait(timeout=240)
+        finally:
+            try:
+                err_fh.close()
+            except Exception:
+                pass
 
-    stderr = proc.stderr.read() if proc.stderr else b""
-    proc.wait(timeout=240)
     if proc.returncode != 0:
-        raise RuntimeError(f"NetflixDoc scene #{s_idx + 1} encode failed: {stderr.decode(errors='ignore')}")
+        err_txt = ""
+        try:
+            err_txt = ffmpeg_err_path.read_text(encoding="utf-8", errors="ignore")[-4000:]
+        except Exception:
+            pass
+        raise RuntimeError(f"NetflixDoc scene #{s_idx + 1} encode failed: {err_txt}")
     return out_scene_mp4, loaded_media.u2netp_separated
 
 
@@ -4985,6 +5390,19 @@ def _find_cached_work_asset(work_dir: Path, prefix: str, min_bytes: int = 4096) 
     return None
 
 
+def _find_cached_slot_photo(work_dir: Path, slot_key: str, min_bytes: int = 12_000) -> Optional[Path]:
+    """Locate any cached bespoke Flow or archival photo for `slot_key` (`flow_{slot_key}*` OR `photo_{slot_key}*`)."""
+    valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
+    for pattern in (f"flow_{slot_key}*", f"photo_{slot_key}*"):
+        for cand in sorted(work_dir.glob(pattern)):
+            try:
+                if cand.is_file() and cand.suffix.lower() in valid_exts and cand.stat().st_size >= min_bytes:
+                    return cand
+            except Exception:
+                continue
+    return None
+
+
 def _prefetch_scene_media_sync(
     scenes: List[NetflixDocScene],
     work_dir: Path,
@@ -4992,19 +5410,23 @@ def _prefetch_scene_media_sync(
     mood: str = "corporate_thriller",
     resume: bool = False,
     scene_shot_counts: Optional[List[int]] = None,
+    skip_scene_indices: Optional[Set[int]] = None,
 ) -> Tuple[List[SceneMediaAssets], Dict[str, Any]]:
-    """Cinema v4 Zero-Repetition + 100% Context-Verified Media Orchestrator:
-      1. Pre-screens atmospheric B-roll videos via Multimodal Gemini Vision Critic (score >= 7/10)
-         BEFORE downloading (zero steampunk buses / caves / off-topic stock!).
-      2. Batches ALL chronological per-phrase bespoke stills across ALL scenes into ONE SINGLE
-         logged-in Google Flow Pro (`Nano Banana 2.1`) session (native 9:16 / 16:9, parallel waves of 3),
+    """Cinema v5 Zero-Repetition + 100% Context-Verified Media Orchestrator:
+      1. Skips already-rendered scenes (`skip_scene_indices`) completely on resume (zero wasted Flow/Vision calls!).
+      2. Pre-screens atmospheric B-roll videos via Multimodal Gemini Vision Critic (score >= 7/10)
+         BEFORE downloading (zero off-topic stock!).
+      3. Batches ALL chronological per-phrase bespoke stills across unrendered scenes into ONE SINGLE
+         logged-in Google Flow Pro (`Nano Banana 2.1`) session (native 9:16 / 16:9, vertical-safe prompts for 9:16),
          generating exact `scene_shot_counts[s_idx]` UNIQUE visuals per scene!
-      3. Enforces global SHA256 + 64-bit perceptual `dhash` deduplication across the ENTIRE video
+      4. Enforces global SHA256 + 64-bit perceptual `dhash` deduplication across the ENTIRE video
          so ZERO images or videos EVER repeat inside a scene or across scenes!
     """
     used_video_hashes: Set[str] = set()
     used_photo_urls: Set[str] = set()
     used_dhashes: Set[int] = set()
+    skip_set: Set[int] = set(skip_scene_indices or ())
+    is_vertical = str(aspect_ratio).strip() == "9:16"
 
     assets_list: List[SceneMediaAssets] = [SceneMediaAssets() for _ in scenes]
     broll_clips_used: List[str] = []
@@ -5024,6 +5446,8 @@ def _prefetch_scene_media_sync(
     # if stock doesn't truly match >= 7/10, leave None -> upgraded to bespoke Flow art!)
     # -------------------------------------------------------------------------
     for s_idx, sc in enumerate(scenes):
+        if s_idx in skip_set:
+            continue
         item = assets_list[s_idx]
         sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
         mood_defaults = _OPEN_TOPIC_FALLBACK_MEDIA.get(sc_mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
@@ -5046,8 +5470,8 @@ def _prefetch_scene_media_sync(
             item.primary_broll_mp4 = main_mp4
             broll_clips_used.append(str(main_mp4))
 
-        # Secondary PiP video ONLY for genuine PiP monitor modes (dark_map_route, broll_video_pip, video_pip_evidence)
-        if sc.visual_mode in ("dark_map_route", "broll_video_pip", "video_pip_evidence"):
+        # Secondary PiP video ONLY for genuine PiP monitor modes (matches PIP_ENABLED_MODES exactly!)
+        if sc.visual_mode in PIP_ENABLED_MODES:
             pip_mp4 = _find_cached_work_asset(work_dir, f"broll_sc{s_idx:02d}_pip", min_bytes=32_768) if resume else None
             if pip_mp4 is None:
                 pip_q = sc.pip_broll_query_en or mood_defaults["pip"][s_idx % len(mood_defaults["pip"])]
@@ -5067,7 +5491,7 @@ def _prefetch_scene_media_sync(
                 pip_clips_used.append(str(pip_mp4))
 
     # -------------------------------------------------------------------------
-    # PHASE B: Plan exact UNIQUE bespoke visual slots across ALL scenes & batch-generate
+    # PHASE B: Plan exact UNIQUE bespoke visual slots across ALL unrendered scenes & batch-generate
     # them in ONE SINGLE logged-in Google Flow Pro (`Nano Banana 2.1`) session!
     # -------------------------------------------------------------------------
     batch_items: List[Dict[str, Any]] = []
@@ -5075,34 +5499,16 @@ def _prefetch_scene_media_sync(
     scene_slot_specs: List[List[Dict[str, Any]]] = []
     global_used_prompts: Set[str] = set()
 
-    for s_idx, sc in enumerate(scenes):
-        item = assets_list[s_idx]
-        sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
-        mood_defaults = _OPEN_TOPIC_FALLBACK_MEDIA.get(sc_mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
-        target_shots = (
-            max(3, min(8, int(scene_shot_counts[s_idx])))
-            if (scene_shot_counts and s_idx < len(scene_shot_counts))
-            else 4
+    if is_vertical:
+        camera_angles = (
+            "Vertical full-bleed 9:16 35mm cinema still showing",
+            "Intimate vertical close-up detail shot focusing on",
+            "Moody vertical nocturnal chiaroscuro candlelight scene depicting",
+            "Haunting vertical low-angle dark historical documentary portrait of",
+            "Tall atmospheric vertical silhouette in mist and shadow showing",
+            "Cinematic vertical top-down archival mystery frame of",
         )
-        # Graphic modes bookend a 5s centerpiece graphic with unique shots before & after
-        if sc.visual_mode in ("newspaper_highlighter", "dark_map_route", "sliding_timeline", "red_string_board"):
-            n_seq_photos = max(3, target_shots - (1 if item.primary_broll_mp4 else 0))
-        else:
-            n_seq_photos = max(3, target_shots - (1 if item.primary_broll_mp4 else 0))
-
-        # Build an ordered list of rich, chronological, scene-specific English visual prompts
-        prompt_candidates: List[str] = []
-        for sp in list(getattr(sc, "shot_prompts_en", None) or []):
-            sp_c = str(sp or "").strip()
-            if sp_c and sp_c.lower() not in {x.lower() for x in prompt_candidates}:
-                prompt_candidates.append(sp_c)
-        if sc.bespoke_image_prompt_en and sc.bespoke_image_prompt_en.strip().lower() not in {x.lower() for x in prompt_candidates}:
-            prompt_candidates.insert(0, sc.bespoke_image_prompt_en.strip())
-
-        fallback_queries = [q for q in [sc.photo_query_en, *(sc.extra_photo_queries_en or [])] if str(q or "").strip()]
-        if not fallback_queries:
-            fallback_queries = list(mood_defaults["photos"])
-
+    else:
         camera_angles = (
             "dramatic wide establishing 35mm cinema still showing",
             "tense intimate close-up detail shot focusing on",
@@ -5111,6 +5517,40 @@ def _prefetch_scene_media_sync(
             "atmospheric silhouette in mist and shadow showing",
             "cinematic overhead archival mystery frame of",
         )
+
+    for s_idx, sc in enumerate(scenes):
+        if s_idx in skip_set:
+            scene_slot_specs.append([])
+            continue
+        item = assets_list[s_idx]
+        sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
+        mood_defaults = _OPEN_TOPIC_FALLBACK_MEDIA.get(sc_mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
+        target_shots = (
+            max(3, min(12, int(scene_shot_counts[s_idx])))
+            if (scene_shot_counts and s_idx < len(scene_shot_counts))
+            else 4
+        )
+        n_seq_photos = max(3, target_shots - (1 if item.primary_broll_mp4 else 0))
+
+        # Build an ordered list of rich, chronological, scene-specific English visual prompts
+        prompt_candidates: List[str] = []
+        for sp in list(getattr(sc, "shot_prompts_en", None) or []):
+            sp_c = str(sp or "").strip()
+            if is_vertical:
+                sp_c = _enforce_vertical_prompt_framing(sp_c)
+            if sp_c and sp_c.lower() not in {x.lower() for x in prompt_candidates}:
+                prompt_candidates.append(sp_c)
+        if sc.bespoke_image_prompt_en:
+            bp_c = sc.bespoke_image_prompt_en.strip()
+            if is_vertical:
+                bp_c = _enforce_vertical_prompt_framing(bp_c)
+            if bp_c and bp_c.lower() not in {x.lower() for x in prompt_candidates}:
+                prompt_candidates.insert(0, bp_c)
+
+        fallback_queries = [q for q in [sc.photo_query_en, *(sc.extra_photo_queries_en or [])] if str(q or "").strip()]
+        if not fallback_queries:
+            fallback_queries = list(mood_defaults["photos"])
+
         for fq_i, fq in enumerate(fallback_queries):
             if len(prompt_candidates) >= n_seq_photos + 2:
                 break
@@ -5129,6 +5569,8 @@ def _prefetch_scene_media_sync(
         specs_for_scene: List[Dict[str, Any]] = []
         for sh_i in range(n_seq_photos):
             p_txt = prompt_candidates[sh_i]
+            if is_vertical:
+                p_txt = _enforce_vertical_prompt_framing(p_txt)
             if p_txt.lower() in global_used_prompts:
                 p_txt = f"{p_txt} — alternate angle #{s_idx + 1}-{sh_i + 1}"
             global_used_prompts.add(p_txt.lower())
@@ -5136,9 +5578,7 @@ def _prefetch_scene_media_sync(
             slot_key = f"sc{s_idx:02d}_shot{sh_i:02d}"
             out_p = work_dir / f"flow_{slot_key}.jpg"
             fb_q = fallback_queries[sh_i % len(fallback_queries)]
-            cached_p = _find_cached_work_asset(work_dir, f"flow_{slot_key}", min_bytes=12_000) if resume else None
-            if cached_p is None and out_p.exists() and out_p.stat().st_size >= 12_000 and resume:
-                cached_p = out_p
+            cached_p = _find_cached_slot_photo(work_dir, slot_key, min_bytes=12_000) if resume else None
             spec = {
                 "key": slot_key,
                 "role": "shot",
@@ -5175,6 +5615,8 @@ def _prefetch_scene_media_sync(
     # (Fall back to Vision-verified Openverse/Wikimedia/Pixabay ONLY if Flow missed a slot!)
     # -------------------------------------------------------------------------
     for s_idx, sc in enumerate(scenes):
+        if s_idx in skip_set:
+            continue
         item = assets_list[s_idx]
         sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
         scene_photos: List[Path] = []
@@ -5339,10 +5781,12 @@ def _concat_scenes_with_xfade(
     out_mp4: Path,
     work_dir: Path,
     thermal_limit_c: float,
+    scene_durs: Optional[List[float]] = None,
 ) -> Tuple[Path, bool]:
-    """Concatenate rendered documentary scenes using smooth 0.35s FFmpeg `xfade` cinema transitions
+    """Concatenate rendered documentary scenes using smooth 0.40s FFmpeg `xfade` cinema transitions
     (`fadeblack`, `smoothleft`, `zoomin`, `dissolve`, `wiperight`) with hardware QuickSync VAAPI
-    encoding (and automatic software fallback) while keeping Core i5 RAM & thermals safe.
+    encoding (and automatic software fallback + drift-free trimmed concat fallback) while keeping
+    Core i5 RAM & thermals safe.
     """
     if not scene_mp4_paths:
         raise RuntimeError("Nenhuma cena renderizada para concatenar.")
@@ -5358,9 +5802,11 @@ def _concat_scenes_with_xfade(
         batch_size = 8
         batch_outs: List[Path] = []
         batch_trs: List[str] = []
+        batch_durs: List[float] = []
         for b_idx, start in enumerate(range(0, len(scene_mp4_paths), batch_size)):
             chunk_paths = scene_mp4_paths[start : start + batch_size]
             chunk_trs = transitions[start : start + len(chunk_paths) - 1]
+            chunk_durs = scene_durs[start : start + len(chunk_paths)] if scene_durs is not None else None
             b_out = work_dir / f"_xfade_batch_{b_idx:02d}.mp4"
             _concat_scenes_with_xfade(
                 chunk_paths,
@@ -5370,8 +5816,11 @@ def _concat_scenes_with_xfade(
                 out_mp4=b_out,
                 work_dir=work_dir,
                 thermal_limit_c=thermal_limit_c,
+                scene_durs=chunk_durs,
             )
             batch_outs.append(b_out)
+            if chunk_durs is not None:
+                batch_durs.append(round(sum(chunk_durs), 4))
             boundary_tr_idx = start + len(chunk_paths) - 1
             if boundary_tr_idx < len(transitions):
                 batch_trs.append(transitions[boundary_tr_idx])
@@ -5383,6 +5832,7 @@ def _concat_scenes_with_xfade(
             out_mp4=out_mp4,
             work_dir=work_dir,
             thermal_limit_c=thermal_limit_c,
+            scene_durs=batch_durs if batch_durs else None,
         )
 
     durs = [_probe_video_duration(p) for p in scene_mp4_paths]
@@ -5434,16 +5884,42 @@ def _concat_scenes_with_xfade(
             return out_mp4, True
         except Exception as exc_sw:
             print(f"[NetflixDoc] xfade emergency concat fallback ({exc_sw})", flush=True)
+            # Trim scenes 0..N-2 to exact `scene_dur` (-t) so removing xfade NEVER introduces +0.40s/scene A/V drift!
+            trimmed_paths: List[Path] = []
+            for idx_f, p_f in enumerate(scene_mp4_paths):
+                if idx_f < len(scene_mp4_paths) - 1:
+                    if scene_durs is not None and idx_f < len(scene_durs) and float(scene_durs[idx_f]) > 0.2:
+                        trim_d = float(scene_durs[idx_f])
+                    else:
+                        trim_d = max(0.2, float(durs[idx_f]) - float(xfade_dur))
+                    trim_out = work_dir / f"_fallback_trim_{out_mp4.stem}_{idx_f:03d}.mp4"
+                    run_ffmpeg_safe(
+                        [
+                            "ffmpeg", "-y", "-v", "error",
+                            "-i", str(p_f),
+                            "-t", f"{trim_d:.4f}",
+                            "-vf", f"fps={fps},format=yuv420p",
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+                            "-an", str(trim_out),
+                        ],
+                        thermal_limit_c=thermal_limit_c,
+                        timeout=180,
+                    )
+                    trimmed_paths.append(trim_out)
+                else:
+                    trimmed_paths.append(p_f)
             video_concat_txt = work_dir / "doc_video_concat_fallback.txt"
-            video_concat_txt.write_text("\n".join(f"file '{p.resolve()}'" for p in scene_mp4_paths), encoding="utf-8")
+            video_concat_txt.write_text("\n".join(f"file '{p.resolve()}'" for p in trimmed_paths), encoding="utf-8")
             run_ffmpeg_safe(
                 [
                     "ffmpeg", "-y", "-v", "error",
                     "-f", "concat", "-safe", "0", "-i", str(video_concat_txt),
-                    "-c:v", "copy", "-an",
-                    str(out_mp4),
+                    "-vf", f"fps={fps},format=yuv420p",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
+                    "-an", str(out_mp4),
                 ],
                 thermal_limit_c=thermal_limit_c,
+                timeout=300,
             )
             return out_mp4, False
 
@@ -5466,9 +5942,9 @@ async def render_netflix_documentary(
 ) -> Dict[str, Any]:
     """Render a complete Netflix / MagnatesMedia / Dark History cinema documentary scene-by-scene to disk
     with REAL moving HD B-roll video in every scene, Video-over-Video (PiP), REAL/Bespoke Gemini photographs
-    + u2netp 2.5D parallax, 0.35s FFmpeg `xfade` cinema transitions, Hollywood multi-layered SFX,
+    + u2netp 2.5D parallax, 0.40s FFmpeg `xfade` cinema transitions, Hollywood multi-layered SFX,
     mood-matched atmosphere music bed, kinetic captions, LUT 02_dark_wealth.cube, 35mm film grain,
-    and -14 LUFS broadcast audio mastering.
+    per-scene voice leveling (-18 LUFS), and -14 LUFS broadcast audio mastering.
     """
     fps = 30 if int(fps) <= 30 else 60
     work_dir = Path(work_dir)
@@ -5506,10 +5982,11 @@ async def render_netflix_documentary(
     ui_tf, _ = _load_verified_typeface("PlusJakartaSans-ExtraBold.ttf", role="doc_ui")
     caption_tf, _ = _load_verified_typeface("Montserrat-Black.ttf", role="doc_caption")
 
-    # 1. AUDIO-FIRST: Synthesize narration + real Whisper word timestamps FIRST so we know each scene's
-    # exact `body_dur` and exact number of UNIQUE non-repeating visual shots needed (`body_dur / cut_cadence_s`)!
+    # 1. AUDIO-FIRST: Synthesize narration + per-scene LUFS leveling + real Whisper word timestamps FIRST
+    # so we know each scene's exact `render_dur`, `body_dur`, `already_rendered_mask`, and `n_shots_for_scene`!
     scene_records: List[Dict[str, Any]] = []
     scene_shot_counts: List[int] = []
+    already_rendered_mask: List[bool] = []
     all_words: List[Dict[str, Any]] = []
     audio_parts: List[Path] = []
     sfx_events: List[Tuple[Path, float, float]] = []
@@ -5522,6 +5999,7 @@ async def render_netflix_documentary(
 
     cursor_t = 0.0
     pause_gap_s = 0.24
+    tail_pad_s = 0.40
     xfade_dur = CINEMA_XFADE_DURATION_S
     gap_wav = work_dir / "_doc_gap.wav"
     run_ffmpeg_safe(
@@ -5538,20 +6016,10 @@ async def render_netflix_documentary(
             pct = 10 + int(18 * ((s_idx + 1) / float(max(1, n_scenes))))
             progress_cb(pct, f"Sintetizando narração cinema cena {s_idx + 1}/{n_scenes} ({sc.visual_mode})...")
 
+        is_last_scene = s_idx == (n_scenes - 1)
         tr_name = sc.transition_type or _select_transition_for_scene(s_idx, sc.visual_mode, sc.chapter_card is not None)
         if s_idx > 0:
             transitions_plan.append(tr_name)
-            # Sync Hollywood transition SFX RIGHT on the 0.35s xfade cut!
-            if sc.chapter_card:
-                if cursor_t >= 1.4:
-                    _add_sfx(cursor_t - 1.25, 0.26, "riser_tension.wav")
-            elif tr_name in ("smoothleft", "wiperight"):
-                _add_sfx(max(0.0, cursor_t - 0.06), 0.42, "whoosh_deep.wav", "whoosh_fast.wav")
-            elif tr_name == "zoomin":
-                _add_sfx(max(0.0, cursor_t - 0.04), 0.44, "flash_impact.wav", "cinematic_hit.wav")
-            else:
-                _add_sfx(max(0.0, cursor_t - 0.05), 0.38, "whoosh_deep.wav")
-                _add_sfx(cursor_t + 0.03, 0.32, "sub_boom.wav")
 
         chapter_intro_s = 1.65 if sc.chapter_card else 0.0
         chap_gap_wav = work_dir / f"_chap_intro_{s_idx:03d}.wav"
@@ -5566,10 +6034,6 @@ async def render_netflix_documentary(
                 thermal_limit_c=thermal_limit_c,
             )
             audio_parts.append(chap_gap_wav)
-            if doc_mood == "dark_horror":
-                _add_sfx(cursor_t + 0.04, 0.56, "horror_braam.wav", "sub_boom.wav")
-            else:
-                _add_sfx(cursor_t + 0.04, 0.54, "sub_boom.wav", "cinematic_hit.wav")
 
         existing_sc_mp4 = work_dir / f"doc_scene_{s_idx:03d}.mp4"
         existing_vad_wav = work_dir / f"doc_narr_{s_idx:03d}_vad.wav"
@@ -5577,7 +6041,11 @@ async def render_netflix_documentary(
         if resume and existing_sc_mp4.exists() and existing_vad_wav.exists():
             est_wav_d = _probe_wav_duration_s(existing_vad_wav)
             if est_wav_d > 0.3:
-                exp_sc_d = round(chapter_intro_s + est_wav_d + pause_gap_s + (xfade_dur if s_idx < n_scenes - 1 else 0.0), 3)
+                # Last scene includes tail_pad_s=0.40; scenes 0..N-2 include xfade_dur=0.40!
+                exp_sc_d = round(
+                    chapter_intro_s + est_wav_d + pause_gap_s + (tail_pad_s if is_last_scene else xfade_dur),
+                    3,
+                )
                 scene_already_rendered = _is_valid_cached_scene_mp4(existing_sc_mp4, w, h, fps, exp_sc_d, tol_s=0.35)
 
         wav_p, words, speech_dur = await _synthesize_doc_scene_narration(
@@ -5594,6 +6062,23 @@ async def render_netflix_documentary(
             voice_engine=voice_engine,
             mood=doc_mood,
         )
+
+        # P1 #1: Per-Scene Voice Leveling (-18 LUFS) so narration loudness never swings 4-7 dB across scenes!
+        if normalize_scene_wav_lufs is not None and wav_p is not None and Path(wav_p).exists():
+            try:
+                norm_wav_p = await asyncio.to_thread(
+                    normalize_scene_wav_lufs,
+                    wav_p,
+                    -18.0,
+                    thermal_limit_c,
+                )
+                if norm_wav_p is not None and Path(norm_wav_p).exists():
+                    wav_p = Path(norm_wav_p)
+                    norm_dur = _probe_wav_duration_s(wav_p)
+                    if norm_dur > 0.3:
+                        speech_dur = norm_dur
+            except Exception as exc_norm:
+                print(f"[NetflixDoc] Per-scene voice LUFS leveling skipped on scene {s_idx + 1}: {exc_norm}", flush=True)
 
         # Shift scene words by chapter_intro_s (local scene time) and cursor_t (master time)
         local_words: List[Dict[str, Any]] = []
@@ -5612,51 +6097,33 @@ async def render_netflix_documentary(
                 }
             )
 
-        body_est = max(1.0, speech_dur + pause_gap_s)
-        n_shots_for_scene = max(3, min(7, int(round(body_est / eff_cad))))
+        audio_scene_dur = round(chapter_intro_s + speech_dur + pause_gap_s, 3)
+        scene_dur_with_tail = round(audio_scene_dur + (tail_pad_s if is_last_scene else 0.0), 3)
+        render_dur = round(scene_dur_with_tail + (xfade_dur if not is_last_scene else 0.0), 3)
+        exact_dur = max(1, int(round(render_dur * fps))) / float(fps)
+        body_dur = max(0.5, exact_dur - chapter_intro_s)
+
+        # Cap raised from min(7, ...) -> min(12, ...) so longer scenes preserve crisp ~2.5s visual cut cadence!
+        n_shots_for_scene = max(3, min(12, int(round(body_dur / eff_cad))))
         scene_shot_counts.append(n_shots_for_scene)
 
-        # Hollywood mood-matched foley & internal visual-cut SFX across ALL dynamic modes!
-        body_start_t = cursor_t + chapter_intro_s
-        if s_idx == 0:
-            if is_dark_mood:
-                _add_sfx(0.04, 0.56, "horror_braam.wav", "sub_boom.wav")
-            else:
-                _add_sfx(0.04, 0.50, "cinematic_hit.wav", "sub_boom.wav")
-        if sc.visual_mode in ("cinema_multishot", "parallax_25d_photo"):
-            sub_dur = body_est / float(n_shots_for_scene)
-            for si_cut in range(1, n_shots_for_scene):
-                cut_t = body_start_t + si_cut * sub_dur
-                if si_cut % 2 == 1:
-                    _add_sfx(cut_t - 0.04, 0.24, "whoosh_fast.wav", "camera_shutter.wav")
-                else:
-                    _add_sfx(cut_t - 0.03, 0.22, "flash_impact.wav", "whoosh_fast.wav")
-        elif sc.visual_mode == "broll_video_pip":
-            _add_sfx(body_start_t + 0.14, 0.34, "whoosh_fast.wav", "whoosh_deep.wav")
-        elif sc.visual_mode == "video_pip_evidence":
-            _add_sfx(body_start_t + 0.12, 0.36, "flash_impact.wav", "ui_click.wav")
-        elif sc.visual_mode == "newspaper_highlighter":
-            _add_sfx(body_start_t + 0.10, 0.44, "paper_flip.wav", "whoosh_deep.wav")
-        elif sc.visual_mode == "dark_map_route":
-            _add_sfx(body_start_t + 0.14, 0.32, "ui_click.wav")
-            _add_sfx(body_start_t + 0.24, 0.28, "whoosh_fast.wav")
-        elif sc.visual_mode == "sliding_timeline":
-            if doc_mood == "corporate_thriller":
-                _add_sfx(body_start_t + 0.16, 0.32, "cash_chime.wav", "ui_click.wav")
-            else:
-                _add_sfx(body_start_t + 0.14, 0.38, "sub_boom.wav", "ui_click.wav")
-        elif sc.visual_mode == "red_string_board":
-            _add_sfx(body_start_t + 0.10, 0.38, "heartbeat.wav", "sub_boom.wav")
-            _add_sfx(body_start_t + 0.36, 0.30, "paper_flip.wav", "whoosh_fast.wav")
+        # Re-verify cached scene MP4 against exact `render_dur` BEFORE media prefetch!
+        if resume and existing_sc_mp4.exists():
+            scene_already_rendered = _is_valid_cached_scene_mp4(existing_sc_mp4, w, h, fps, render_dur, tol_s=0.35)
+        already_rendered_mask.append(scene_already_rendered)
 
-        audio_scene_dur = round(chapter_intro_s + speech_dur + pause_gap_s, 3)
         scene_records.append(
             {
                 "s_idx": s_idx,
                 "scene": sc,
                 "start_t": cursor_t,
-                "scene_dur": audio_scene_dur,
+                "scene_dur": scene_dur_with_tail,
+                "render_dur": render_dur,
+                "exact_dur": exact_dur,
+                "body_dur": body_dur,
                 "chapter_intro_s": chapter_intro_s,
+                "transition_type": tr_name,
+                "already_rendered": scene_already_rendered,
                 "local_words": local_words,
                 "media_assets": SceneMediaAssets(),
             }
@@ -5665,14 +6132,16 @@ async def render_netflix_documentary(
         audio_parts.append(gap_wav)
         cursor_t = round(cursor_t + audio_scene_dur, 3)
 
-    # 2. ZERO-REPETITION MEDIA ORCHESTRATOR: Now that exact shot counts are known, pre-screen B-roll via
-    # Gemini Vision Critic AND batch-generate exact unique bespoke stills via Google Flow Pro (Nano Banana 2.1)!
-    total_planned_shots = sum(scene_shot_counts)
+    # 2. ZERO-REPETITION MEDIA ORCHESTRATOR: Skip already-rendered scenes completely on resume!
+    skip_scene_indices: Set[int] = {idx_r for idx_r, is_done in enumerate(already_rendered_mask) if is_done}
+    total_planned_shots = sum(
+        cnt for idx_c, cnt in enumerate(scene_shot_counts) if idx_c not in skip_scene_indices
+    )
     if progress_cb:
         progress_cb(
             30,
-            "♻️ Reaproveitando mídias exclusivas em cache do ponto de parada..."
-            if resume
+            f"♻️ Reaproveitando {len(skip_scene_indices)}/{n_scenes} cenas já renderizadas e mídias em cache..."
+            if (resume and skip_scene_indices)
             else f"Gerando {total_planned_shots} planos exclusivos sem repetição (Google Flow Pro Nano Banana 2.1 + Auditoria Visual Gemini)...",
         )
     scene_media_list, media_telemetry = await asyncio.to_thread(
@@ -5683,10 +6152,98 @@ async def render_netflix_documentary(
         doc_mood,
         resume,
         scene_shot_counts,
+        skip_scene_indices,
     )
     for idx_m, rec in enumerate(scene_records):
         if idx_m < len(scene_media_list):
             rec["media_assets"] = scene_media_list[idx_m]
+
+    # 2.5 EXACT VISUAL-ALIGNED HOLLYWOOD SFX SCHEDULING (P1 #2)
+    # Scheduled AFTER media prefetch & exact `render_dur`/`body_dur` so EVERY riser, whoosh,
+    # graphic foley (`body_start_t + pre_dur`), and internal cut SFX hits the EXACT visual cut!
+    for rec in scene_records:
+        s_idx = rec["s_idx"]
+        sc: NetflixDocScene = rec["scene"]
+        sc_start_t = float(rec["start_t"])
+        chapter_intro_s = float(rec["chapter_intro_s"])
+        body_start_t = sc_start_t + chapter_intro_s
+        body_dur = float(rec["body_dur"])
+        tr_name = str(rec["transition_type"])
+        is_last_scene = s_idx == (n_scenes - 1)
+
+        if s_idx > 0:
+            # Transition SFX aligned to exact peak/cutoff at `sc_start_t`!
+            if sc.chapter_card:
+                if sc_start_t >= 1.4:
+                    _add_sfx(max(0.0, sc_start_t - 2.48), 0.26, "riser_tension.wav")
+            elif tr_name in ("smoothleft", "wiperight"):
+                _add_sfx(max(0.0, sc_start_t - 0.48), 0.36, "whoosh_deep.wav", "whoosh_fast.wav")
+            elif tr_name == "zoomin":
+                _add_sfx(max(0.0, sc_start_t - 0.04), 0.38, "flash_impact.wav", "cinematic_hit.wav")
+            else:
+                _add_sfx(max(0.0, sc_start_t - 0.48), 0.34, "whoosh_deep.wav")
+                _add_sfx(sc_start_t + 0.03, 0.28, "sub_boom.wav")
+
+        if chapter_intro_s > 0.0:
+            if doc_mood == "dark_horror":
+                _add_sfx(sc_start_t + 0.04, 0.34, "horror_braam.wav", "sub_boom.wav")
+            else:
+                _add_sfx(sc_start_t + 0.04, 0.44, "sub_boom.wav", "cinematic_hit.wav")
+
+        if s_idx == 0:
+            if is_dark_mood:
+                _add_sfx(0.04, 0.34, "horror_braam.wav", "sub_boom.wav")
+            else:
+                _add_sfx(0.04, 0.42, "cinematic_hit.wav", "sub_boom.wav")
+
+        # Determine actual rendered visual shot count for this scene (only emit cut SFX when real visual cuts exist!)
+        seq_len = len(rec["media_assets"].shot_sequence or [])
+        if seq_len == 0 and rec["already_rendered"]:
+            # Resumed skipped scene: estimate shot count from cached work assets, else planned count
+            cached_shots = len(list(work_dir.glob(f"flow_sc{s_idx:02d}_shot*"))) + len(list(work_dir.glob(f"photo_sc{s_idx:02d}_shot*")))
+            has_cached_broll = 1 if _find_cached_work_asset(work_dir, f"broll_sc{s_idx:02d}_main", min_bytes=32_768) else 0
+            seq_len = (cached_shots + has_cached_broll) or scene_shot_counts[s_idx]
+
+        if sc.visual_mode in ("cinema_multishot", "parallax_25d_photo"):
+            if seq_len >= 2:
+                shot_dur = max(0.8, body_dur / float(seq_len))
+                # Stop before xfade overlap on scenes 0..N-2 so internal cut whooshes never collide with scene transitions
+                safe_cut_limit = (body_dur - xfade_dur - 0.15) if not is_last_scene else (body_dur - 0.15)
+                for si_cut in range(1, seq_len):
+                    cut_local_t = si_cut * shot_dur
+                    if cut_local_t >= safe_cut_limit:
+                        break
+                    cut_t = body_start_t + cut_local_t
+                    if si_cut % 2 == 1:
+                        _add_sfx(max(0.0, cut_t - 0.24), 0.16, "whoosh_fast.wav", "camera_shutter.wav")
+                    else:
+                        _add_sfx(max(0.0, cut_t - 0.03), 0.15, "flash_impact.wav", "whoosh_fast.wav")
+        elif sc.visual_mode == "broll_video_pip":
+            _add_sfx(max(0.0, body_start_t + 0.14 - 0.24), 0.22, "whoosh_fast.wav", "whoosh_deep.wav")
+        elif sc.visual_mode == "video_pip_evidence":
+            _add_sfx(body_start_t + 0.12, 0.28, "flash_impact.wav", "ui_click.wav")
+        elif sc.visual_mode in GRAPHIC_BOOKEND_MODES:
+            bookend_w = _compute_bookended_graphic_window(
+                sc.visual_mode,
+                body_dur,
+                seq_len,
+                cut_cadence_s=cut_cadence_s,
+            )
+            # Schedule graphic foley RIGHT when the bookended graphic enters (`body_start_t + pre_dur`), NOT +0.10s!
+            graphic_enter_t = (body_start_t + bookend_w[0]) if bookend_w is not None else (body_start_t + 0.10)
+            if sc.visual_mode == "newspaper_highlighter":
+                _add_sfx(graphic_enter_t, 0.36, "paper_flip.wav", "whoosh_deep.wav")
+            elif sc.visual_mode == "dark_map_route":
+                _add_sfx(graphic_enter_t, 0.28, "ui_click.wav")
+                _add_sfx(max(0.0, graphic_enter_t - 0.24), 0.16, "whoosh_fast.wav")
+            elif sc.visual_mode == "sliding_timeline":
+                if doc_mood == "corporate_thriller":
+                    _add_sfx(graphic_enter_t, 0.28, "cash_chime.wav", "ui_click.wav")
+                else:
+                    _add_sfx(graphic_enter_t, 0.30, "sub_boom.wav", "ui_click.wav")
+            elif sc.visual_mode == "red_string_board":
+                _add_sfx(graphic_enter_t, 0.32, "heartbeat.wav", "sub_boom.wav")
+                _add_sfx(graphic_enter_t + 0.26, 0.24, "paper_flip.wav", "whoosh_fast.wav")
 
     # Concatenate full narration WAV and master Broadcast Audio (-14 LUFS + 0.40s clean tail)
     concat_audio_txt = work_dir / "doc_audio_concat.txt"
@@ -5706,16 +6263,17 @@ async def render_netflix_documentary(
         master_audio,
         cursor_t,
         eff_music_vol,
-        0.40,
+        tail_pad_s,
         thermal_limit_c=thermal_limit_c,
     )
 
-    # Extend last scene by 0.40s broadcast audio tail; add +0.35s visual handle to scenes 0..N-2 for exact A/V sync across xfade!
+    # Reconcile last scene duration in case `master_broadcast_audio` returned a slightly different `final_dur`
     if scene_records:
-        tail_delta = max(0.0, round(final_dur - cursor_t, 3))
-        scene_records[-1]["scene_dur"] = round(scene_records[-1]["scene_dur"] + tail_delta, 3)
-        for idx_r, rec in enumerate(scene_records):
-            rec["render_dur"] = round(rec["scene_dur"] + (xfade_dur if idx_r < len(scene_records) - 1 else 0.0), 3)
+        actual_tail_delta = max(0.0, round(final_dur - cursor_t, 3))
+        if abs(actual_tail_delta - tail_pad_s) > 0.005:
+            base_last = round(scene_records[-1]["scene_dur"] - tail_pad_s, 3)
+            scene_records[-1]["scene_dur"] = round(base_last + actual_tail_delta, 3)
+            scene_records[-1]["render_dur"] = scene_records[-1]["scene_dur"]
 
     # 3. Render each scene to disk one-by-one (os.nice(10) + thermal_guard_wait -> flat RAM!)
     scene_mp4_paths: List[Path] = []
@@ -5724,7 +6282,7 @@ async def render_netflix_documentary(
         s_idx = rec["s_idx"]
         sc: NetflixDocScene = rec["scene"]
         out_sc_mp4 = work_dir / f"doc_scene_{s_idx:03d}.mp4"
-        if resume and _is_valid_cached_scene_mp4(out_sc_mp4, w, h, fps, rec["render_dur"]):
+        if resume and (rec.get("already_rendered") or _is_valid_cached_scene_mp4(out_sc_mp4, w, h, fps, rec["render_dur"], tol_s=0.35)):
             if progress_cb:
                 pct = 45 + int(40 * ((s_idx + 1) / float(max(1, n_scenes))))
                 progress_cb(
@@ -5742,6 +6300,7 @@ async def render_netflix_documentary(
                 pct,
                 f"Renderizando cena Skia C++ {s_idx + 1}/{n_scenes} [{sc.visual_mode}] ({w}x{h} @ {fps}fps | Vídeo Real + PiP + Fotos)...",
             )
+        prev_lt_title = plan_obj.scenes[s_idx - 1].lower_third_title if s_idx > 0 else None
         rendered_p, did_u2netp = await asyncio.to_thread(
             _render_single_doc_scene_to_disk,
             sc,
@@ -5764,14 +6323,15 @@ async def render_netflix_documentary(
             plan_obj.lang,
             eff_caption_style,
             cut_cadence_s,
+            prev_lt_title,
         )
         if did_u2netp:
             u2netp_25d_used = True
         scene_mp4_paths.append(rendered_p)
 
-    # 4. Join rendered scenes with smooth 0.35s FFmpeg `xfade` cinema transitions + mux master broadcast audio
+    # 4. Join rendered scenes with smooth 0.40s FFmpeg `xfade` cinema transitions + mux master broadcast audio
     if progress_cb:
-        progress_cb(88, "Aplicando transições cinema FFmpeg xfade (0.35s) e mixagem master -14 LUFS...")
+        progress_cb(88, "Aplicando transições cinema FFmpeg xfade (0.40s) e mixagem master -14 LUFS...")
     base_scenes_mp4 = work_dir / "base_scenes.mp4"
     base_scenes_mp4, xfade_active = await asyncio.to_thread(
         _concat_scenes_with_xfade,
@@ -5782,6 +6342,7 @@ async def render_netflix_documentary(
         base_scenes_mp4,
         work_dir,
         thermal_limit_c,
+        [float(rec["scene_dur"]) for rec in scene_records],
     )
 
     run_ffmpeg_safe(

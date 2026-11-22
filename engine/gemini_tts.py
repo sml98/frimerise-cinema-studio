@@ -47,6 +47,50 @@ _ROMAN_TO_PT: Dict[str, str] = {
     "XXI": "vinte e um",
 }
 
+# Formal PT-BR grammar for centuries, monarchs & popes:
+# I..X -> ordinal (primeiro..décimo), XI..XXI -> cardinal (onze..vinte e um)
+_ROMAN_CENTURY_PT: Dict[str, str] = {
+    "I": "primeiro",
+    "II": "segundo",
+    "III": "terceiro",
+    "IV": "quarto",
+    "V": "quinto",
+    "VI": "sexto",
+    "VII": "sétimo",
+    "VIII": "oitavo",
+    "IX": "nono",
+    "X": "décimo",
+    "XI": "onze",
+    "XII": "doze",
+    "XIII": "treze",
+    "XIV": "quatorze",
+    "XV": "quinze",
+    "XVI": "dezesseis",
+    "XVII": "dezessete",
+    "XVIII": "dezoito",
+    "XIX": "dezenove",
+    "XX": "vinte",
+    "XXI": "vinte e um",
+}
+
+_ROMAN_ORDINAL_FEM_PT: Dict[str, str] = {
+    "I": "primeira",
+    "II": "segunda",
+    "III": "terceira",
+    "IV": "quarta",
+    "V": "quinta",
+    "VI": "sexta",
+    "VII": "sétima",
+    "VIII": "oitava",
+    "IX": "nona",
+    "X": "décima",
+}
+
+_FEMALE_MONARCH_NAMES = {
+    "maria", "isabel", "elizabeth", "elisabete", "catarina", "joana",
+    "teresa", "leopoldina", "carlota", "ana", "vitória", "vitoria", "cleópatra",
+}
+
 _ROMAN_TO_EN: Dict[str, str] = {
     "I": "first",
     "II": "second",
@@ -72,8 +116,46 @@ _ROMAN_TO_EN: Dict[str, str] = {
 }
 
 
+def _expand_currency_pt(text: str, symbol: str, singular: str, plural: str) -> str:
+    pat = re.compile(
+        rf"(?<!\w){re.escape(symbol)}\s*(\d+(?:[.,]\d+)*)(?:\s+(mil|milh[aã]o|milh[oõ]es|bilh[aã]o|bilh[oõ]es|trilh[aã]o|trilh[oõ]es))?\b",
+        flags=re.I,
+    )
+
+    def _repl(m: re.Match[str]) -> str:
+        num_s = m.group(1)
+        scale = m.group(2)
+        if scale:
+            if scale.lower() == "mil":
+                return f"{num_s} mil {plural}"
+            return f"{num_s} {scale} de {plural}"
+        unit = singular if num_s in ("1", "1,00", "1.00") else plural
+        return f"{num_s} {unit}"
+
+    return pat.sub(_repl, text)
+
+
+def _expand_currency_en(text: str, symbol: str, singular: str, plural: str) -> str:
+    pat = re.compile(
+        rf"(?<!\w){re.escape(symbol)}\s*(\d+(?:[.,]\d+)*)(?:\s+(thousand|million|billion|trillion))?\b",
+        flags=re.I,
+    )
+
+    def _repl(m: re.Match[str]) -> str:
+        num_s = m.group(1)
+        scale = m.group(2)
+        if scale:
+            return f"{num_s} {scale} {plural}"
+        unit = singular if num_s in ("1", "1.00") else plural
+        return f"{num_s} {unit}"
+
+    return pat.sub(_repl, text)
+
+
 def normalize_narration_for_speech(text: str, lang: str = "pt_br") -> str:
-    """Normalize abbreviations, Roman numerals, and raw symbols so TTS diction is natural & fluid."""
+    """Normalize abbreviations, Roman numerals, currencies, units, monarchs, and raw symbols
+    so TTS diction is natural, grammatical, and fluid.
+    """
     s = (text or "").strip()
     if not s:
         return ""
@@ -91,25 +173,99 @@ def normalize_narration_for_speech(text: str, lang: str = "pt_br") -> str:
             s,
             flags=re.I,
         )
+        s = _expand_currency_en(s, "US$", "dollar", "dollars")
+        s = _expand_currency_en(s, "R$", "real", "reais")
+        s = _expand_currency_en(s, "£", "pound", "pounds")
+        s = _expand_currency_en(s, "€", "euro", "euros")
+        s = re.sub(r"(\d+(?:[.,]\d+)?)\s*%", r"\1 percent", s)
+        s = re.sub(
+            r"([+-]?\d+(?:[.,]\d+)?)\s*[°º]\s*C\b",
+            lambda m: f"{m.group(1)} {'degree' if m.group(1) in ('1', '-1', '+1') else 'degrees'} Celsius",
+            s,
+        )
+        s = re.sub(r"(\d+(?:[.,]\d+)?)\s*km/h\b", r"\1 kilometers per hour", s, flags=re.I)
+        s = re.sub(
+            r"(\d+(?:[.,]\d+)?)\s*km\b",
+            lambda m: f"{m.group(1)} {'kilometer' if m.group(1) == '1' else 'kilometers'}",
+            s,
+            flags=re.I,
+        )
+        s = re.sub(r"\s*&\s*", " and ", s)
     else:
+        # 1. Centuries (PT-BR formal grammar: I..X -> ordinal, XI..XXI -> cardinal)
         s = re.sub(
             r"\bs[eé]c\.?\s*([IVX]{1,4})\b",
-            lambda m: f"século {_ROMAN_TO_PT.get(m.group(1).upper(), m.group(1))}",
+            lambda m: f"século {_ROMAN_CENTURY_PT.get(m.group(1).upper(), m.group(1))}",
             s,
             flags=re.I,
         )
         s = re.sub(
-            r"\bséculo\s+([IVX]{1,4})\b",
-            lambda m: f"século {_ROMAN_TO_PT.get(m.group(1).upper(), m.group(1))}",
+            r"\bs[eé]culo\s+([IVX]{1,4})\b",
+            lambda m: f"século {_ROMAN_CENTURY_PT.get(m.group(1).upper(), m.group(1))}",
             s,
             flags=re.I,
         )
         s = re.sub(
-            r"\bcapítulo\s+([IVX]{1,4})\b",
+            r"\bcap[ií]tulo\s+([IVX]{1,4})\b",
             lambda m: f"capítulo {_ROMAN_TO_PT.get(m.group(1).upper(), m.group(1))}",
             s,
             flags=re.I,
         )
+
+        # 2. Monarchs, nobles & popes (e.g. "D. Pedro II" -> "Dom Pedro segundo", "D. Maria I" -> "Dona Maria primeira")
+        s = re.sub(
+            r"\bD\.\s+([A-ZÀ-Ý][a-zà-ÿ]+)\b",
+            lambda m: f"{'Dona' if m.group(1).lower() in _FEMALE_MONARCH_NAMES else 'Dom'} {m.group(1)}",
+            s,
+        )
+
+        def _monarch_roman_repl(m: re.Match[str]) -> str:
+            prefix = m.group(1)
+            rom = m.group(2)
+            if rom not in _ROMAN_CENTURY_PT:
+                return m.group(0)
+            low_pref = prefix.lower()
+            is_fem = (
+                low_pref.startswith(("dona ", "rainha ", "imperatriz "))
+                or any(fn in low_pref.split() for fn in _FEMALE_MONARCH_NAMES)
+            )
+            spoken = (_ROMAN_ORDINAL_FEM_PT.get(rom) if is_fem else None) or _ROMAN_CENTURY_PT[rom]
+            return f"{prefix} {spoken}"
+
+        s = re.sub(
+            r"\b((?:Dom|Dona|Rei|Rainha|Papa|Imperador|Imperatriz|Czar|Pr[ií]ncipe)\s+[A-ZÀ-Ý][a-zà-ÿ]+(?:\s+[A-ZÀ-Ý][a-zà-ÿ]+)?)\s+([IVX]{1,4})\b",
+            _monarch_roman_repl,
+            s,
+        )
+        s = re.sub(
+            r"\b(Pedro|Jo[aã]o|Henrique|Lu[ií]s|Carlos|F[ei]lipe|Afonso|Eduardo|Jorge|Nicolau|Alexandre|Isabel|Elizabeth|Catarina|Bento|Pio|Greg[oó]rio|Inoc[eê]ncio|Le[aã]o|Urbano|Clemente|J[uú]lio)\s+([IVX]{1,4})\b",
+            _monarch_roman_repl,
+            s,
+        )
+
+        # 3. Currencies (R$, US$, £, €)
+        s = _expand_currency_pt(s, "US$", "dólar", "dólares")
+        s = _expand_currency_pt(s, "R$", "real", "reais")
+        s = _expand_currency_pt(s, "£", "libra", "libras")
+        s = _expand_currency_pt(s, "€", "euro", "euros")
+
+        # 4. Percentages, temperatures, distances & ampersand
+        s = re.sub(r"(\d+(?:[.,]\d+)?)\s*%", r"\1 por cento", s)
+        s = re.sub(
+            r"([+-]?\d+(?:[.,]\d+)?)\s*[°º]\s*C\b",
+            lambda m: f"{m.group(1)} {'grau' if m.group(1) in ('1', '-1', '+1') else 'graus'} Celsius",
+            s,
+        )
+        s = re.sub(r"(\d+(?:[.,]\d+)?)\s*km/h\b", r"\1 quilômetros por hora", s, flags=re.I)
+        s = re.sub(
+            r"(\d+(?:[.,]\d+)?)\s*km\b",
+            lambda m: f"{m.group(1)} {'quilômetro' if m.group(1) == '1' else 'quilômetros'}",
+            s,
+            flags=re.I,
+        )
+        s = re.sub(r"\s*&\s*", " e ", s)
+
+        # 5. Historical era & common abbreviations
         s = re.sub(r"\ba\.C\.(?=\W|$)|\ba\.C\b", "antes de Cristo", s, flags=re.I)
         s = re.sub(r"\bd\.C\.(?=\W|$)|\bd\.C\b", "depois de Cristo", s, flags=re.I)
         s = re.sub(r"\bEUA\b", "Estados Unidos", s)
@@ -131,6 +287,10 @@ GEMINI_EXPRESSIVE_VOICES = [
 
 def _pcm24k_to_wav48k(pcm_bytes: bytes, out_wav: Path, thermal_limit_c: float = 85.0) -> float:
     """Convert raw 24kHz 16-bit mono PCM returned by Gemini TTS into broadcast 48kHz stereo WAV."""
+    if not pcm_bytes or len(pcm_bytes) < 2:
+        raise ValueError("PCM vazio ou corrompido retornado pelo Gemini TTS")
+    if len(pcm_bytes) % 2 != 0:
+        pcm_bytes = pcm_bytes[:-1]
     raw_24k = out_wav.with_name(out_wav.stem + "_24k.wav")
     with wave.open(str(raw_24k), "wb") as wf:
         wf.setnchannels(1)
@@ -153,6 +313,19 @@ def has_valid_gemini_key() -> Tuple[bool, str]:
     if (key.startswith("AQ.") and len(key) >= 32) or (key.startswith("AIza") and 35 <= len(key) <= 45):
         return True, key
     return False, key
+
+
+def _compute_backoff_s(attempt: int, status_code: Optional[int] = None, retry_after: Optional[str] = None) -> float:
+    """Compute bounded exponential backoff delay (respecting Retry-After header on HTTP 429/503)."""
+    if retry_after:
+        try:
+            ra = float(str(retry_after).strip())
+            if ra > 0.0:
+                return min(15.0, max(0.5, ra))
+        except Exception:
+            pass
+    base = 1.5 if status_code == 429 else 1.0
+    return min(12.0, base * (2 ** max(0, attempt)))
 
 
 def synthesize_gemini_tts_line(
@@ -191,15 +364,24 @@ def synthesize_gemini_tts_line(
     }
     headers = {"Content-Type": "application/json", "x-goog-api-key": key}
     last_err = "Gemini TTS indisponível"
+    max_attempts = 4
 
     for model_id in GEMINI_TTS_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
-        for attempt in range(2):
+        for attempt in range(max_attempts):
             try:
                 r = httpx.post(url, json=payload, headers=headers, timeout=45.0)
-                if r.status_code in (500, 502, 503) and attempt == 0:
-                    time.sleep(1.2)
-                    continue
+                if r.status_code in (429, 500, 502, 503):
+                    last_err = f"Gemini TTS ({model_id}) HTTP {r.status_code}: {r.text[:160]}"
+                    if attempt < max_attempts - 1:
+                        wait_s = _compute_backoff_s(
+                            attempt,
+                            status_code=r.status_code,
+                            retry_after=r.headers.get("Retry-After") if hasattr(r, "headers") else None,
+                        )
+                        time.sleep(wait_s)
+                        continue
+                    break
                 if r.status_code != 200:
                     last_err = f"Gemini TTS ({model_id}) HTTP {r.status_code}: {r.text[:160]}"
                     break
@@ -226,8 +408,8 @@ def synthesize_gemini_tts_line(
                 return out_wav, dur_s
             except Exception as exc:
                 last_err = str(exc)
-                if attempt == 0:
-                    time.sleep(0.8)
+                if attempt < max_attempts - 1:
+                    time.sleep(_compute_backoff_s(attempt))
                     continue
                 break
 
@@ -269,36 +451,53 @@ def synthesize_gemini_multispeaker_dialogue(
     }
     headers = {"Content-Type": "application/json", "x-goog-api-key": key}
     last_err = "Gemini Multi-Speaker TTS indisponível"
+    max_attempts = 4
 
     for model_id in GEMINI_TTS_MODELS:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
-        try:
-            r = httpx.post(url, json=payload, headers=headers, timeout=60.0)
-            if r.status_code != 200:
-                last_err = f"Gemini Multi-Speaker TTS ({model_id}) HTTP {r.status_code}: {r.text[:160]}"
-                continue
-
-            j = r.json()
-            parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            audio_b64 = ""
-            for p in parts:
-                idata = p.get("inlineData") or p.get("inline_data")
-                if idata and idata.get("data"):
-                    audio_b64 = idata["data"]
+        for attempt in range(max_attempts):
+            try:
+                r = httpx.post(url, json=payload, headers=headers, timeout=60.0)
+                if r.status_code in (429, 500, 502, 503):
+                    last_err = f"Gemini Multi-Speaker TTS ({model_id}) HTTP {r.status_code}: {r.text[:160]}"
+                    if attempt < max_attempts - 1:
+                        time.sleep(
+                            _compute_backoff_s(
+                                attempt,
+                                status_code=r.status_code,
+                                retry_after=r.headers.get("Retry-After") if hasattr(r, "headers") else None,
+                            )
+                        )
+                        continue
                     break
-            if not audio_b64:
-                last_err = f"Gemini Multi-Speaker TTS ({model_id}) sem áudio."
-                continue
+                if r.status_code != 200:
+                    last_err = f"Gemini Multi-Speaker TTS ({model_id}) HTTP {r.status_code}: {r.text[:160]}"
+                    break
 
-            pcm = base64.b64decode(audio_b64)
-            dur_s = _pcm24k_to_wav48k(pcm, out_wav)
-            meta = j.get("usageMetadata", {})
-            pt = int(meta.get("promptTokenCount", 120))
-            ct = int(meta.get("candidatesTokenCount", 400))
-            record_token_usage("gemini-tts", model_id, pt, ct, 0, round((pt * 0.5 + ct * 10.0) / 1_000_000.0, 5))
-            return out_wav, dur_s
-        except Exception as exc:
-            last_err = str(exc)
-            continue
+                j = r.json()
+                parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                audio_b64 = ""
+                for p in parts:
+                    idata = p.get("inlineData") or p.get("inline_data")
+                    if idata and idata.get("data"):
+                        audio_b64 = idata["data"]
+                        break
+                if not audio_b64:
+                    last_err = f"Gemini Multi-Speaker TTS ({model_id}) sem áudio."
+                    break
+
+                pcm = base64.b64decode(audio_b64)
+                dur_s = _pcm24k_to_wav48k(pcm, out_wav)
+                meta = j.get("usageMetadata", {})
+                pt = int(meta.get("promptTokenCount", 120))
+                ct = int(meta.get("candidatesTokenCount", 400))
+                record_token_usage("gemini-tts", model_id, pt, ct, 0, round((pt * 0.5 + ct * 10.0) / 1_000_000.0, 5))
+                return out_wav, dur_s
+            except Exception as exc:
+                last_err = str(exc)
+                if attempt < max_attempts - 1:
+                    time.sleep(_compute_backoff_s(attempt))
+                    continue
+                break
 
     raise RuntimeError(last_err)
