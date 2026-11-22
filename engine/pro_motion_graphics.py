@@ -485,25 +485,50 @@ def extract_depth_stamp_text(raw_text_or_scene: Any) -> str:
         if re.search(rf"\bS[EÉ]C(?:ULO|\.)?\s+{word_c}\b", upper_raw):
             return f"SÉC. {rom_c}"
 
-    # 4. Otherwise pick the strongest 1-2 word location/entity token before '•' or ','
+    # 4. Otherwise pick the strongest 1-2 whole location/entity words before '•' or ',' (ZERO mid-word [:N] slices!)
     first_seg = re.split(r"[•|—\-:,]", upper_raw)[0].strip()
     stop_words = {"DE", "DA", "DO", "DAS", "DOS", "EM", "NO", "NA", "NOS", "NAS", "O", "A", "OS", "AS", "ANTIGA"}
     words = [w for w in first_seg.split() if w not in stop_words]
     if not words:
         words = first_seg.split()
-    stamp = " ".join(words[:2]).strip()
-    return stamp[:14] if stamp else "ARQUIVO"
+    if not words:
+        return "ARQUIVO"
+    two_words = " ".join(words[:2]).strip()
+    if len(two_words) <= 16:
+        return two_words
+    return words[0].strip() or "ARQUIVO"
 
 
 # ---------------------------------------------------------------------------
 # 1. Signature 3D Depth Title Behind 2.5D Foreground Subject (Alpha-Aware + Sprite-Cached)
 # ---------------------------------------------------------------------------
+def _dilate_alpha_grid(grid: np.ndarray, rx: int, ry: int) -> np.ndarray:
+    """Fast pure-NumPy 2D separable max-dilation over a `(2*ry+1) x (2*rx+1)` kernel."""
+    out = grid
+    if rx > 0:
+        padded = np.pad(out, ((0, 0), (rx, rx)), mode="edge")
+        acc = padded[:, : out.shape[1]].copy()
+        for dx in range(1, 2 * rx + 1):
+            np.maximum(acc, padded[:, dx : dx + out.shape[1]], out=acc)
+        out = acc
+    if ry > 0:
+        padded = np.pad(out, ((ry, ry), (0, 0)), mode="edge")
+        acc = padded[: out.shape[0], :].copy()
+        for dy in range(1, 2 * ry + 1):
+            np.maximum(acc, padded[dy : dy + out.shape[0], :], out=acc)
+        out = acc
+    return out
+
+
 def _analyze_fg_alpha(
     fg_img: skia.Image,
     w: int,
     h: int,
 ) -> Tuple[float, float, np.ndarray]:
-    """Compute and cache `(fg_cx_norm, fg_y_top_norm, alpha_grid)` once per `fg_img.uniqueID()`."""
+    """Compute and cache `(fg_cx_norm, fg_y_top_norm, alpha_grid)` once per `fg_img.uniqueID()`.
+    Dilates `alpha_grid` to the worst-case `1.14x` foreground push-in + opposing parallax envelope
+    so 3D Depth Titles stay unoccluded across the ENTIRE shot duration (never clipping leading/trailing glyphs!).
+    """
     key = (int(fg_img.uniqueID()), int(w), int(h))
     cached = _FG_ALPHA_CACHE.get(key)
     if cached is not None:
@@ -512,12 +537,27 @@ def _analyze_fg_alpha(
     is_wide = w >= h
     gw = 160 if is_wide else 90
     gh = 90 if is_wide else 160
-    surf = skia.Surface(gw, gh)
-    c = surf.getCanvas()
-    c.clear(skia.ColorSetARGB(0, 0, 0, 0))
-    _draw_image_cover(c, fg_img, skia.Rect.MakeWH(gw, gh), y_bias=0.25)
-    raw = surf.makeImageSnapshot().tobytes()
-    alpha_grid = np.frombuffer(raw, dtype=np.uint8).reshape(gh, gw, 4)[:, :, 3].copy()
+
+    def _render_alpha_at_scale(scale: float) -> np.ndarray:
+        surf = skia.Surface(gw, gh)
+        c = surf.getCanvas()
+        c.clear(skia.ColorSetARGB(0, 0, 0, 0))
+        c.save()
+        c.translate(gw * 0.5, gh * 0.5)
+        c.scale(scale, scale)
+        c.translate(-gw * 0.5, -gh * 0.5)
+        _draw_image_cover(c, fg_img, skia.Rect.MakeWH(gw, gh), y_bias=0.25)
+        c.restore()
+        raw = surf.makeImageSnapshot().tobytes()
+        return np.frombuffer(raw, dtype=np.uint8).reshape(gh, gw, 4)[:, :, 3].copy()
+
+    # Union of 1.00x base footprint and worst-case 1.14x foreground push-in footprint + parallax safety dilation
+    alpha_100 = _render_alpha_at_scale(1.00)
+    alpha_114 = _render_alpha_at_scale(1.14)
+    alpha_union = np.maximum(alpha_100, alpha_114)
+    pad_rx = max(2, int(round(gw * 0.028)))
+    pad_ry = max(2, int(round(gh * 0.022)))
+    alpha_grid = _dilate_alpha_grid(alpha_union, pad_rx, pad_ry)
 
     mask = alpha_grid >= 96
     if mask.any():
@@ -561,6 +601,26 @@ def _bbox_clear_fraction(
     return float(np.mean(patch < alpha_thresh))
 
 
+def _bbox_quartile_clear_fractions(
+    alpha_grid: np.ndarray,
+    x0_norm: float,
+    y0_norm: float,
+    x1_norm: float,
+    y1_norm: float,
+    alpha_thresh: int = 96,
+) -> Tuple[float, float, float, float]:
+    """Return `(q0, q1, q2, q3)` clear fractions across the 4 horizontal quartiles of the text bbox
+    so leading/trailing glyphs (e.g. 'S' in 'SÉC. IV' or 'A' in 'ESCANDINÁVIA') are NEVER occluded!
+    """
+    span = max(1e-4, float(x1_norm) - float(x0_norm))
+    return (
+        _bbox_clear_fraction(alpha_grid, x0_norm, y0_norm, x0_norm + span * 0.25, y1_norm, alpha_thresh=alpha_thresh),
+        _bbox_clear_fraction(alpha_grid, x0_norm + span * 0.25, y0_norm, x0_norm + span * 0.50, y1_norm, alpha_thresh=alpha_thresh),
+        _bbox_clear_fraction(alpha_grid, x0_norm + span * 0.50, y0_norm, x0_norm + span * 0.75, y1_norm, alpha_thresh=alpha_thresh),
+        _bbox_clear_fraction(alpha_grid, x0_norm + span * 0.75, y0_norm, x1_norm, y1_norm, alpha_thresh=alpha_thresh),
+    )
+
+
 def _compute_depth_title_placement(
     stamp: str,
     w: int,
@@ -569,12 +629,14 @@ def _compute_depth_title_placement(
     fg_img: Optional[skia.Image] = None,
 ) -> Tuple[float, float, float, float, float]:
     """Compute and cache Rule-of-Thirds + Headroom placement `(center_x, baseline_y, font_size, measured_w, clear_frac)`.
-    Guarantees `>= 88%` of text bounding box has `fg_alpha < 96` whenever `fg_img` is provided.
+    Uses the dilated worst-case `1.14x` foreground alpha footprint and requires BOTH:
+      - global `cf >= 0.92` (`fg_alpha < 96`)
+      - EVERY horizontal quartile `q_cf >= 0.75` (protecting leading/trailing characters!).
     """
     is_wide = w >= h
     target_max_w = w * (0.76 if is_wide else 0.86)
     base_font_size = 236.0 if is_wide else 220.0
-    min_font_size = 64.0
+    min_font_size = 56.0
 
     font = skia.Font(title_tf, base_font_size)
     font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
@@ -601,30 +663,28 @@ def _compute_depth_title_placement(
 
     fg_cx_norm, fg_y_top_norm, alpha_grid = _analyze_fg_alpha(fg_img, w, h)
 
-    # Rule-of-Thirds + Headroom candidate ordering:
-    # - In 16:9: shift horizontally into open negative space opposite fg_cx_norm
-    #   (fg_cx < 0.48 -> ~0.62*w; fg_cx > 0.52 -> ~0.38*w; centered -> raise baseline_y above fg_y_top + 0.08*h)
+    # Rule-of-Thirds + Headroom candidate ordering (expanded negative-space sweeps for 1.14x dilated masks)
     if is_wide:
         if fg_cx_norm < 0.48:
-            cx_cands = [0.62, 0.67, 0.72, 0.78, 0.83, 0.56, 0.50, 0.22]
-            by_cands = [0.36, 0.30, 0.44, 0.24, 0.52, max(0.15, fg_y_top_norm + 0.06)]
+            cx_cands = [0.64, 0.70, 0.76, 0.82, 0.58, 0.50, 0.24, 0.18]
+            by_cands = [0.34, 0.26, 0.20, 0.42, 0.16, 0.50, max(0.14, fg_y_top_norm + 0.04)]
         elif fg_cx_norm > 0.52:
-            cx_cands = [0.38, 0.33, 0.28, 0.22, 0.17, 0.44, 0.50, 0.78]
-            by_cands = [0.36, 0.30, 0.44, 0.24, 0.52, max(0.15, fg_y_top_norm + 0.06)]
+            cx_cands = [0.36, 0.30, 0.24, 0.18, 0.42, 0.50, 0.76, 0.82]
+            by_cands = [0.34, 0.26, 0.20, 0.42, 0.16, 0.50, max(0.14, fg_y_top_norm + 0.04)]
         else:
-            headroom_by = max(0.16, min(0.38, fg_y_top_norm + 0.06))
-            cx_cands = [0.50, 0.68, 0.32, 0.76, 0.24, 0.83, 0.17, 0.62, 0.38]
-            by_cands = [headroom_by, max(0.13, fg_y_top_norm + 0.02), 0.26, 0.34, 0.44, 0.54]
+            headroom_by = max(0.15, min(0.36, fg_y_top_norm + 0.04))
+            cx_cands = [0.50, 0.72, 0.28, 0.78, 0.22, 0.84, 0.16, 0.64, 0.36]
+            by_cands = [headroom_by, max(0.13, fg_y_top_norm), 0.20, 0.26, 0.34, 0.44, 0.54]
     else:
-        headroom_by = max(0.16, min(0.36, fg_y_top_norm + 0.06))
-        cx_cands = [0.50, 0.62, 0.38, 0.74, 0.26]
-        by_cands = [headroom_by, max(0.13, fg_y_top_norm + 0.02), 0.22, 0.28, 0.12, 0.40]
+        headroom_by = max(0.15, min(0.34, fg_y_top_norm + 0.04))
+        cx_cands = [0.50, 0.64, 0.36, 0.76, 0.24]
+        by_cands = [headroom_by, max(0.12, fg_y_top_norm), 0.18, 0.24, 0.32, 0.40]
 
     best_any: Optional[Tuple[float, float, float, float, float]] = None
     best_any_score = -1.0
     chosen: Optional[Tuple[float, float, float, float, float]] = None
 
-    for scale_mult in (1.0, 0.86, 0.74, 0.62, 0.50, 0.40, 0.32):
+    for scale_mult in (1.0, 0.86, 0.74, 0.62, 0.50, 0.40, 0.32, 0.26):
         fs = max(min_font_size, base_font_size * scale_mult)
         f_try = skia.Font(title_tf, fs)
         mw = float(f_try.measureText(stamp))
@@ -635,7 +695,7 @@ def _compute_depth_title_placement(
         half_w_norm = (mw * 0.5) / float(w)
         asc_norm = asc / float(h)
         desc_norm = desc / float(h)
-        drift_pad_x = 12.0 / float(w)
+        drift_pad_x = 16.0 / float(w)
 
         found_at_scale: Optional[Tuple[float, float, float, float, float]] = None
         best_clear_at_scale = -1.0
@@ -650,15 +710,18 @@ def _compute_depth_title_placement(
                 y0 = by_clamped - asc_norm
                 y1 = by_clamped + desc_norm
                 cf = _bbox_clear_fraction(alpha_grid, x0, y0, x1, y1, alpha_thresh=96)
+                q_cfs = _bbox_quartile_clear_fractions(alpha_grid, x0, y0, x1, y1, alpha_thresh=96)
+                min_q_cf = min(q_cfs)
 
-                if cf >= 0.88:
-                    # Prefer first candidate hitting >=88%, breaking ties by higher clarity
-                    if found_at_scale is None or cf > best_clear_at_scale + 0.03:
-                        best_clear_at_scale = cf
+                if cf >= 0.92 and min_q_cf >= 0.75:
+                    # Prefer first candidate hitting global >=92% AND every quartile >=75%, breaking ties by clarity
+                    eff_clarity = cf * 0.65 + min_q_cf * 0.35
+                    if found_at_scale is None or eff_clarity > best_clear_at_scale + 0.02:
+                        best_clear_at_scale = eff_clarity
                         found_at_scale = (cx_clamped * w, by_clamped * h, fs, mw, cf)
-                        if cf >= 0.94:
+                        if cf >= 0.96 and min_q_cf >= 0.90:
                             break
-                score = cf * 100.0 + scale_mult * 8.0
+                score = cf * 100.0 + min_q_cf * 65.0 + scale_mult * 8.0
                 if score > best_any_score:
                     best_any_score = score
                     best_any = (cx_clamped * w, by_clamped * h, fs, mw, cf)
@@ -1157,11 +1220,11 @@ def draw_pro_safezone_lower_third(
         scale_y = float(h) / 1080.0
         margin_x = 96.0 * scale_x
         margin_y = 84.0 * scale_y
-        # Leave right half clear for bottom_right Selective Emphasis kinetic captions
-        max_pill_w = min(float(w) - margin_x * 2.0, float(w) * 0.56)
-        max_text_w = max(220.0, max_pill_w - 56.0)
+        # Strictly bound 16:9 pill to <= 0.42*w (806px, max right edge x=902px) so it NEVER reaches the right half!
+        max_pill_w = min(float(w) - margin_x * 2.0, float(w) * 0.42)
+        max_text_w = max(220.0, max_pill_w - 56.0 * scale_x)
 
-        t_font, t_lns = _wrap_text_to_width(clean_title, eff_title_tf, 42.0 * scale_x, 24.0 * scale_x, max_text_w, 1)
+        t_font, t_lns = _wrap_text_to_width(clean_title, eff_title_tf, 42.0 * scale_x, 20.0 * scale_x, max_text_w, 1)
         t_font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
         t_line = t_lns[0] if t_lns else clean_title
         t_w = float(t_font.measureText(t_line)) if t_line else 0.0
@@ -1171,7 +1234,7 @@ def draw_pro_safezone_lower_third(
         s_font = skia.Font(eff_ui_tf, 24.0 * scale_x)
         s_font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
         if clean_sub:
-            s_font, s_lns = _wrap_text_to_width(clean_sub, eff_ui_tf, 24.0 * scale_x, 15.0 * scale_x, max_text_w, 1)
+            s_font, s_lns = _wrap_text_to_width(clean_sub, eff_ui_tf, 24.0 * scale_x, 13.5 * scale_x, max_text_w, 1)
             s_font.setEdging(skia.Font.Edging.kSubpixelAntiAlias)
             s_line = s_lns[0] if s_lns else clean_sub
             s_w = float(s_font.measureText(s_line)) if s_line else 0.0
@@ -1324,8 +1387,13 @@ def draw_pro_safezone_lower_third(
 # ---------------------------------------------------------------------------
 # 4. Dark Cartographic Tactical Map of Europe & Mediterranean
 # ---------------------------------------------------------------------------
-# Procedural normalized (0..1, 0..1) coastline polygons for Europe & Mediterranean
+# Procedural normalized (0..1, 0..1) coastline polygons for Europe, Scandinavia & Mediterranean
 _EUROPE_LANDMASS_POLYS: List[List[Tuple[float, float]]] = [
+    # Scandinavia / Nordic Peninsula (Norway & Sweden)
+    [
+        (0.39, 0.16), (0.42, 0.10), (0.50, 0.05), (0.59, 0.08),
+        (0.58, 0.15), (0.52, 0.18), (0.45, 0.19),
+    ],
     # Great Britain (London at ~0.27, 0.27)
     [
         (0.21, 0.14), (0.26, 0.12), (0.28, 0.18), (0.27, 0.23),
@@ -1360,10 +1428,10 @@ _EUROPE_LANDMASS_POLYS: List[List[Tuple[float, float]]] = [
     [
         (0.39, 0.53), (0.41, 0.53), (0.41, 0.63), (0.38, 0.63),
     ],
-    # Anatolia / Asia Minor (Myra at ~0.78, 0.68) & Levant
+    # Anatolia / Asia Minor (Myra at ~0.78, 0.68) & Levant / Palmyra
     [
-        (0.72, 0.52), (0.82, 0.49), (0.95, 0.48), (0.97, 0.76),
-        (0.89, 0.78), (0.86, 0.69), (0.79, 0.70), (0.73, 0.66),
+        (0.72, 0.52), (0.82, 0.49), (0.95, 0.48), (0.97, 0.78),
+        (0.89, 0.80), (0.86, 0.69), (0.79, 0.70), (0.73, 0.66),
         (0.71, 0.58),
     ],
     # North Africa Mediterranean Coastline
@@ -1374,17 +1442,43 @@ _EUROPE_LANDMASS_POLYS: List[List[Tuple[float, float]]] = [
     ],
 ]
 
+# Eastern North America coastline polygons used in Transatlantic Projection Mode (u in [0.02..0.30])
+_EASTERN_NORTH_AMERICA_POLYS: List[List[Tuple[float, float]]] = [
+    # Labrador -> Nova Scotia -> New England (Boston ~0.228, 0.345) -> NY (~0.206, 0.402) -> Florida -> Gulf
+    [
+        (0.02, 0.14), (0.14, 0.13), (0.22, 0.17), (0.26, 0.23),
+        (0.29, 0.27), (0.25, 0.30), (0.255, 0.345), (0.225, 0.395),
+        (0.205, 0.455), (0.215, 0.525), (0.175, 0.595), (0.185, 0.695),
+        (0.165, 0.775), (0.135, 0.755), (0.125, 0.675), (0.06, 0.665),
+        (0.02, 0.640),
+    ],
+    # Newfoundland island
+    [
+        (0.285, 0.175), (0.320, 0.185), (0.315, 0.225), (0.280, 0.215),
+    ],
+]
+
+_AMERICAS_CITY_KEYS = (
+    "BOSTON", "MASSACHUSETTS", "NOVA INGLATERRA", "NEW ENGLAND",
+    "NOVA YORK", "NEW YORK", "NOVA IORQUE", "MANHATTAN",
+    "CHICAGO", "ILLINOIS", "WASHINGTON", "FILADÉLFIA", "FILADELFIA", "PHILADELPHIA",
+)
+
 _CITY_GEO_COORDS: List[Tuple[Tuple[str, ...], Tuple[float, float], str]] = [
     (("CANTERBURY", "KENT"), (0.292, 0.288), "51°16'N 01°04'E"),
+    (("WESTMINSTER", "PARLAMENTO"), (0.265, 0.278), "51°30'N 00°07'W"),
     (("AMSTERDÃ", "AMSTERDA", "AMSTERDAM", "HOLANDA", "PAÍSES BAIXOS", "NETHERLANDS", "DUTCH"), (0.352, 0.258), "52°22'N 04°54'E"),
     (("VATICANO", "VATICAN", "SANTA SÉ"), (0.463, 0.562), "41°54'N 12°27'E"),
     (("ROMA", "ROME", "ITÁLIA", "ITALY", "SATURNALIA", "SATURNÁLIA", "TRASIMENO"), (0.465, 0.565), "41°54'N 12°29'E"),
+    (("PALMIRA", "PALMYRA", "SÍRIA", "SIRIA", "SYRIA"), (0.885, 0.725), "34°33'N 38°16'E"),
     (("MIRA", "MYRA", "DEMRE", "ÁSIA MENOR", "ASIA MINOR", "ANATÓLIA", "ANATOLIA", "LÍCIA", "LICIA"), (0.785, 0.675), "36°15'N 29°59'E"),
     (("CONSTANTINOPLA", "CONSTANTINOPLE", "ISTAMBUL", "ISTANBUL", "BIZÂNCIO", "BYZANTIUM", "TURQUIA", "TURKEY"), (0.742, 0.542), "41°01'N 28°58'E"),
     (("ALPES", "ALPS", "ÁUSTRIA", "AUSTRIA", "TIROL", "SALZBURGO", "VIENA", "KRAMPUS"), (0.465, 0.395), "47°16'N 11°24'E"),
     (("ALEMANHA", "GERMANY", "BAVIERA", "BAVARIA", "MUNIQUE", "MUNICH", "BERLIM", "BERLIN", "HERZOGENAURACH"), (0.478, 0.335), "48°08'N 11°34'E"),
-    (("BOSTON", "MASSACHUSETTS", "NOVA INGLATERRA", "NEW ENGLAND"), (0.105, 0.340), "42°21'N 71°03'W"),
-    (("NOVA YORK", "NEW YORK", "NOVA IORQUE", "MANHATTAN"), (0.095, 0.395), "40°42'N 74°00'W"),
+    (("BOSTON", "MASSACHUSETTS", "NOVA INGLATERRA", "NEW ENGLAND"), (0.228, 0.345), "42°21'N 71°03'W"),
+    (("NOVA YORK", "NEW YORK", "NOVA IORQUE", "MANHATTAN"), (0.206, 0.402), "40°42'N 74°00'W"),
+    (("CHICAGO", "ILLINOIS"), (0.128, 0.362), "41°52'N 87°37'W"),
+    (("POLO NORTE", "NORTH POLE", "ÁRTICO", "ARTICO", "ARCTIC"), (0.500, 0.085), "90°00'N 00°00'E"),
     (("LONDRES", "LONDON", "WINDSOR", "MANCHESTER", "INGLATERRA", "ENGLAND", "BRITÂNICO", "PURITANO", "CROMWELL"), (0.268, 0.275), "51°30'N 00°07'W"),
     (("PARIS", "FRANÇA", "FRANCE"), (0.315, 0.355), "48°51'N 02°21'E"),
     (("ESCANDINÁVIA", "SCANDINAVIA", "NORUEGA", "NORWAY", "SUÉCIA", "SWEDEN", "YULE", "ODIN"), (0.480, 0.145), "59°55'N 10°45'E"),
@@ -1394,16 +1488,31 @@ _CITY_GEO_COORDS: List[Tuple[Tuple[str, ...], Tuple[float, float], str]] = [
 ]
 
 
+def _is_americas_location(name: str) -> bool:
+    up = _normalize_upper(name)
+    return any(k in up for k in _AMERICAS_CITY_KEYS)
+
+
+def _project_eu_uv_transatlantic(uv: Tuple[float, float]) -> Tuple[float, float]:
+    """Shift normalized Europe/Mediterranean UV into right half (`[0.44..1.00]`) for transatlantic routes."""
+    return (0.44 + uv[0] * 0.56, uv[1])
+
+
 def _resolve_city_map_point(
     name: str,
     default_uv: Tuple[float, float],
     default_coord: str,
+    transatlantic: bool = False,
 ) -> Tuple[Tuple[float, float], str]:
     up = _normalize_upper(name)
     for keys, uv, coord_str in _CITY_GEO_COORDS:
         for k in keys:
             if k in up:
+                if transatlantic and not _is_americas_location(name):
+                    return _project_eu_uv_transatlantic(uv), coord_str
                 return uv, coord_str
+    if transatlantic and not _is_americas_location(name):
+        return _project_eu_uv_transatlantic(default_uv), default_coord
     return default_uv, default_coord
 
 
@@ -1674,8 +1783,9 @@ def draw_pro_cartographic_map(
     metric_txt = str(_get_attr(scene, "map_metric", "ANÁLISE GEOGRÁFICA") or "ANÁLISE GEOGRÁFICA")
     lt_sub = str(_get_attr(scene, "lower_third_subtitle", "") or _get_attr(scene, "evidence_headline", "") or "")
 
-    uv_orig, coord_orig = _resolve_city_map_point(orig_name, (0.465, 0.565), "41°54'N 12°29'E")
-    uv_dest, coord_dest = _resolve_city_map_point(dest_name, uv_orig, coord_orig)
+    is_transatlantic = _is_americas_location(orig_name) or _is_americas_location(dest_name)
+    uv_orig, coord_orig = _resolve_city_map_point(orig_name, (0.465, 0.565), "41°54'N 12°29'E", transatlantic=is_transatlantic)
+    uv_dest, coord_dest = _resolve_city_map_point(dest_name, uv_orig, coord_orig, transatlantic=is_transatlantic)
 
     # Detect single-city event cleanly — NEVER silently reset uv_orig/uv_dest to fake cities!
     orig_norm = _normalize_upper(orig_name).strip()
@@ -1744,7 +1854,14 @@ def draw_pro_cartographic_map(
         Color=hex_to_skia("#2C323B", 235),
     )
 
-    for poly in _EUROPE_LANDMASS_POLYS:
+    if is_transatlantic:
+        active_polys: List[List[Tuple[float, float]]] = list(_EASTERN_NORTH_AMERICA_POLYS)
+        for eu_poly in _EUROPE_LANDMASS_POLYS:
+            active_polys.append([_project_eu_uv_transatlantic(pt) for pt in eu_poly])
+    else:
+        active_polys = list(_EUROPE_LANDMASS_POLYS)
+
+    for poly in active_polys:
         path = skia.Path()
         for idx_pt, (ux, uy) in enumerate(poly):
             px = geo_x0 + geo_w * ux
@@ -1758,6 +1875,19 @@ def draw_pro_cartographic_map(
         canvas.drawPath(path, land_fill)
         canvas.drawPath(path, coast_stroke)
 
+    if is_transatlantic:
+        ocean_lbl = "ATLANTIC OCEAN" if is_en else "OCEANO ATLÂNTICO"
+        oc_f = skia.Font(cp_tf, 13.0)
+        oc_w = float(oc_f.measureText(ocean_lbl))
+        _draw_safe_string(
+            canvas,
+            ocean_lbl,
+            geo_x0 + geo_w * 0.385 - oc_w * 0.5,
+            geo_y0 + geo_h * 0.62,
+            oc_f,
+            skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(88, 224, 192, 151)),
+        )
+
     # 2. Compass Rose Watermark
     _draw_compass_rose(
         canvas,
@@ -1768,6 +1898,8 @@ def draw_pro_cartographic_map(
     )
 
     coord_font = skia.Font(cp_tf, 13.5)
+    # Strictly clear left latitude axis labels (`mx + 14..78px`) on every callout/badge
+    min_badge_x = max(geo_x0 + 12.0, mx + 86.0)
 
     if is_single_city:
         # ------------------------------------------------------------------
@@ -1807,12 +1939,12 @@ def draw_pro_cartographic_map(
         canvas.drawLine(px - axis_len, py, px + axis_len, py, axis_p)
         canvas.drawLine(px, py - axis_len * 0.72, px, py + axis_len * 0.72, axis_p)
 
-        # Animated dashed vector callout lines radiating to schematic HUD callout nodes
+        # Animated dashed vector callout lines radiating to schematic HUD callout nodes (ZERO [:N] slicing!)
         callout_specs = [
             (
                 (px + 135.0, py - 88.0),
                 "PERÍMETRO ATIVO" if not is_en else "ACTIVE PERIMETER",
-                _normalize_upper(orig_name)[:20],
+                _normalize_upper(orig_name),
                 "#D9381E",
             ),
             (
@@ -1824,15 +1956,16 @@ def draw_pro_cartographic_map(
             (
                 (px + 142.0, py + 86.0),
                 "REGISTRO HISTÓRICO" if not is_en else "HISTORICAL EVENT",
-                _normalize_upper(lt_sub or metric_txt)[:24],
+                _normalize_upper(lt_sub or metric_txt),
                 "#F8FAFC",
             ),
         ]
+        max_callout_w = min(340.0, max(200.0, geo_w * 0.42))
         for c_idx, (end_pt, k_hdr, k_val, c_hex) in enumerate(callout_specs):
             c_prog = _ease_doc_snap(min(1.0, max(0.0, (prog - 0.08 * c_idx) / 0.38)))
             if c_prog <= 0.02:
                 continue
-            ex = max(geo_x0 + 90.0, min(geo_x0 + geo_w - 110.0, end_pt[0]))
+            ex = max(min_badge_x + 40.0, min(geo_x0 + geo_w - 110.0, end_pt[0]))
             ey = max(geo_y0 + 36.0, min(geo_y0 + geo_h - 46.0, end_pt[1]))
             elbow_x = px + (ex - px) * 0.55
             cur_ex = px + (ex - px) * c_prog
@@ -1853,12 +1986,16 @@ def draw_pro_cartographic_map(
             if c_prog > 0.55:
                 box_a = int(235 * min(1.0, (c_prog - 0.55) / 0.45))
                 hf = skia.Font(cp_tf, 12.5)
-                vf = skia.Font(cp_tf, 17.5)
-                bw = max(168.0, max(float(hf.measureText(k_hdr)), float(vf.measureText(k_val))) + 28.0)
-                bh = 50.0
+                vf, v_lns = _wrap_text_to_width(k_val, cp_tf, 16.5, 11.5, max_callout_w - 28.0, 2)
+                if not v_lns:
+                    v_lns = [k_val]
+                max_ln_w = max([float(hf.measureText(k_hdr))] + [float(vf.measureText(ln)) for ln in v_lns])
+                bw = min(max_callout_w, max(168.0, max_ln_w + 28.0))
+                line_step = vf.getSize() * 1.24
+                bh = 50.0 if len(v_lns) <= 1 else (36.0 + len(v_lns) * line_step + 8.0)
                 bx = ex if ex >= px else (ex - bw)
-                bx = max(geo_x0 + 12.0, min(geo_x0 + geo_w - bw - 12.0, bx))
-                by = ey - bh * 0.5
+                bx = max(min_badge_x, min(geo_x0 + geo_w - bw - 12.0, bx))
+                by = max(geo_y0 + 8.0, min(geo_y0 + geo_h - bh - 8.0, ey - bh * 0.5))
                 br = skia.Rect.MakeXYWH(bx, by, bw, bh)
                 canvas.drawRoundRect(br, 6.0, 6.0, skia.Paint(AntiAlias=True, Color=hex_to_skia("#121417", box_a)))
                 canvas.drawRoundRect(
@@ -1869,21 +2006,24 @@ def draw_pro_cartographic_map(
                 )
                 canvas.drawRect(skia.Rect.MakeXYWH(bx, by + 6.0, 3.5, bh - 12.0), skia.Paint(Color=hex_to_skia(c_hex, box_a)))
                 _draw_safe_string(canvas, k_hdr, bx + 12.0, by + 18.0, hf, skia.Paint(AntiAlias=True, Color=hex_to_skia(c_hex, box_a)))
-                _draw_safe_string(canvas, k_val, bx + 12.0, by + 39.0, vf, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", box_a)))
+                vy = by + 38.0
+                for vln in v_lns:
+                    _draw_safe_string(canvas, vln, bx + 12.0, vy, vf, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", box_a)))
+                    vy += line_step
 
         # Single high-precision target pin at true city coordinates
         canvas.drawCircle(px, py, 16.0, skia.Paint(AntiAlias=True, Color=hex_to_skia("#D9381E", 85)))
         canvas.drawCircle(px, py, 10.5, skia.Paint(AntiAlias=True, Color=hex_to_skia("#D9381E", 255)))
         canvas.drawCircle(px, py, 4.5, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", 255)))
 
-        # Crisp city label badge cleanly above the pin
+        # Crisp city label badge cleanly above the pin (always clearing left latitude labels!)
         c_clean = _sanitize_glyphs(_normalize_upper(orig_name), typeface=cinzel_tf)
-        cf, cl = _wrap_text_to_width(c_clean, cinzel_tf, 24.0, 16.0, 260.0, 1)
+        cf, cl = _wrap_text_to_width(c_clean, cinzel_tf, 24.0, 15.0, 260.0, 1)
         c_str = cl[0] if cl else c_clean
         cw = float(cf.measureText(c_str))
         tag_w = max(160.0, cw + 32.0)
         tag_h = 50.0
-        tx = max(geo_x0 + 12.0, min(geo_x0 + geo_w - tag_w - 12.0, px - tag_w * 0.5))
+        tx = max(min_badge_x, min(geo_x0 + geo_w - tag_w - 12.0, px - tag_w * 0.5))
         ty = max(geo_y0 + 12.0, py - tag_h - 24.0)
         tag_r = skia.Rect.MakeXYWH(tx, ty, tag_w, tag_h)
         canvas.drawRoundRect(tag_r, 8.0, 8.0, skia.Paint(AntiAlias=True, Color=hex_to_skia("#121417", 236)))
@@ -1983,7 +2123,7 @@ def draw_pro_cartographic_map(
         canvas.drawCircle(tip_x, tip_y, 24.0, ember_halo)
         canvas.drawCircle(tip_x, tip_y, 6.5, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC")))
 
-        # Origin & Destination Pins + Crisp Callout Badges
+        # Origin & Destination Pins + Crisp Callout Badges (tx >= mx + 86.0 clears latitude labels!)
         for is_dest, pin_pt, city_lbl, city_coord in (
             (False, p_orig, orig_name, coord_orig),
             (True, p_dest, dest_name, coord_dest),
@@ -1998,7 +2138,7 @@ def draw_pro_cartographic_map(
             cw = float(cf.measureText(c_str))
             tag_w = max(148.0, cw + 28.0)
             tag_h = 48.0
-            tx = max(geo_x0 + 12.0, min(geo_x0 + geo_w - tag_w - 12.0, pin_pt[0] - tag_w * 0.5))
+            tx = max(min_badge_x, min(geo_x0 + geo_w - tag_w - 12.0, pin_pt[0] - tag_w * 0.5))
             ty = pin_pt[1] + 18.0 if pin_pt[1] < (geo_y0 + geo_h * 0.72) else (pin_pt[1] - tag_h - 18.0)
 
             tag_r = skia.Rect.MakeXYWH(tx, ty, tag_w, tag_h)
@@ -2028,7 +2168,12 @@ def draw_pro_cartographic_map(
         canvas.drawLine(mx, gy, mx + map_w, gy, grat_p)
         _draw_safe_string(canvas, lat_lbl, mx + 14.0, gy - 6.0, coord_font, coord_paint)
 
-    for rx_norm, lon_lbl in ((0.26, "00°07'W"), (0.47, "12°29'E"), (0.65, "23°43'E"), (0.81, "29°59'E")):
+    lon_ticks = (
+        ((0.22, "71°03'W"), (0.40, "40°00'W"), (0.59, "00°07'W"), (0.80, "15°00'E"))
+        if is_transatlantic
+        else ((0.26, "00°07'W"), (0.47, "12°29'E"), (0.65, "23°43'E"), (0.81, "29°59'E"))
+    )
+    for rx_norm, lon_lbl in lon_ticks:
         gx = geo_x0 + geo_w * rx_norm
         canvas.drawLine(gx, my, gx, my + map_h, grat_p)
         _draw_safe_string(canvas, lon_lbl, gx + 6.0, my + map_h - 12.0, coord_font, coord_paint)
@@ -3089,8 +3234,8 @@ def _draw_catenary_red_string(
         c2 = (p1[0] + (corridor_mid[0] - p1[0]) * 0.72, p1[1] + (corridor_mid[1] - p1[1]) * 0.58)
     else:
         dist = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
-        # Gentle taut sag keeping horizontal pin-to-pin threads strictly above card badges
-        sag = min(32.0, 12.0 + dist * 0.025)
+        # Taut sag keeping horizontal pin-to-pin threads strictly in the top margin clear of card text/photos
+        sag = min(18.0, 8.0 + dist * 0.012)
         c1 = (p0[0] + (p1[0] - p0[0]) * 0.33, p0[1] + (p1[1] - p0[1]) * 0.33 + sag * 0.85)
         c2 = (p0[0] + (p1[0] - p0[0]) * 0.67, p0[1] + (p1[1] - p0[1]) * 0.67 + sag * 0.95)
 
@@ -3247,7 +3392,23 @@ def draw_pro_forensic_string_board(
         py = cy + local_py * math.cos(rad_t)
         pin_coords.append((px, py))
 
-    # 1. Draw the 4 Polaroid / Dossier Evidence Cards
+    # 1A. Draw DIAGONAL Catenary Red Strings `(0->3)` and `(1->2)` UNDERNEATH the cards so they
+    # emerge cleanly into the open central corridor and NEVER slash across card text (`217`) or coin photos!
+    corridor_cx = float(w) * 0.5
+    corridor_cy = (centers[0][1] + centers[2][1]) * 0.5
+    diag_edges = [
+        (2, 0, 3, (corridor_cx, corridor_cy - 18.0)),
+        (3, 1, 2, (corridor_cx, corridor_cy + 18.0)),
+    ]
+    for e_idx, i_start, i_end, corr_pt in diag_edges:
+        edge_start = 0.02 + e_idx * 0.055
+        edge_dur = 0.155
+        raw_ep = (prog_c - edge_start) / edge_dur
+        edge_prog = _ease_doc_snap(min(1.0, max(0.0, raw_ep)))
+        if edge_prog > 0.02:
+            _draw_catenary_red_string(canvas, centers[i_start], centers[i_end], edge_prog, corridor_mid=corr_pt)
+
+    # 1B. Draw the 4 Polaroid / Dossier Evidence Cards
     for idx, nd in enumerate(nodes):
         cx, cy = centers[idx]
         is_act = idx == active_idx
@@ -3402,18 +3563,13 @@ def draw_pro_forensic_string_board(
 
         canvas.restore()
 
-    # 2. Curved Catenary Bézier Red Strings — ALL finishing strictly by `prog <= 0.35` (ZERO severed strings!)
-    # and routed cleanly pin-to-pin above card tops / through the open central corridor so zero badges are crossed!
-    corridor_cx = float(w) * 0.5
-    corridor_cy = (centers[0][1] + centers[2][1]) * 0.5
-    edges = [
-        (0, 1, None),
-        (2, 3, None),
-        (0, 3, (corridor_cx, corridor_cy - 18.0)),
-        (1, 2, (corridor_cx, corridor_cy + 18.0)),
+    # 2. Horizontal Top-Corridor Catenary Bézier Red Strings `(0->1)` & `(2->3)` — completing cleanly by `prog <= 0.35`
+    # and staying strictly along the upper card border well clear of badges, titles, and polaroid photos!
+    horiz_edges = [
+        (0, 0, 1, None),
+        (1, 2, 3, None),
     ]
-    for e_idx, (i_start, i_end, corr_pt) in enumerate(edges):
-        # e_idx=0: 0.02..0.175, e_idx=1: 0.075..0.23, e_idx=2: 0.13..0.285, e_idx=3: 0.185..0.34 -> 100% complete by prog=0.35!
+    for e_idx, i_start, i_end, corr_pt in horiz_edges:
         edge_start = 0.02 + e_idx * 0.055
         edge_dur = 0.155
         raw_ep = (prog_c - edge_start) / edge_dur
@@ -3529,40 +3685,58 @@ def draw_2d_schematic_over_realism(
     for gy in range(0, h, step_g):
         canvas.drawLine(0, gy, w, gy, grid_p)
 
-    # Extract scene metadata for diagram nodes & key date/stat headline
+    # Extract scene-local metadata for diagram nodes & key date/stat headline
     stamp_big = extract_depth_stamp_text(scene)
     lt_title = _normalize_upper(str(_get_attr(scene, "lower_third_title", stamp_big) or stamp_big))
-    headline = _normalize_upper(str(_get_attr(scene, "evidence_headline", "") or _get_attr(scene, "lower_third_subtitle", "") or "ANÁLISE HISTÓRICA"))
+    lt_sub = str(_get_attr(scene, "lower_third_subtitle", "") or "").strip()
+    headline = _normalize_upper(str(_get_attr(scene, "evidence_headline", "") or lt_sub or "ANÁLISE HISTÓRICA"))
+    quote_txt = str(_get_attr(scene, "evidence_quote", "") or "").strip()
 
+    # Use explicit scene-local `schematic_points` ONLY if provided; NEVER slice global Roman `timeline_points[:3]`
+    # onto 1644 / 1863 scenes! Build scene-local CAUSA / MECANISMO / EFEITO cards cleanly from scene metadata.
     raw_nodes: List[Tuple[str, str, str]] = []
-    t_pts = _get_attr(scene, "timeline_points", None) or []
-    b_nodes = _get_attr(scene, "board_nodes", None) or []
-    for p in t_pts[:3]:
-        raw_nodes.append(
-            (
-                _compact_odometer_date(str(_get_attr(p, "date", "FASE"))),
-                str(_get_attr(p, "value", "EVENTO")),
-                str(_get_attr(p, "label", "Registro documentado")),
-            )
-        )
-    if not raw_nodes:
-        for bn in b_nodes[:3]:
+    s_pts = _get_attr(scene, "schematic_points", None) or []
+    for sp in s_pts[:3]:
+        if isinstance(sp, (tuple, list)) and len(sp) >= 3:
+            raw_nodes.append((str(sp[0]), str(sp[1]), str(sp[2])))
+        else:
             raw_nodes.append(
                 (
-                    str(_get_attr(bn, "badge", "VETOR")),
-                    str(_get_attr(bn, "title", "FATOR")),
-                    str(_get_attr(bn, "role", "Conexão histórica")),
+                    str(_get_attr(sp, "tag", _get_attr(sp, "date", "FASE"))),
+                    str(_get_attr(sp, "title", _get_attr(sp, "value", "EVENTO"))),
+                    str(_get_attr(sp, "desc", _get_attr(sp, "label", "Registro documentado"))),
                 )
             )
+
     if not raw_nodes:
+        sub_parts = [seg.strip() for seg in re.split(r"[•|—]+", lt_sub) if seg.strip()]
+        cause_desc = lt_sub if lt_sub else headline
+        mech_title = _normalize_upper(sub_parts[0]) if sub_parts else stamp_big
+        mech_desc = headline
+        eff_title = (
+            _normalize_upper(sub_parts[-1])
+            if len(sub_parts) >= 2
+            else ("DOCUMENTED IMPACT" if is_en else "IMPACTO DOCUMENTADO")
+        )
+        eff_desc = quote_txt or (
+            "Historical turning point documented in primary archives."
+            if is_en
+            else "Ruptura histórica documentada nos registros primários."
+        )
         raw_nodes = [
-            ("CAUSA" if not is_en else "CAUSE", stamp_big, lt_title),
-            ("MECANISMO" if not is_en else "MECHANISM", headline[:26], str(_get_attr(scene, "evidence_quote", "Mudança documentada nos registros."))[:54]),
-            ("EFEITO" if not is_en else "EFFECT", "LEGADO" if not is_en else "LEGACY", "Impacto preservado através dos séculos" if not is_en else "Impact preserved across centuries"),
+            (f"{'CAUSE' if is_en else 'CAUSA'} • {stamp_big}", lt_title, cause_desc),
+            ("MECHANISM" if is_en else "MECANISMO", mech_title, mech_desc),
+            ("EFFECT" if is_en else "EFEITO", eff_title, eff_desc),
         ]
     while len(raw_nodes) < 3:
         idx_k = len(raw_nodes) + 1
-        raw_nodes.append((f"FASE 0{idx_k}", f"MARCO 0{idx_k}", headline[:44]))
+        raw_nodes.append(
+            (
+                f"{'PHASE' if is_en else 'FASE'} 0{idx_k}",
+                f"{'MILESTONE' if is_en else 'MARCO'} 0{idx_k}",
+                headline,
+            )
+        )
 
     # 2. Animated Tactical Target Reticles locked onto 2 focal landmarks over the realistic scene
     reticle_pts = (
@@ -3636,11 +3810,12 @@ def draw_2d_schematic_over_realism(
     canvas.drawLine(panel_x, div_y, panel_x + panel_w * stamp_reveal, div_y, div_p)
 
     # 3 Cause-and-Effect Diagram Nodes connected with animated dashed callout lines from reticles
-    node_colors = ("#EAB308", "#F8FAFC", "#D9381E")
-    nodes_top = div_y + 26.0
+    # Card 03 uses high-contrast #F87171 over #121417 dark slate (instead of dark low-contrast #D9381E)
+    node_colors = ("#EAB308", "#F8FAFC", "#F87171")
+    nodes_top = div_y + 24.0
     n_count = len(raw_nodes)
-    node_gap = 24.0 if is_wide else 16.0
-    node_h = min(168.0 if is_wide else 136.0, (panel_y + panel_h - nodes_top - node_gap * (n_count - 1)) / float(n_count))
+    node_gap = 20.0 if is_wide else 16.0
+    node_h = min(176.0 if is_wide else 136.0, (panel_y + panel_h - nodes_top - node_gap * (n_count - 1)) / float(n_count))
 
     prev_node_bottom: Optional[Tuple[float, float]] = None
     for idx_n, (n_tag, n_title, n_desc) in enumerate(raw_nodes):
@@ -3700,36 +3875,41 @@ def draw_2d_schematic_over_realism(
 
         tx = nx + 20.0
         avail_w = panel_w - 36.0
-        # Tag + Courier Prime 36px metric/year label
-        tf_tag = skia.Font(cp_tf, 14.5)
+        # Tag + wrapped Cinzel title + wrapped Courier Prime description (ZERO mid-word truncation!)
+        tag_str = f"0{idx_n + 1} // {_normalize_upper(n_tag)}"
+        tf_tag, tag_ls = _wrap_text_to_width(tag_str, cp_tf, 14.5, 11.5, avail_w, 1)
         _draw_safe_string(
             canvas,
-            f"0{idx_n + 1} // {_normalize_upper(n_tag)}",
+            tag_ls[0] if tag_ls else tag_str,
             tx,
-            ny + 26.0,
+            ny + 24.0,
             tf_tag,
-            skia.Paint(AntiAlias=True, Color=hex_to_skia(n_col, int(245 * n_prog))),
+            skia.Paint(AntiAlias=True, Color=hex_to_skia(n_col, int(250 * n_prog))),
         )
-        title_f, title_ls = _wrap_text_to_width(_normalize_upper(n_title), cinzel_tf, 28.0 if is_wide else 22.0, 16.0, avail_w, 1)
+        title_f, title_ls = _wrap_text_to_width(_normalize_upper(n_title), cinzel_tf, 26.0 if is_wide else 21.0, 14.5, avail_w, 1)
         if title_ls:
-            _draw_safe_string(canvas, title_ls[0], tx, ny + 60.0, title_f, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", int(250 * n_prog))))
+            _draw_safe_string(canvas, title_ls[0], tx, ny + 55.0, title_f, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", int(250 * n_prog))))
 
-        desc_f, desc_ls = _wrap_text_to_width(n_desc, cp_tf, 18.0 if is_wide else 15.0, 13.0, avail_w, 2)
-        dy = ny + 92.0
+        desc_f, desc_ls = _wrap_text_to_width(n_desc, cp_tf, 17.0 if is_wide else 14.5, 12.0, avail_w, 3)
+        dy = ny + 84.0
         for dln in desc_ls:
-            if dy > ny + node_h - 12.0:
+            if dy > ny + node_h - 10.0:
                 break
-            _draw_safe_string(canvas, dln, tx, dy, desc_f, skia.Paint(AntiAlias=True, Color=hex_to_skia("#E0C097", int(225 * n_prog))))
-            dy += desc_f.getSize() * 1.28
+            _draw_safe_string(canvas, dln, tx, dy, desc_f, skia.Paint(AntiAlias=True, Color=hex_to_skia("#E0C097", int(230 * n_prog))))
+            dy += desc_f.getSize() * 1.24
 
         prev_node_bottom = (nx + 42.0, ny + node_h + 2.0)
 
-    # 4. Left-Side Stepped Historical Vector Timeline Breakdown Bar (Vox visual anchor)
+    # 4. Left-Side Stepped Historical Vector Timeline Breakdown Bar (Vox visual anchor — ZERO [:38] slicing!)
     if is_wide:
         bar_x = 96.0
         bar_y = 76.0
-        bar_w = w * 0.38
-        bar_h = 84.0
+        bar_w = w * 0.40
+        hl_f, hl_lns = _wrap_text_to_width(_normalize_upper(headline), cp_tf, 15.5, 11.5, bar_w - 36.0, 2)
+        if not hl_lns:
+            hl_lns = [_normalize_upper(headline)]
+        hl_step = hl_f.getSize() * 1.28
+        bar_h = 84.0 if len(hl_lns) <= 1 else (48.0 + len(hl_lns) * hl_step + 24.0)
         br = skia.Rect.MakeXYWH(bar_x, bar_y, bar_w, bar_h)
         canvas.drawRoundRect(br, 8.0, 8.0, skia.Paint(AntiAlias=True, Color=hex_to_skia("#121417", 215)))
         canvas.drawRoundRect(
@@ -3738,21 +3918,24 @@ def draw_2d_schematic_over_realism(
             8.0,
             skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=1.4, Color=hex_to_skia("#2C323B", 220)),
         )
-        _draw_safe_string(
-            canvas,
-            _normalize_upper(headline)[:38],
-            bar_x + 18.0,
-            bar_y + 30.0,
-            skia.Font(cp_tf, 15.5),
-            skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", 230)),
-        )
-        # Stepped proportional vector breakdown segments (#EAB308, #F8FAFC, #D9381E)
+        hy_bar = bar_y + 28.0
+        for hln in hl_lns:
+            _draw_safe_string(
+                canvas,
+                hln,
+                bar_x + 18.0,
+                hy_bar,
+                hl_f,
+                skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", 235)),
+            )
+            hy_bar += hl_step
+        # Stepped proportional vector breakdown segments (#EAB308, #F8FAFC, #F87171)
         seg_x = bar_x + 18.0
-        seg_y = bar_y + 48.0
+        seg_y = hy_bar + 4.0
         seg_total_w = bar_w - 36.0
         weights = (0.34, 0.30, 0.36)
         cur_x = seg_x
-        for s_i, (wt, s_hex) in enumerate(zip(weights, ("#EAB308", "#F8FAFC", "#D9381E"))):
+        for s_i, (wt, s_hex) in enumerate(zip(weights, ("#EAB308", "#F8FAFC", "#F87171"))):
             sw = max(4.0, (seg_total_w - 12.0) * wt * eased_p)
             canvas.drawRoundRect(
                 skia.Rect.MakeXYWH(cur_x, seg_y, sw, 14.0),
@@ -3925,9 +4108,9 @@ def draw_video_over_video_collage(
         if role_kind == "doc_highlight":
             # Parchment / archival document PiP window with animated #FFD700 kMultiply brush-stroke highlighter!
             canvas.drawRect(r, skia.Paint(Color=skia.ColorSetARGB(255, 244, 237, 222)))
-            # Top archival plate slice (48% height) + highlighted excerpt below
-            plate_h = ch * 0.46
-            plate_r = skia.Rect.MakeXYWH(-cw * 0.5 + 16.0, -ch * 0.5 + 42.0, cw - 32.0, plate_h - 46.0)
+            # Top archival plate slice (44% height) + unobstructed headline & highlighted excerpt below
+            plate_h = ch * 0.44
+            plate_r = skia.Rect.MakeXYWH(-cw * 0.5 + 16.0, -ch * 0.5 + 40.0, cw - 32.0, plate_h - 44.0)
             if img_use is not None:
                 _draw_archival_sepia_plate_with_mounts(canvas, img_use, plate_r)
             # Top file header strip
@@ -3936,23 +4119,25 @@ def draw_video_over_video_collage(
                 canvas,
                 f"ARQUIVO // {stamp_lbl}" if not is_en else f"ARCHIVE // {stamp_lbl}",
                 -cw * 0.5 + 18.0,
-                -ch * 0.5 + 27.0,
+                -ch * 0.5 + 26.0,
                 hdr_f,
                 skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(200, 66, 54, 46)),
             )
-            # Headline + quote with animated #FFD700 multiply brush-stroke highlighter
-            text_top = -ch * 0.5 + plate_h + 18.0
-            hf_d, hl_d = _wrap_text_to_width(headline, cinzel_tf, 22.0, 14.0, cw - 40.0, 1)
-            if hl_d:
-                _draw_safe_string(canvas, hl_d[0], -cw * 0.5 + 20.0, text_top + 18.0, hf_d, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(245, 22, 18, 24)))
+            # Headline (up to 2 crisp wrapped lines, ZERO truncation) + quote with #FFD700 multiply brush highlighter
+            text_top = -ch * 0.5 + plate_h + 14.0
+            hf_d, hl_d = _wrap_text_to_width(headline, cinzel_tf, 20.5, 13.0, cw - 40.0, 2)
+            hy_d = text_top + 18.0
+            for hln in hl_d:
+                _draw_safe_string(canvas, hln, -cw * 0.5 + 20.0, hy_d, hf_d, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(245, 22, 18, 24)))
+                hy_d += hf_d.getSize() * 1.22
 
-            qf_d, ql_d = _wrap_text_to_width(quote, cp_tf, 20.0, 14.0, cw - 44.0, 4)
-            qy = text_top + 52.0
-            line_step = qf_d.getSize() * 1.42
+            qf_d, ql_d = _wrap_text_to_width(quote, cp_tf, 18.5, 12.5, cw - 44.0, 5)
+            qy = hy_d + 12.0
+            line_step = qf_d.getSize() * 1.38
             hl_sweep = _ease_doc_snap(min(1.0, max(0.0, (prog_c - delay_p - 0.08) / 0.52)))
             n_ql = max(1, len(ql_d))
             for li, qln in enumerate(ql_d):
-                if qy > ch * 0.5 - 16.0:
+                if qy > ch * 0.5 - 14.0:
                     break
                 l_prog = max(0.0, min(1.0, hl_sweep * n_ql - li))
                 if l_prog > 0.01:
@@ -3970,7 +4155,7 @@ def draw_video_over_video_collage(
                 _draw_safe_string(canvas, qln, -cw * 0.5 + 22.0, qy, qf_d, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(250, 20, 18, 22)))
                 qy += line_step
         else:
-            # Floating Cinema Video / Archival Photo Window
+            # Floating Cinema Video / Archival Photo Window (Background Cards 1 & 2)
             if img_use is not None:
                 kb = 1.03 + 0.06 * prog_c
                 canvas.save()
@@ -3980,39 +4165,41 @@ def draw_video_over_video_collage(
             else:
                 canvas.drawRect(r, skia.Paint(Color=hex_to_skia("#1C2026")))
 
-            # Bottom gradient scrim + Courier Prime archival reel label + #FFD700 highlight strip
-            bot_h = 84.0
-            bot_r = skia.Rect.MakeXYWH(-cw * 0.5, ch * 0.5 - bot_h, cw, bot_h)
-            scrim_p = skia.Paint()
-            scrim_p.setShader(
-                skia.GradientShader.MakeLinear(
-                    [(0.0, bot_r.top()), (0.0, bot_r.bottom())],
-                    [skia.ColorSetARGB(0, 12, 14, 18), skia.ColorSetARGB(225, 12, 14, 18)],
-                )
-            )
-            canvas.drawRect(bot_r, scrim_p)
-
-            # Top-left archival clip badge
-            tag_txt = f"FIG. 0{c_idx + 1} • {stamp_lbl}"
-            tf_b = skia.Font(cp_tf, 14.0)
+            # Clean unobstructed top-left `FIG. 01` / `FIG. 02` tag ONLY on multi-card background windows
+            # (removes buried/overlapped bottom prose captions — headline + quote belong strictly on Card 3!)
+            has_doc_card = any(spec[6] == "doc_highlight" for spec in layouts)
+            tag_txt = f"FIG. 0{c_idx + 1}" if has_doc_card else f"FIG. 0{c_idx + 1} • {stamp_lbl}"
+            tf_b = skia.Font(cp_tf, 14.5)
             tw_b = float(tf_b.measureText(tag_txt))
-            pill_r = skia.Rect.MakeXYWH(-cw * 0.5 + 16.0, -ch * 0.5 + 16.0, tw_b + 24.0, 28.0)
-            canvas.drawRoundRect(pill_r, 5.0, 5.0, skia.Paint(AntiAlias=True, Color=hex_to_skia("#121417", 215)))
+            pill_r = skia.Rect.MakeXYWH(-cw * 0.5 + 16.0, -ch * 0.5 + 16.0, tw_b + 26.0, 28.0)
+            canvas.drawRoundRect(pill_r, 5.0, 5.0, skia.Paint(AntiAlias=True, Color=hex_to_skia("#121417", 220)))
             canvas.drawRect(skia.Rect.MakeXYWH(pill_r.left(), pill_r.top() + 4.0, 3.5, 20.0), skia.Paint(Color=hex_to_skia("#EAB308")))
             _draw_safe_string(canvas, tag_txt, pill_r.left() + 12.0, pill_r.top() + 19.0, tf_b, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC")))
 
-            # Animated gold highlighter accent bar along bottom caption
-            if c_idx == 0 and n_cards == 1:
+            # Only render bottom caption when this is a solo 1-card unobstructed layout (no overlapping foreground card)
+            if not has_doc_card:
+                bot_h = 92.0
+                bot_r = skia.Rect.MakeXYWH(-cw * 0.5, ch * 0.5 - bot_h, cw, bot_h)
+                scrim_p = skia.Paint()
+                scrim_p.setShader(
+                    skia.GradientShader.MakeLinear(
+                        [(0.0, bot_r.top()), (0.0, bot_r.bottom())],
+                        [skia.ColorSetARGB(0, 12, 14, 18), skia.ColorSetARGB(225, 12, 14, 18)],
+                    )
+                )
+                canvas.drawRect(bot_r, scrim_p)
                 hl_w = (cw - 44.0) * _ease_doc_snap(min(1.0, max(0.0, (prog_c - 0.12) / 0.45)))
                 canvas.drawRoundRect(
-                    skia.Rect.MakeXYWH(-cw * 0.5 + 20.0, ch * 0.5 - 18.0, max(6.0, hl_w), 4.0),
+                    skia.Rect.MakeXYWH(-cw * 0.5 + 20.0, ch * 0.5 - 16.0, max(6.0, hl_w), 4.0),
                     2.0,
                     2.0,
                     skia.Paint(AntiAlias=True, Color=hex_to_skia("#FFD700", 230)),
                 )
-            cap_f, cap_l = _wrap_text_to_width(headline if c_idx == 0 else quote, cp_tf, 18.0, 13.0, cw - 40.0, 1)
-            if cap_l:
-                _draw_safe_string(canvas, cap_l[0], -cw * 0.5 + 20.0, ch * 0.5 - 28.0, cap_f, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC")))
+                cap_f, cap_l = _wrap_text_to_width(headline, cp_tf, 18.0, 13.0, cw - 40.0, 2)
+                cy_cap = ch * 0.5 - (30.0 if len(cap_l) <= 1 else 52.0)
+                for cln in cap_l:
+                    _draw_safe_string(canvas, cln, -cw * 0.5 + 20.0, cy_cap, cap_f, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC")))
+                    cy_cap += cap_f.getSize() * 1.24
 
         canvas.restore()  # End clipRRect
         canvas.drawRRect(rr, border_paint)
@@ -4116,22 +4303,25 @@ def draw_fern_3d_reconstruction(
     fg_img: Optional[skia.Image] = None,
     body_t: Optional[float] = None,
     is_en: bool = False,
+    primary_photo: Optional[skia.Image] = None,
     **kwargs: Any,
 ) -> None:
     """Render Category 4 (`Dark_3D_Reconstruction` — Fern-style Minimalist 3D Reconstruction):
     - Dark slate minimalist 3D void (`#121417`) with orbiting 3D perspective camera matrix.
     - Procedural 3D perspective wireframe architectural floor grid, columns/arches, and central altar.
     - Overhead volumetric spotlight cones (`kScreen` god rays + ground pool).
-    - Backlit dark human silhouette (using `fg_img`'s alpha mask turned into a rim-lit dark silhouette
-      OR a procedural backlit historical standing silhouette).
+    - Backlit dark human silhouette (when `fg_img` is provided) OR a rim-lit 3D holographic
+      archival exhibit monolith framing `backdrop_img` / `primary_photo` on the glowing plinth
+      (ZERO primitive circle+trapezoid cartoon pawn fallback!).
     - Glowing 3D-projected perspective tactical target circles (`#D9381E`, `#EAB308`, `#38BDF8`).
-    - Fern-style digital forensic UI telemetry callouts (`Courier Prime Bold`).
+    - Fern-style digital forensic UI telemetry callouts (`Courier Prime Bold` / `Cinzel Bold`, ZERO `[:N]` slices!).
     """
     mood = str(_get_attr(scene, "mood", "dark_horror") or "dark_horror")
     cp_tf = get_courier_prime_bold_typeface(fallback=ui_tf) or ui_tf
     cinzel_tf = get_cinzel_bold_typeface(fallback=title_tf) or title_tf
     prog_c = max(0.0, min(1.0, float(prog)))
     is_wide = w >= h
+    exhibit_img = backdrop_img or primary_photo
 
     full_r = skia.Rect.MakeWH(w, h)
     # 1. Dark minimalist 3D slate void (#121417 + deep #0D1B2A horizon fog, cached 1/4-res gradient)
@@ -4315,17 +4505,24 @@ def draw_fern_3d_reconstruction(
     canvas.drawCircle(0.0, 0.0, cone_half_w * 0.95, pool_p)
     canvas.restore()
 
-    # 6. Backlit Dark Human Silhouette (from `fg_img` alpha mask OR procedural Fern figure!)
+    # 6. Centerpiece on Glowing Tactical Plinth:
+    #    - If `fg_img` is provided: backlit rim-lit dark silhouette cutout.
+    #    - If `fg_img is None`: rim-lit 3D holographic archival exhibit monolith framing `backdrop_img` / `primary_photo`!
+    stamp_lbl = extract_depth_stamp_text(scene)
     fig_base = _proj(0.0, 0.44, 0.0) or (vp_cx, h * 0.64, cam_dist)
-    fig_head = _proj(0.0, 2.35, 0.0) or (vp_cx, h * 0.28, cam_dist)
-    fig_h = max(160.0, min(h * 0.58, abs(fig_base[1] - fig_head[1])))
+    fig_head = _proj(0.0, 2.38, 0.0) or (vp_cx, h * 0.26, cam_dist)
+    fig_h = max(180.0, min(h * 0.58, abs(fig_base[1] - fig_head[1])))
     fig_w = fig_h * 0.72
 
     # Contact shadow ellipse on top of altar
+    shadow_w = fig_w * (0.56 if fg_img is not None else 1.25)
     canvas.drawOval(
-        skia.Rect.MakeXYWH(fig_base[0] - fig_w * 0.28, fig_base[1] - 10.0, fig_w * 0.56, 22.0),
+        skia.Rect.MakeXYWH(fig_base[0] - shadow_w * 0.5, fig_base[1] - 10.0, shadow_w, 22.0),
         skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(195, 4, 5, 8)),
     )
+
+    callout_anchor_top = (fig_base[0], fig_base[1] - fig_h * 0.72)
+    callout_anchor_bot = (stage_floor[0] + (80.0 if is_wide else 40.0), stage_floor[1])
 
     if fg_img is not None:
         sil_img = _get_rimlit_silhouette_image(fg_img)
@@ -4344,47 +4541,197 @@ def draw_fern_3d_reconstruction(
             skia.Canvas.SrcRectConstraint.kFast_SrcRectConstraint,
         )
     else:
-        # Procedural minimalist backlit historical standing figure (Fern silhouette aesthetic)
+        # Rim-Lit 3D Holographic Archival Exhibit Monolith on the Glowing Tactical Plinth
         fx, fy = fig_base[0], fig_base[1]
-        head_r = fig_h * 0.105
-        head_cy = fy - fig_h * 0.84
-        sh_y = fy - fig_h * 0.69
-        sh_hw = fig_h * 0.205
-        hem_hw = fig_h * 0.245
+        lev_y = math.sin(t * 1.45) * 4.0
+        mon_w = min(w * (0.34 if is_wide else 0.72), fig_h * (1.28 if is_wide else 1.02))
+        mon_h = min(h * (0.48 if is_wide else 0.34), fig_h * 0.90)
+        mon_cx = fx
+        mon_bot = fy - 18.0 + lev_y
+        mon_top = mon_bot - mon_h
+        mon_l = mon_cx - mon_w * 0.5
+        mon_r = mon_cx + mon_w * 0.5
+        callout_anchor_top = (mon_r, mon_top + mon_h * 0.28)
+        callout_anchor_bot = (mon_r, mon_top + mon_h * 0.70)
 
-        body_path = skia.Path()
-        body_path.moveTo(fx - sh_hw, sh_y)
-        body_path.quadTo(fx, sh_y - head_r * 0.75, fx + sh_hw, sh_y)
-        body_path.lineTo(fx + hem_hw, fy)
-        body_path.lineTo(fx - hem_hw, fy)
-        body_path.close()
-
-        # Crisp cyan/amber backlight rim contour
-        rim_p = skia.Paint(
-            AntiAlias=True,
-            Style=skia.Paint.kStroke_Style,
-            StrokeWidth=5.0,
-            Color=hex_to_skia("#38BDF8", 175),
+        # Upward holographic projector light beams rising from tactical plinth to monolith base
+        emitter_path = skia.Path()
+        emitter_path.moveTo(fx - mon_w * 0.36, fy + 2.0)
+        emitter_path.lineTo(fx + mon_w * 0.36, fy + 2.0)
+        emitter_path.lineTo(mon_r - 12.0, mon_bot + 4.0)
+        emitter_path.lineTo(mon_l + 12.0, mon_bot + 4.0)
+        emitter_path.close()
+        em_p = skia.Paint(AntiAlias=True)
+        em_p.setBlendMode(skia.BlendMode.kScreen)
+        em_p.setShader(
+            skia.GradientShader.MakeLinear(
+                [(fx, fy + 2.0), (fx, mon_bot - 18.0)],
+                [
+                    hex_to_skia("#38BDF8", 155),
+                    hex_to_skia("#EAB308", 72),
+                    skia.ColorSetARGB(0, 56, 189, 248),
+                ],
+                [0.0, 0.45, 1.0],
+            )
         )
-        rim_p.setImageFilter(skia.ImageFilters.Blur(4.0, 4.0))
-        canvas.drawPath(body_path, rim_p)
-        canvas.drawCircle(fx, head_cy, head_r, rim_p)
-
-        rim_warm = skia.Paint(
-            AntiAlias=True,
-            Style=skia.Paint.kStroke_Style,
-            StrokeWidth=2.0,
-            Color=hex_to_skia("#E0C097", 215),
+        canvas.drawPath(emitter_path, em_p)
+        # Plinth holographic emitter bar
+        canvas.drawRoundRect(
+            skia.Rect.MakeXYWH(fx - mon_w * 0.36, fy - 3.0, mon_w * 0.72, 6.0),
+            3.0,
+            3.0,
+            skia.Paint(AntiAlias=True, Color=hex_to_skia("#38BDF8", 220)),
         )
-        canvas.drawPath(body_path, rim_warm)
-        canvas.drawCircle(fx, head_cy, head_r, rim_warm)
 
-        core_fill = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(252, 11, 13, 18))
-        canvas.drawPath(body_path, core_fill)
-        canvas.drawCircle(fx, head_cy, head_r, core_fill)
+        # Orbit-synced subtle 3D monolith perspective bevel & glass extrusion
+        yaw_skew = math.sin(yaw_rad) * 0.06
+        extrude_dx = -math.sin(yaw_rad) * 18.0
+        canvas.save()
+        canvas.translate(mon_cx, mon_top + mon_h * 0.5)
+        canvas.skew(0.0, yaw_skew)
+        canvas.translate(-mon_cx, -(mon_top + mon_h * 0.5))
 
-    # 7. Fern-Style Digital Forensic UI Telemetry Callouts
-    stamp_lbl = extract_depth_stamp_text(scene)
+        slab_rect = skia.Rect.MakeXYWH(mon_l, mon_top, mon_w, mon_h)
+        slab_rr = skia.RRect.MakeRectXY(slab_rect, 10.0, 10.0)
+
+        # Dual-color Fern rim backlight halo (#38BDF8 cold cyan left + #E0C097 warm gold right)
+        halo_l = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+        halo_l.setImageFilter(skia.ImageFilters.Blur(14.0, 14.0))
+        halo_l.setColor(hex_to_skia("#38BDF8", 130))
+        canvas.drawRoundRect(skia.Rect.MakeXYWH(mon_l - 8.0, mon_top + 4.0, 18.0, mon_h - 8.0), 8.0, 8.0, halo_l)
+
+        halo_r = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+        halo_r.setImageFilter(skia.ImageFilters.Blur(14.0, 14.0))
+        halo_r.setColor(hex_to_skia("#E0C097", 120))
+        canvas.drawRoundRect(skia.Rect.MakeXYWH(mon_r - 10.0, mon_top + 4.0, 18.0, mon_h - 8.0), 8.0, 8.0, halo_r)
+
+        # 3D extruded glass thickness bezel opposite camera orbit yaw
+        if abs(extrude_dx) > 1.5:
+            back_r = skia.Rect.MakeXYWH(mon_l + extrude_dx, mon_top + 4.0, mon_w, mon_h)
+            canvas.drawRoundRect(back_r, 10.0, 10.0, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(200, 16, 22, 30)))
+            canvas.drawRoundRect(
+                back_r,
+                10.0,
+                10.0,
+                skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=1.4, Color=hex_to_skia("#38BDF8", 130)),
+            )
+
+        # Monolith obsidian glass chassis + shadow
+        _draw_fast_rrect_shadow(canvas, slab_rr, dy=16.0, sigma=22.0, alpha=210)
+        canvas.drawRRect(slab_rr, skia.Paint(AntiAlias=True, Color=hex_to_skia("#121417", 242)))
+
+        # Clipped inner holographic exhibit viewport
+        inner_pad = 12.0
+        hdr_h = 28.0
+        ftr_h = 24.0
+        img_rect = skia.Rect.MakeXYWH(
+            mon_l + inner_pad,
+            mon_top + hdr_h + 4.0,
+            mon_w - inner_pad * 2.0,
+            mon_h - hdr_h - ftr_h - 8.0,
+        )
+        canvas.save()
+        canvas.clipRRect(skia.RRect.MakeRectXY(img_rect, 6.0, 6.0), doAntiAlias=True)
+        if exhibit_img is not None:
+            kb_m = 1.03 + 0.05 * prog_c
+            canvas.save()
+            canvas.translate(img_rect.centerX(), img_rect.centerY())
+            canvas.scale(kb_m, kb_m)
+            canvas.translate(-img_rect.centerX(), -img_rect.centerY())
+            _draw_image_cover(canvas, exhibit_img, img_rect, y_bias=0.22)
+            canvas.restore()
+            # Subtle cool-slate forensic tint & holographic micro-scanlines
+            tint_p = skia.Paint()
+            tint_p.setShader(
+                skia.GradientShader.MakeLinear(
+                    [(img_rect.left(), img_rect.top()), (img_rect.right(), img_rect.bottom())],
+                    [skia.ColorSetARGB(36, 56, 189, 248), skia.ColorSetARGB(14, 18, 20, 23), skia.ColorSetARGB(34, 224, 192, 151)],
+                    [0.0, 0.5, 1.0],
+                )
+            )
+            canvas.drawRect(img_rect, tint_p)
+        else:
+            # Procedural forensic blueprint artifact grid if no backdrop/primary photo was supplied
+            canvas.drawRect(img_rect, skia.Paint(Color=hex_to_skia("#0D1B2A", 245)))
+            bp_p = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=1.2, Color=hex_to_skia("#38BDF8", 115))
+            for gx_m in range(int(img_rect.left()), int(img_rect.right()), 28):
+                canvas.drawLine(gx_m, img_rect.top(), gx_m, img_rect.bottom(), bp_p)
+            for gy_m in range(int(img_rect.top()), int(img_rect.bottom()), 28):
+                canvas.drawLine(img_rect.left(), gy_m, img_rect.right(), gy_m, bp_p)
+            for rr_m in (0.20, 0.34, 0.46):
+                canvas.drawCircle(img_rect.centerX(), img_rect.centerY(), min(img_rect.width(), img_rect.height()) * rr_m, bp_p)
+
+        # Holographic micro-scanlines + sweeping cyan laser scanner bar
+        scan_p = skia.Paint(Color=skia.ColorSetARGB(18, 56, 189, 248))
+        for sy_m in range(int(img_rect.top()), int(img_rect.bottom()), 4):
+            canvas.drawLine(img_rect.left(), sy_m, img_rect.right(), sy_m, scan_p)
+        laser_y = img_rect.top() + ((t * 0.24) % 1.0) * img_rect.height()
+        laser_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+        laser_p.setShader(
+            skia.GradientShader.MakeLinear(
+                [(0.0, laser_y - 16.0), (0.0, laser_y + 16.0)],
+                [skia.ColorSetARGB(0, 56, 189, 248), hex_to_skia("#38BDF8", 145), skia.ColorSetARGB(0, 56, 189, 248)],
+                [0.0, 0.5, 1.0],
+            )
+        )
+        canvas.drawRect(skia.Rect.MakeXYWH(img_rect.left(), laser_y - 16.0, img_rect.width(), 32.0), laser_p)
+        canvas.drawLine(img_rect.left(), laser_y, img_rect.right(), laser_y, skia.Paint(Color=hex_to_skia("#F8FAFC", 150)))
+
+        # Diagonal glass sheen across exhibit plate
+        sheen_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+        sheen_p.setShader(
+            skia.GradientShader.MakeLinear(
+                [(img_rect.left(), img_rect.top()), (img_rect.right(), img_rect.bottom())],
+                [skia.ColorSetARGB(34, 248, 250, 252), skia.ColorSetARGB(0, 248, 250, 252), skia.ColorSetARGB(18, 224, 192, 151)],
+                [0.0, 0.42, 1.0],
+            )
+        )
+        canvas.drawRect(img_rect, sheen_p)
+        canvas.restore()
+
+        # Monolith header & footer forensic telemetry bars
+        mon_hdr_txt = f"3D EXHIBIT // {stamp_lbl}" if is_en else f"ARQUIVO 3D // {stamp_lbl}"
+        mh_f, mh_l = _wrap_text_to_width(mon_hdr_txt, cp_tf, 13.0, 10.5, mon_w - 42.0, 1)
+        canvas.drawCircle(mon_l + 18.0, mon_top + 16.0, 3.8, skia.Paint(AntiAlias=True, Color=hex_to_skia("#EAB308")))
+        _draw_safe_string(
+            canvas,
+            mh_l[0] if mh_l else mon_hdr_txt,
+            mon_l + 28.0,
+            mon_top + 21.0,
+            mh_f,
+            skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", 235)),
+        )
+        ftr_txt = "HOLO-SCAN • SPATIAL ARCHIVE" if is_en else "VARREDURA HOLOGRÁFICA • ATIVA"
+        _draw_safe_string(
+            canvas,
+            ftr_txt,
+            mon_l + 14.0,
+            mon_bot - 7.0,
+            skia.Font(cp_tf, 11.5),
+            skia.Paint(AntiAlias=True, Color=hex_to_skia("#38BDF8", 210)),
+        )
+
+        # Rim-lit metallic glass border + #EAB308 tactical corner brackets
+        rim_border = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=2.0)
+        rim_border.setShader(
+            skia.GradientShader.MakeLinear(
+                [(mon_l, mon_top), (mon_r, mon_bot)],
+                [hex_to_skia("#38BDF8", 230), hex_to_skia("#2C323B", 200), hex_to_skia("#E0C097", 230)],
+                [0.0, 0.5, 1.0],
+            )
+        )
+        canvas.drawRRect(slab_rr, rim_border)
+
+        brk_m = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=2.4, Color=hex_to_skia("#EAB308", 225))
+        bl_m = 18.0
+        for sx_m, cx_m in ((-1, mon_l - 4.0), (1, mon_r + 4.0)):
+            for sy_m, cy_m in ((-1, mon_top - 4.0), (1, mon_bot + 4.0)):
+                canvas.drawLine(cx_m, cy_m, cx_m - sx_m * bl_m, cy_m, brk_m)
+                canvas.drawLine(cx_m, cy_m, cx_m, cy_m - sy_m * bl_m, brk_m)
+
+        canvas.restore()
+
+    # 7. Fern-Style Digital Forensic UI Telemetry Callouts (ZERO [:N] mid-word slices!)
     lt_title = _normalize_upper(str(_get_attr(scene, "lower_third_title", stamp_lbl) or stamp_lbl))
     lt_sub = _normalize_upper(str(_get_attr(scene, "lower_third_subtitle", "") or _get_attr(scene, "evidence_headline", "") or "RECONSTRUÇÃO HISTÓRICA"))
 
@@ -4406,34 +4753,45 @@ def draw_fern_3d_reconstruction(
     cam_readout = f"AZM {yaw_deg:+05.1f}°  •  ELV {pitch_deg:04.1f}°  •  DIST {cam_dist:04.2f}M"
     _draw_safe_string(canvas, cam_readout, hud_x + 16.0, hud_y + 54.0, skia.Font(cp_tf, 15.5), skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC")))
 
-    # 3D-tracked vector leader lines & forensic callout cards
+    # 3D-tracked vector leader lines & dynamically wrapped forensic callout cards
     callouts = [
         (
-            (fig_base[0], fig_base[1] - fig_h * 0.72),
-            (w * 0.72 if is_wide else w * 0.56, h * 0.26 if is_wide else h * 0.64),
+            callout_anchor_top,
+            (w * 0.71 if is_wide else 46.0, h * 0.24 if is_wide else h * 0.64),
             "SUJEITO // ERA" if not is_en else "SUBJECT // ERA",
-            lt_title[:24],
+            lt_title,
             "#EAB308",
             0.08,
         ),
         (
-            (stage_floor[0] + (80.0 if is_wide else 40.0), stage_floor[1]),
-            (w * 0.72 if is_wide else w * 0.56, h * 0.46 if is_wide else h * 0.74),
+            callout_anchor_bot,
+            (w * 0.71 if is_wide else 46.0, h * 0.45 if is_wide else h * 0.76),
             "EVENTO CRÍTICO" if not is_en else "KEY EVENT",
-            lt_sub[:26],
-            "#D9381E",
+            lt_sub,
+            "#F87171",
             0.22,
         ),
     ]
+    prev_callout_bottom = 0.0
     for anchor_pt, box_pos, c_tag, c_val, c_hex, c_delay in callouts:
         cp_anim = _ease_doc_snap(min(1.0, max(0.0, (prog_c - c_delay) / 0.30)))
         if cp_anim <= 0.02:
             continue
         bx, by = box_pos
-        bw = 380.0 if is_wide else (w - 92.0)
-        if not is_wide:
+        if is_wide:
+            bw = min(468.0, max(360.0, float(w) - bx - 48.0))
+        else:
             bx = 46.0
-        bh = 74.0
+            bw = float(w) - 92.0
+        vf, vl = _wrap_text_to_width(c_val, cinzel_tf, 20.5, 13.0, bw - 32.0, 2)
+        if not vl:
+            vl = [c_val]
+        line_step = vf.getSize() * 1.24
+        bh = 74.0 if len(vl) <= 1 else (44.0 + len(vl) * line_step + 14.0)
+        if prev_callout_bottom > 0.0:
+            by = max(by, prev_callout_bottom + 18.0)
+        prev_callout_bottom = by + bh
+
         ax, ay = anchor_pt
         ex = bx
         ey = by + bh * 0.5
@@ -4465,8 +4823,9 @@ def draw_fern_3d_reconstruction(
             )
             canvas.drawCircle(bx + 16.0, by + 22.0, 4.5, skia.Paint(AntiAlias=True, Color=hex_to_skia(c_hex, ba)))
             _draw_safe_string(canvas, c_tag, bx + 28.0, by + 27.0, skia.Font(cp_tf, 13.5), skia.Paint(AntiAlias=True, Color=hex_to_skia(c_hex, ba)))
-            vf, vl = _wrap_text_to_width(c_val, cinzel_tf, 22.0, 14.0, bw - 32.0, 1)
-            if vl:
-                _draw_safe_string(canvas, vl[0], bx + 16.0, by + 58.0, vf, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", ba)))
+            vy = by + 56.0
+            for vln in vl:
+                _draw_safe_string(canvas, vln, bx + 16.0, vy, vf, skia.Paint(AntiAlias=True, Color=hex_to_skia("#F8FAFC", ba)))
+                vy += line_step
 
     draw_anamorphic_film_burn_and_bokeh(canvas, w, h, t, shot_local_t=1.0, mood=mood)

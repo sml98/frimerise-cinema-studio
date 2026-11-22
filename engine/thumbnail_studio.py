@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
 import json
 import math
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
@@ -50,9 +52,14 @@ GEMINI_IMAGE_MODELS: Tuple[str, ...] = (
     "gemini-3.1-flash-image",
 )
 GEMINI_TEXT_PLANNER_MODELS: Tuple[str, ...] = (
+    "gemini-2.5-flash-lite",
     "gemini-flash-lite-latest",
-    "gemini-3.1-flash-lite",
-    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+)
+GEMINI_VISION_SELECTOR_MODELS: Tuple[str, ...] = (
+    "gemini-2.5-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
 )
 
 _REMBG_SESSION = None
@@ -960,23 +967,246 @@ def _pick_best_video_frames(video_path: Path, work_dir: Path) -> List[Path]:
     return [p for _, p in scored[:3]]
 
 
+def _build_vision_contact_sheet_jpeg(
+    candidates: List[Dict[str, Any]],
+    cols: int = 4,
+    tile_w: int = 360,
+    tile_h: int = 202,
+    pad: int = 8,
+) -> Optional[bytes]:
+    """Assemble up to 12 candidate hero plates into a numbered 1..N dark contact sheet JPEG
+    for a single-call Gemini Vision semantic thumbnail selector.
+    """
+    if not candidates:
+        return None
+    n = len(candidates)
+    cols = max(1, min(int(cols), n))
+    rows = int(math.ceil(n / float(cols)))
+    sheet_w = cols * tile_w + (cols + 1) * pad
+    sheet_h = rows * tile_h + (rows + 1) * pad
+    sheet = np.full((sheet_h, sheet_w, 3), (18, 20, 23), dtype=np.uint8)
+
+    for idx, cand in enumerate(candidates):
+        bgr = cand["bgr"]
+        r_idx = idx // cols
+        c_idx = idx % cols
+        x0 = pad + c_idx * (tile_w + pad)
+        y0 = pad + r_idx * (tile_h + pad)
+
+        ih, iw = bgr.shape[:2]
+        src_ar = iw / max(1.0, float(ih))
+        dst_ar = tile_w / max(1.0, float(tile_h))
+        if src_ar > dst_ar:
+            crop_w = max(1, int(round(ih * dst_ar)))
+            sx0 = max(0, (iw - crop_w) // 2)
+            crop = bgr[:, sx0 : sx0 + crop_w]
+        else:
+            crop_h = max(1, int(round(iw / dst_ar)))
+            sy0 = max(0, int((ih - crop_h) * 0.28))
+            crop = bgr[sy0 : sy0 + crop_h, :]
+        tile = cv2.resize(crop, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
+
+        # High-contrast numbered badge `#1..#N` in top-left corner
+        lbl = f"#{idx + 1}"
+        cv2.rectangle(tile, (6, 6), (62, 38), (18, 20, 23), -1)
+        cv2.rectangle(tile, (6, 6), (62, 38), (8, 179, 234), 2)
+        cv2.putText(tile, lbl, (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255, 255, 255), 2, cv2.LINE_AA)
+        sheet[y0 : y0 + tile_h, x0 : x0 + tile_w] = tile
+
+    ok, enc = cv2.imencode(".jpg", sheet, [int(cv2.IMWRITE_JPEG_QUALITY), 84])
+    return enc.tobytes() if ok else None
+
+
+def _vision_select_thumbnail_candidates(
+    candidates: List[Dict[str, Any]],
+    title: str,
+    thumb_3words: str,
+    mood: str,
+    max_pick: int = 5,
+    api_key: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Run ONE 1-call Gemini Vision semantic selector over numbered candidate plates (`#1..#N`)
+    so thumbnail hero art matches `thumb_3words`, `title`, and `mood` (e.g. 'O NATAL PROIBIDO'
+    picks Cromwell / Canterbury Riot / Krampus and rejects smiling Coca-Cola Santa).
+    Unverified `wiki_*` candidates are EXCLUDED unless explicitly approved by Vision!
+    Returns `(selected_candidates_ordered, vision_verified)`.
+    """
+    if not candidates:
+        return [], False
+
+    pool = candidates[:12]
+    eff_key = str(api_key or "").strip()
+    if not eff_key:
+        try:
+            eff_key = str(get_settings().get("gemini_api_key") or "").strip()
+        except Exception:
+            eff_key = ""
+
+    if not eff_key:
+        # Offline fallback: prefer non-wiki flow plates strictly over unverified wiki_* files
+        non_wiki = [c for c in pool if not c.get("is_wiki")]
+        return (non_wiki if non_wiki else [])[:max_pick], False
+
+    sheet_bytes = _build_vision_contact_sheet_jpeg(pool)
+    if not sheet_bytes:
+        non_wiki = [c for c in pool if not c.get("is_wiki")]
+        return (non_wiki if non_wiki else [])[:max_pick], False
+
+    manifest_lines = [
+        f"Tile #{idx + 1}: {c['path'].name} (source={c['sum_lbl']})"
+        for idx, c in enumerate(pool)
+    ]
+    prompt = (
+        "You are a 10M-view Netflix / MagnatesMedia YouTube Documentary Thumbnail Art Director.\n"
+        f"Video title: {title!r}\n"
+        f"Thumbnail 3-word hook overlay: {thumb_3words!r}\n"
+        f"Target mood: {mood!r}\n\n"
+        "The attached contact sheet shows numbered candidate hero plates (#1 through "
+        f"#{len(pool)}):\n" + "\n".join(manifest_lines) + "\n\n"
+        "Task:\n"
+        f"1. Rank up to {max_pick} DISTINCT tile numbers (best first) that MOST STRONGLY AND SEMANTICALLY "
+        "match the exact hook text and mood for a dramatic documentary cover.\n"
+        "2. STRICTLY REJECT (`rejected_indices`) any tile that clashes with the hook or mood — e.g., if the "
+        "hook/title conveys forbidden/dark/conflict/ban/crime/mystery, REJECT smiling commercial Santa Claus, "
+        "cheerful holiday advertisements, bright sunny modern snapshots, off-topic modern objects (cars, "
+        "wristwatches, museum hallways, kitchen scales), or images with visible burned-in text/watermarks.\n"
+        "3. Prefer intense historical portraits, forbidding authority figures, riots, hooded/horned folklore, "
+        "candlelit tension, and high-drama chiaroscuro compositions that make viewers instantly click.\n\n"
+        "Return STRICT JSON ONLY:\n"
+        '{"ranked_indices": [3, 7, 1], "rejected_indices": [9], "reason": "brief explanation"}'
+    )
+    sheet_b64 = base64.b64encode(sheet_bytes).decode("ascii")
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": sheet_b64}},
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.15,
+            "responseMimeType": "application/json",
+        },
+    }
+
+    parsed: Optional[Dict[str, Any]] = None
+    with httpx.Client(timeout=22.0) as client:
+        for model in GEMINI_VISION_SELECTOR_MODELS:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            for attempt in range(2):
+                try:
+                    resp = client.post(
+                        url,
+                        headers={"x-goog-api-key": eff_key, "Content-Type": "application/json"},
+                        json=payload,
+                    )
+                except Exception:
+                    if attempt == 0:
+                        time.sleep(0.8)
+                        continue
+                    break
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                        raw_txt = "".join(str(p.get("text") or "") for p in parts).strip()
+                        raw_txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_txt, flags=re.IGNORECASE | re.DOTALL).strip()
+                        cand_obj = json.loads(raw_txt)
+                        if isinstance(cand_obj, dict) and isinstance(cand_obj.get("ranked_indices"), list):
+                            parsed = cand_obj
+                            break
+                    except Exception:
+                        break
+                elif resp.status_code in (429, 500, 502, 503):
+                    if attempt == 0:
+                        time.sleep(1.0)
+                        continue
+                    break
+                else:
+                    break
+            if parsed is not None:
+                break
+
+    if parsed is None:
+        non_wiki = [c for c in pool if not c.get("is_wiki")]
+        return (non_wiki if non_wiki else [])[:max_pick], False
+
+    rejected_zero: Set[int] = set()
+    for r_i in parsed.get("rejected_indices") or []:
+        try:
+            zi = int(r_i) - 1
+            if 0 <= zi < len(pool):
+                rejected_zero.add(zi)
+        except Exception:
+            pass
+
+    selected: List[Dict[str, Any]] = []
+    used_zero: Set[int] = set()
+    for rank_pos, raw_idx in enumerate(parsed.get("ranked_indices") or [], start=1):
+        try:
+            zi = int(raw_idx) - 1
+        except Exception:
+            continue
+        if 0 <= zi < len(pool) and zi not in used_zero and zi not in rejected_zero:
+            used_zero.add(zi)
+            item = dict(pool[zi])
+            item["vision_verified"] = True
+            item["vision_rank"] = rank_pos
+            selected.append(item)
+            if len(selected) >= max_pick:
+                break
+
+    # Top up from remaining non-rejected, non-wiki Flow plates if Vision returned fewer than max_pick
+    if len(selected) < max_pick:
+        for zi, cand in enumerate(pool):
+            if len(selected) >= max_pick:
+                break
+            if zi in used_zero or zi in rejected_zero or cand.get("is_wiki"):
+                continue
+            used_zero.add(zi)
+            item = dict(cand)
+            item["vision_verified"] = False
+            item["vision_rank"] = len(selected) + 1
+            selected.append(item)
+
+    reason = str(parsed.get("reason") or "").strip()
+    if selected:
+        picked_names = [f"#{c.get('vision_rank')}={c['path'].name}" for c in selected[:3]]
+        print(
+            f"[ThumbStudio] Vision semantic selector ({thumb_3words!r}, mood={mood}): "
+            f"{', '.join(picked_names)} (rejected={len(rejected_zero)}; {reason[:120]})",
+            flush=True,
+        )
+        return selected, True
+
+    non_wiki = [c for c in pool if not c.get("is_wiki")]
+    return (non_wiki if non_wiki else [])[:max_pick], False
+
+
 def _acquire_hero_assets(
     title: str,
     video_path: Path,
     work_dir: Path,
     art_dir: Dict[str, Any],
+    thumb_3words: Optional[str] = None,
 ) -> Tuple[List[Tuple[Path, np.ndarray, str]], str]:
-    """Acquire up to 5 high-resolution cinematic hero images prioritizing era-validated
-    project hero plates BEFORE generic stock fallbacks:
-      1. Era-validated project hero plates in `_work/` (`flow_sc*`, `wiki_*`, `wikimedia_*`, `archival_*`)
-      2. Wikimedia Commons free archival plates (`fetch_wikimedia_commons_archival_photo`, if available)
+    """Acquire up to 5 high-resolution cinematic hero images prioritizing Vision-selected
+    era-validated project hero plates BEFORE generic stock fallbacks:
+      1. 1-call Gemini Vision semantic selection over `_work/flow_sc*_shot00.*` hero plates
+         (excluding unverified `wiki_*` files unless explicitly Vision-verified!)
+      2. Vision-verified Wikimedia Commons free archival plates (`strict_vision=True`)
       3. Bespoke Gemini Image API (`gemini-2.5-flash-image` -> `gemini-3.1-flash-image`)
       4. Sharpest clean frames from the rendered project `video_path`
-      5. Last-resort generic stock fallback (`fetch_doc_real_photo` / remaining `_work/photo_*.jpg`)
+      5. Last-resort editorial photo fallback (`fetch_doc_real_photo` with `mood` + `scene_context`)
     """
     assets: List[Tuple[Path, np.ndarray, str]] = []
     sources_used: List[str] = []
     existing_sigs: Set[str] = set()
+    eff_mood = str(art_dir.get("mood") or "dark_horror").strip().lower() or "dark_horror"
+    eff_hook = str(thumb_3words or " ".join(art_dir.get("auto_headline") or []) or title).strip()
+    eff_scene_context = f"{title} | Hook: {eff_hook} | Mood: {eff_mood}".strip()
 
     def _try_add_asset(p: Path, bgr: Optional[np.ndarray], src_tag: str, summary_tag: str, min_w: int = 480, min_h: int = 320) -> bool:
         if not _validate_decoded_bgr(bgr, min_w=min_w, min_h=min_h):
@@ -991,7 +1221,8 @@ def _acquire_hero_assets(
             sources_used.append(summary_tag)
         return True
 
-    # 1. PRIORITY 1: Harvest era-validated project hero plates from _work/ (flow_sc* + Wikimedia archival plates)
+    # 1. PRIORITY 1: Harvest project hero plates from _work/ (`flow_sc*_shot00.*` prioritized;
+    #    unverified `wiki_*` files are EXCLUDED unless Vision-verified!)
     search_dirs: List[Path] = []
     if work_dir.exists():
         search_dirs.append(work_dir)
@@ -1001,19 +1232,22 @@ def _acquire_hero_assets(
             search_dirs.append(vp_work)
 
     if search_dirs:
-        validated_cands: List[Tuple[int, Path, str]] = []
+        flow_raw: List[Tuple[int, Path, str, bool]] = []
+        wiki_raw: List[Tuple[int, Path, str, bool]] = []
         seen_paths: Set[Path] = set()
-        pattern_tiers = [
+        flow_tiers = [
             ("flow_sc*_shot00.*", 3, "project_hero_flow"),
             ("flow_sc*.*", 2, "project_hero_flow"),
             ("flow_*_shot00.*", 2, "project_hero_flow"),
             ("flow_*.*", 2, "project_hero_flow"),
-            ("wiki_*.*", 2, "wikimedia_archival"),
-            ("wikimedia_*.*", 2, "wikimedia_archival"),
-            ("archival_*.*", 2, "wikimedia_archival"),
+        ]
+        wiki_tiers = [
+            ("wiki_*.*", 1, "wikimedia_archival"),
+            ("wikimedia_*.*", 1, "wikimedia_archival"),
+            ("archival_*.*", 1, "wikimedia_archival"),
         ]
         for sdir in search_dirs:
-            for pat, tier_pri, src_prefix in pattern_tiers:
+            for pat, tier_pri, src_prefix in flow_tiers:
                 for cand_p in sorted(sdir.glob(pat)):
                     if (
                         cand_p.is_file()
@@ -1022,60 +1256,111 @@ def _acquire_hero_assets(
                         and cand_p.resolve() not in seen_paths
                     ):
                         seen_paths.add(cand_p.resolve())
-                        validated_cands.append((tier_pri, cand_p, src_prefix))
+                        flow_raw.append((tier_pri, cand_p, src_prefix, False))
+            for pat, tier_pri, src_prefix in wiki_tiers:
+                for cand_p in sorted(sdir.glob(pat)):
+                    if (
+                        cand_p.is_file()
+                        and cand_p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+                        and cand_p.stat().st_size > 8_000
+                        and cand_p.resolve() not in seen_paths
+                    ):
+                        seen_paths.add(cand_p.resolve())
+                        wiki_raw.append((tier_pri, cand_p, src_prefix, True))
 
-        scored_project: List[Tuple[int, int, float, Path, np.ndarray, str, str]] = []
-        for tier_pri, cand_p, src_prefix in validated_cands[:36]:
-            bgr_w = cv2.imread(str(cand_p), cv2.IMREAD_COLOR)
-            if not _validate_decoded_bgr(bgr_w, min_w=480, min_h=340):
-                continue
-            is_landscape = 1 if bgr_w.shape[1] >= bgr_w.shape[0] else 0
-            drama = _score_cinema_drama_bgr(bgr_w)
-            scored_project.append(
-                (tier_pri, is_landscape, drama, cand_p, bgr_w, f"{src_prefix}:{cand_p.name}", src_prefix)
-            )
-
-        # Diversify across distinct scenes (flow_sc00, flow_sc03, flow_sc07...) so A, B, C get distinct era plates
-        scored_project.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
-        picked_scene_prefixes: Set[str] = set()
-        deferred: List[Tuple[int, int, float, Path, np.ndarray, str, str]] = []
-        for item in scored_project:
-            if len(assets) >= 5:
-                break
-            _, _, _, cand_p, bgr_w, src_lbl, sum_lbl = item
-            m_sc = re.match(r"^(flow_sc\d+)", cand_p.name.lower())
-            sc_key = m_sc.group(1) if m_sc else ""
-            if sc_key and sc_key in picked_scene_prefixes:
-                deferred.append(item)
-                continue
-            if _try_add_asset(cand_p, bgr_w, src_lbl, sum_lbl):
+        # Decode and diversify across distinct scenes (`flow_sc00`, `flow_sc03`, `flow_sc12`...) up to 12 Vision candidates
+        def _decode_pool(raw_items: List[Tuple[int, Path, str, bool]], limit: int) -> List[Dict[str, Any]]:
+            decoded: List[Dict[str, Any]] = []
+            for tier_pri, cand_p, src_prefix, is_wiki in raw_items[:40]:
+                bgr_w = cv2.imread(str(cand_p), cv2.IMREAD_COLOR)
+                if not _validate_decoded_bgr(bgr_w, min_w=480, min_h=340):
+                    continue
+                is_landscape = 1 if bgr_w.shape[1] >= bgr_w.shape[0] else 0
+                drama = _score_cinema_drama_bgr(bgr_w)
+                decoded.append(
+                    {
+                        "tier_pri": tier_pri,
+                        "is_landscape": is_landscape,
+                        "drama": drama,
+                        "path": cand_p,
+                        "bgr": bgr_w,
+                        "src_lbl": f"{src_prefix}:{cand_p.name}",
+                        "sum_lbl": src_prefix,
+                        "is_wiki": is_wiki,
+                    }
+                )
+            decoded.sort(key=lambda d: (d["tier_pri"], d["is_landscape"], d["drama"]), reverse=True)
+            picked: List[Dict[str, Any]] = []
+            deferred: List[Dict[str, Any]] = []
+            seen_sc: Set[str] = set()
+            for item in decoded:
+                if len(picked) >= limit:
+                    break
+                m_sc = re.match(r"^(flow_sc\d+)", item["path"].name.lower())
+                sc_key = m_sc.group(1) if m_sc else ""
+                if sc_key and sc_key in seen_sc:
+                    deferred.append(item)
+                    continue
+                picked.append(item)
                 if sc_key:
-                    picked_scene_prefixes.add(sc_key)
-        for item in deferred:
-            if len(assets) >= 5:
-                break
-            _, _, _, cand_p, bgr_w, src_lbl, sum_lbl = item
-            _try_add_asset(cand_p, bgr_w, src_lbl, sum_lbl)
+                    seen_sc.add(sc_key)
+            for item in deferred:
+                if len(picked) >= limit:
+                    break
+                picked.append(item)
+            return picked
 
-    # 2. PRIORITY 2: Wikimedia Commons Archival Plates (when < 3 era-validated assets exist)
+        flow_cands = _decode_pool(flow_raw, limit=12)
+        # Only expose `_work/wiki_*` candidates to Vision selector when < 5 Flow plates exist;
+        # unverified `wiki_*` files are NEVER admitted without explicit Vision approval!
+        vision_pool: List[Dict[str, Any]] = list(flow_cands)
+        if len(vision_pool) < 5 and wiki_raw:
+            wiki_cands = _decode_pool(wiki_raw, limit=max(0, 12 - len(vision_pool)))
+            vision_pool.extend(wiki_cands)
+
+        if vision_pool:
+            selected_cands, vision_ok = _vision_select_thumbnail_candidates(
+                vision_pool,
+                title=title,
+                thumb_3words=eff_hook,
+                mood=eff_mood,
+                max_pick=5,
+            )
+            for rank_i, cand in enumerate(selected_cands, start=1):
+                if len(assets) >= 5:
+                    break
+                # Double-guard: exclude any unverified wiki_* candidate
+                if cand.get("is_wiki") and not cand.get("vision_verified"):
+                    continue
+                v_tag = f"|vision_rank#{rank_i}" if vision_ok and cand.get("vision_verified") else ""
+                src_lbl = f"{cand['src_lbl']}{v_tag}"
+                sum_lbl = f"{cand['sum_lbl']}_vision" if (vision_ok and cand.get("vision_verified")) else cand["sum_lbl"]
+                _try_add_asset(cand["path"], cand["bgr"], src_lbl, sum_lbl)
+
+    # 2. PRIORITY 2: Wikimedia Commons Archival Plates (Vision-strict, when < 3 era-validated assets exist)
     if len(assets) < 3:
         try:
             import engine.doc_media_engine as _dme
 
             wiki_fn = getattr(_dme, "fetch_wikimedia_commons_archival_photo", None)
             if callable(wiki_fn):
+                wiki_sig = inspect.signature(wiki_fn).parameters
+                wiki_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in wiki_sig.values())
                 queries = list(art_dir.get("photo_queries") or [])
                 for q_idx, query in enumerate(queries[:3], start=1):
                     if len(assets) >= 3:
                         break
-                    wp = wiki_fn(
-                        query_en=query,
-                        out_dir=work_dir,
-                        prefix=f"wiki_thumb_{q_idx}",
-                        is_wide=True,
-                        topic_context=title,
-                        mood=str(art_dir.get("mood") or "dark_horror"),
-                    )
+                    wiki_kw: Dict[str, Any] = {
+                        "query_en": query,
+                        "out_dir": work_dir,
+                        "prefix": f"wiki_thumb_{q_idx}",
+                        "is_wide": True,
+                        "topic_context": eff_scene_context,
+                        "mood": eff_mood,
+                    }
+                    if "strict_vision" in wiki_sig or wiki_var_kw:
+                        wiki_kw["strict_vision"] = True
+                    wp = wiki_fn(**wiki_kw)
                     if wp is not None and Path(wp).exists():
                         bgr_wk = cv2.imread(str(wp), cv2.IMREAD_COLOR)
                         _try_add_asset(Path(wp), bgr_wk, f"wikimedia_archival:{query}", "wikimedia_archival", min_w=600, min_h=340)
@@ -1106,23 +1391,32 @@ def _acquire_hero_assets(
             bgr = cv2.imread(str(vf), cv2.IMREAD_COLOR)
             _try_add_asset(vf, bgr, "video_frame", "video_frame", min_w=320, min_h=200)
 
-    # 5. PRIORITY 5 (Last Resort): Generic Stock Photos via fetch_doc_real_photo ONLY if < 3 assets exist
+    # 5. PRIORITY 5 (Last Resort): Vision-checked editorial photo fallback WITH mood + scene_context!
     if len(assets) < 3:
         try:
             from engine.doc_media_engine import fetch_doc_real_photo
 
+            fetch_sig = inspect.signature(fetch_doc_real_photo).parameters
+            fetch_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in fetch_sig.values())
             used_urls: Set[str] = set()
             queries = list(art_dir.get("photo_queries") or [])
             for q_idx, query in enumerate(queries, start=1):
                 if len(assets) >= 3:
                     break
-                p = fetch_doc_real_photo(
-                    query=query,
-                    work_dir=work_dir,
-                    tag=f"thumb_hero_{q_idx}",
-                    min_width=900,
-                    used_urls=used_urls,
-                )
+                fetch_kw: Dict[str, Any] = {
+                    "query": query,
+                    "work_dir": work_dir,
+                    "tag": f"thumb_hero_{q_idx}",
+                    "min_width": 900,
+                    "used_urls": used_urls,
+                }
+                if "mood" in fetch_sig or fetch_var_kw:
+                    fetch_kw["mood"] = eff_mood
+                if "scene_context" in fetch_sig or fetch_var_kw:
+                    fetch_kw["scene_context"] = eff_scene_context
+                if "strict_vision" in fetch_sig or fetch_var_kw:
+                    fetch_kw["strict_vision"] = True
+                p = fetch_doc_real_photo(**fetch_kw)
                 if p is not None and Path(p).exists():
                     bgr = cv2.imread(str(p), cv2.IMREAD_COLOR)
                     _try_add_asset(Path(p), bgr, f"stock_fallback:{query}", "doc_media_photo", min_w=600, min_h=340)
@@ -1843,20 +2137,25 @@ def _save_surface_jpeg(surface: skia.Surface, out_path: Path, quality: int = 94)
 # Role Selector Across Acquired Hero Candidates
 # ---------------------------------------------------------------------------
 def _hero_source_priority_bonus(src: str, path: Optional[Path] = None) -> float:
-    """Strongly prioritize era-validated project hero plates (`_work/flow_sc*` or Wikimedia
-    archival plates) and bespoke Gemini covers before generic stock fallbacks.
+    """Strongly prioritize Vision-ranked semantic hero plates (`|vision_rank#1..5`),
+    era-validated project hero plates (`_work/flow_sc*`), and bespoke Gemini covers before stock.
     """
     s = str(src or "").lower()
     fname = str(path.name).lower() if path is not None else ""
+    vision_bonus = 0.0
+    m_vr = re.search(r"vision_rank#(\d+)", s)
+    if m_vr:
+        r_pos = max(1, int(m_vr.group(1)))
+        vision_bonus = max(20.0, 220.0 - (r_pos - 1) * 45.0)
     if s.startswith("project_hero_flow") or fname.startswith("flow_sc") or fname.startswith("flow_"):
-        return 260.0
+        return 260.0 + vision_bonus
     if s.startswith("wikimedia_archival") or fname.startswith(("wiki_", "wikimedia_", "archival_")):
-        return 240.0
+        return (240.0 if vision_bonus > 0 else 120.0) + vision_bonus
     if s.startswith("gemini_image"):
-        return 220.0
+        return 220.0 + vision_bonus
     if s.startswith("video_frame"):
-        return 150.0
-    return 0.0
+        return 150.0 + vision_bonus
+    return vision_bonus
 
 
 def _select_hero_roles(
@@ -2010,7 +2309,14 @@ def generate_ab_thumbnails_16x9(
         llm_headline_words=art_dir.get("auto_headline"),
     )
 
-    assets, hero_source_summary = _acquire_hero_assets(title, video_path, work_dir, art_dir)
+    eff_thumb_3words = (str(custom_3words).strip() if custom_3words else " ".join(words)).strip()
+    assets, hero_source_summary = _acquire_hero_assets(
+        title,
+        video_path,
+        work_dir,
+        art_dir,
+        thumb_3words=eff_thumb_3words,
+    )
     roles = _select_hero_roles(assets, work_dir)
     seed_base = int(hashlib.md5(f"{title}|{words}".encode("utf-8")).hexdigest()[:8], 16)
 
