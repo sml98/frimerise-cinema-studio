@@ -56,6 +56,60 @@ from engine.intel_vaapi import read_cpu_temperature_c, thermal_guard_wait  # noq
 from engine.pipeline import enqueue_new_job, run_video_job  # noqa: E402
 
 OUTPUTS_DIR = BASE_DIR / "outputs"
+RENDER_LOCK_PATH = BASE_DIR / "data" / ".frimerise_render.lock"
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _acquire_render_lock(job_id: str, source: str = "batch_produce") -> None:
+    RENDER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if RENDER_LOCK_PATH.exists():
+        try:
+            lock_data = json.loads(RENDER_LOCK_PATH.read_text(encoding="utf-8"))
+            other_pid = int(lock_data.get("pid") or 0)
+            if other_pid != os.getpid() and _is_pid_alive(other_pid):
+                raise RuntimeError(
+                    f"Outro render FrimeRise já está ativo (PID {other_pid}, job={lock_data.get('job_id')}, "
+                    f"source={lock_data.get('source')}). Aguarde terminar para evitar corrupção de _work/."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+    RENDER_LOCK_PATH.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "job_id": job_id,
+                "source": source,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _release_render_lock() -> None:
+    try:
+        if RENDER_LOCK_PATH.exists():
+            lock_data = json.loads(RENDER_LOCK_PATH.read_text(encoding="utf-8"))
+            if int(lock_data.get("pid") or 0) == os.getpid():
+                RENDER_LOCK_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def check_disk_headroom(min_free_gb: float) -> float:
@@ -83,14 +137,30 @@ def run_automated_qc(
     job_dir = Path(job_dir)
     master = job_dir / "master.mp4"
     if not master.exists():
-        # If already pruned after Drive upload, fall back to preview_540p.mp4 for basic presence check
+        # Prefer previously saved real broadcast QC report computed BEFORE Drive prune
+        existing_qc_p = job_dir / "qc_report.json"
+        if existing_qc_p.exists():
+            try:
+                saved_qc = json.loads(existing_qc_p.read_text(encoding="utf-8"))
+                if isinstance(saved_qc, dict) and saved_qc.get("metrics"):
+                    return saved_qc
+            except Exception:
+                pass
+        # If pruned without a prior QC report, do NOT falsely return passed=True without metrics
         qr_p = job_dir / "quality_report.json"
         if qr_p.exists():
             qr = json.loads(qr_p.read_text(encoding="utf-8"))
             if (qr.get("gdrive_backup") or {}).get("status") == "uploaded":
+                qc_sum = qr.get("qc_summary")
+                if isinstance(qc_sum, dict) and qc_sum.get("metrics"):
+                    return {
+                        **qc_sum,
+                        "note": "QC pré-poda preservado (master.mp4 arquivado no Google Drive).",
+                        "gdrive_backup": qr.get("gdrive_backup"),
+                    }
                 return {
-                    "passed": True,
-                    "note": "master.mp4 já enviado e verificado no Google Drive (local podado).",
+                    "passed": False,
+                    "errors": ["master.mp4 podado antes do QC — execute QC antes de podar!"],
                     "gdrive_backup": qr.get("gdrive_backup"),
                 }
         return {"passed": False, "errors": ["master.mp4 não encontrado"]}
@@ -279,11 +349,10 @@ async def produce_single_item(
         flush=True,
     )
 
-    topic = str(item["topic"]).strip()
+    topic = str(item.get("topic") or item.get("resume_job_id") or "").strip()
     client_id = int(item.get("client_id") or 1)
     skill_id = str(item.get("skill_id") or "10_netflix_investigative_doc")
     mode = str(item.get("mode") or "single")
-    opts = build_full_quality_options(item)
 
     job_id = str(item.get("resume_job_id") or "").strip()
     if job_id:
@@ -291,41 +360,65 @@ async def produce_single_item(
         if not existing:
             raise RuntimeError(f"Job '{job_id}' não encontrado no banco para retomada.")
         saved_opts = json.loads(existing.get("options_json") or "{}")
-        opts = {**saved_opts, **opts, "_resume": True}
+        if not isinstance(saved_opts, dict):
+            saved_opts = {}
+        # Build defaults anchored to saved engine/aspect, then layer saved_opts, then ONLY explicit CLI overrides!
+        defaults = build_full_quality_options(
+            {
+                "engine_style": saved_opts.get("engine_style"),
+                "aspect_ratio": saved_opts.get("aspect_ratio"),
+            }
+        )
+        cli_overrides = dict(item.get("_cli_overrides") or {})
+        for k_item, v_item in item.items():
+            if k_item in ("topic", "resume_job_id", "client_id", "skill_id", "mode", "_cli_overrides"):
+                continue
+            if v_item is not None and v_item != "":
+                cli_overrides[k_item] = v_item
+        opts = {**defaults, **saved_opts, **cli_overrides, "_resume": True}
         topic = str(existing.get("topic") or topic)
         client_id = int(existing.get("client_id") or client_id)
         skill_id = str(existing.get("skill_id") or skill_id)
-        print(f"[Factory] ♻️ Retomando job existente: {job_id} ('{topic}')", flush=True)
+        print(f"[Factory] ♻️ Retomando job existente: {job_id} ('{topic}' | {opts.get('engine_style')} {opts.get('aspect_ratio')})", flush=True)
     else:
+        opts = build_full_quality_options(item)
         job = enqueue_new_job(client_id, topic, skill_id, mode, opts)
         job_id = str(job["id"])
         print(f"[Factory] 🎬 Novo job enfileirado: {job_id} ('{topic}' | {opts['engine_style']} {opts['aspect_ratio']})", flush=True)
 
     last_exc: Optional[Exception] = None
     result: Dict[str, Any] = {}
-    for attempt in range(max_retries + 1):
-        try:
-            thermal_guard_wait(float(get_settings().get("thermal_limit_c") or 85.0))
-            run_opts = dict(opts)
-            if attempt > 0:
-                run_opts["_resume"] = True
-                print(f"[Factory] ♻️ Tentativa {attempt + 1}/{max_retries + 1} com checkpoint resume...", flush=True)
-            result = await run_video_job(
-                job_id=job_id,
-                client_id=client_id,
-                topic=topic,
-                skill_id=skill_id,
-                mode=mode,
-                options=run_opts,
-            )
-            last_exc = None
-            break
-        except Exception as exc:
-            last_exc = exc
-            print(f"[Factory] ⚠️ Erro na tentativa {attempt + 1}: {exc}", flush=True)
-            if attempt >= max_retries:
-                raise
+    _acquire_render_lock(job_id, source="batch_produce")
+    try:
+        for attempt in range(max_retries + 1):
+            try:
+                thermal_guard_wait(float(get_settings().get("thermal_limit_c") or 85.0))
+                run_opts = dict(opts)
+                # Defer Drive upload/prune until AFTER automated broadcast QC validates master.mp4!
+                run_opts["_defer_drive_upload"] = True
+                run_opts["_skip_loudness_qc"] = bool(skip_loudness_qc)
+                if attempt > 0:
+                    run_opts["_resume"] = True
+                    print(f"[Factory] ♻️ Tentativa {attempt + 1}/{max_retries + 1} com checkpoint resume...", flush=True)
+                result = await run_video_job(
+                    job_id=job_id,
+                    client_id=client_id,
+                    topic=topic,
+                    skill_id=skill_id,
+                    mode=mode,
+                    options=run_opts,
+                )
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                print(f"[Factory] ⚠️ Erro na tentativa {attempt + 1}: {exc}", flush=True)
+                if attempt >= max_retries:
+                    raise
+    finally:
+        _release_render_lock()
 
+    # Step 1: Run automated broadcast QC BEFORE Drive upload/prune while master.mp4 is still on SSD!
     job_dir = OUTPUTS_DIR / job_id
     qc = run_automated_qc(
         job_dir,
@@ -339,15 +432,24 @@ async def produce_single_item(
     if qc.get("errors"):
         print(f"[Factory] ❌ Erros QC: {qc['errors']}", flush=True)
 
-    # Upload qc_report.json / retry Drive upload if pipeline finished before Drive was connected
+    # Step 2: Upload verified project (including qc_report.json) to Google Drive & prune heavy local files cleanly!
     qr_path = job_dir / "quality_report.json"
     if qr_path.exists():
         qr = json.loads(qr_path.read_text(encoding="utf-8"))
+        qr["qc_summary"] = {
+            "passed": bool(qc.get("passed", False)),
+            "errors": list(qc.get("errors") or []),
+            "warnings": list(qc.get("warnings") or []),
+            "metrics": dict(qc.get("metrics") or {}),
+        }
         gd_b = qr.get("gdrive_backup") or {}
         if gd_b.get("status") != "uploaded" and probe_gdrive_status().get("connected"):
             gd_b = await asyncio.to_thread(upload_job_to_gdrive, job_dir, topic, job_id, prune_after_upload=ensure_drive_prune)
             qr["gdrive_backup"] = gd_b
-            qr_path.write_text(json.dumps(qr, indent=2, ensure_ascii=False), encoding="utf-8")
+            # NEVER overwrite master_path with preview_540p.mp4 — clear master_path if pruned to Drive!
+            if gd_b.get("status") == "uploaded" and not (job_dir / "master.mp4").exists():
+                update_job(job_id, master_path="", hook_a_path="")
+        qr_path.write_text(json.dumps(qr, indent=2, ensure_ascii=False), encoding="utf-8")
 
     return {"job_id": job_id, "topic": topic, "result": result, "qc": qc, "disk_free_gb": round(shutil.disk_usage(BASE_DIR).free / (1024**3), 2)}
 
@@ -358,13 +460,13 @@ def main() -> int:
     parser.add_argument("--queue", help="Caminho para arquivo JSON com fila de vídeos (ver fila_videos.example.json)")
     parser.add_argument("--resume-job", help="ID de um job existente para retomar via checkpoint")
     parser.add_argument("--qc-only", help="Executa apenas o QC automático em uma pasta outputs/<job_id>")
-    parser.add_argument("--engine", default="netflix_doc", choices=["netflix_doc", "cinematic_broll", "cartoon_2d"])
-    parser.add_argument("--aspect", default="16:9", choices=["16:9", "9:16", "4:5", "1:1"])
-    parser.add_argument("--minutes", type=float, default=17.0, help="Duração alvo em minutos (netflix_doc)")
-    parser.add_argument("--lang", default="pt_br", choices=["pt_br", "en_us", "es"])
-    parser.add_argument("--thumb-3words", default="", help="Texto de 3 palavras nas thumbnails A/B")
-    parser.add_argument("--directives", default="", help="Diretrizes editoriais extras")
-    parser.add_argument("--shorts-cascade", action="store_true", help="Extrair 5 Shorts 9:16 do 16:9")
+    parser.add_argument("--engine", default=None, choices=["netflix_doc", "cinematic_broll", "cartoon_2d"])
+    parser.add_argument("--aspect", default=None, choices=["16:9", "9:16", "4:5", "1:1"])
+    parser.add_argument("--minutes", type=float, default=None, help="Duração alvo em minutos (netflix_doc)")
+    parser.add_argument("--lang", default=None, choices=["pt_br", "en_us", "es"])
+    parser.add_argument("--thumb-3words", default=None, help="Texto de 3 palavras nas thumbnails A/B")
+    parser.add_argument("--directives", default=None, help="Diretrizes editoriais extras")
+    parser.add_argument("--shorts-cascade", action="store_true", default=None, help="Extrair 5 Shorts 9:16 do 16:9")
     parser.add_argument("--min-free-gb", type=float, default=10.0, help="Mínimo de espaço livre em GB no SSD")
     parser.add_argument("--skip-loudness-qc", action="store_true", help="Pular análise ebur128 (mais rápido)")
     args = parser.parse_args()
@@ -376,20 +478,35 @@ def main() -> int:
 
     items: List[Dict[str, Any]] = []
     if args.resume_job:
-        items.append({"topic": args.topic or args.resume_job, "resume_job_id": args.resume_job})
+        cli_ov: Dict[str, Any] = {}
+        if args.engine is not None:
+            cli_ov["engine_style"] = args.engine
+        if args.aspect is not None:
+            cli_ov["aspect_ratio"] = args.aspect
+        if args.minutes is not None:
+            cli_ov["target_minutes"] = args.minutes
+        if args.lang is not None:
+            cli_ov["language"] = args.lang
+        if args.thumb_3words is not None:
+            cli_ov["thumb_3words"] = args.thumb_3words
+        if args.directives is not None:
+            cli_ov["custom_directives"] = args.directives
+        if args.shorts_cascade is True:
+            cli_ov["auto_shorts_cascade"] = True
+        items.append({"topic": args.topic or args.resume_job, "resume_job_id": args.resume_job, "_cli_overrides": cli_ov})
     elif args.queue:
         raw = json.loads(Path(args.queue).read_text(encoding="utf-8"))
         items = raw if isinstance(raw, list) else list(raw.get("videos") or [])
     elif args.topic:
         items.append({
             "topic": args.topic,
-            "engine_style": args.engine,
-            "aspect_ratio": args.aspect,
-            "target_minutes": args.minutes,
-            "language": args.lang,
-            "thumb_3words": args.thumb_3words,
-            "custom_directives": args.directives,
-            "auto_shorts_cascade": args.shorts_cascade,
+            "engine_style": args.engine or "netflix_doc",
+            "aspect_ratio": args.aspect or "16:9",
+            "target_minutes": args.minutes if args.minutes is not None else 17.0,
+            "language": args.lang or "pt_br",
+            "thumb_3words": args.thumb_3words or "",
+            "custom_directives": args.directives or "",
+            "auto_shorts_cascade": bool(args.shorts_cascade),
         })
     else:
         parser.print_help()

@@ -13,9 +13,12 @@ import asyncio
 import hmac
 import inspect
 import json
+import os
 import re
 import secrets
 import shutil
+import signal
+import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -210,6 +213,102 @@ async def security_and_auth_middleware(request: Request, call_next):
 # Sequential job queue worker so Acer Aspire 5 Core i5 never overloads RAM/thermals
 JOB_QUEUE: asyncio.Queue = asyncio.Queue()
 SCHEDULER = AsyncIOScheduler()
+RENDER_LOCK_PATH = DATA_DIR / ".frimerise_render.lock"
+_WORKER_TASK: Optional[asyncio.Task] = None
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _read_active_external_lock() -> Optional[Dict[str, Any]]:
+    """Return lock payload if another live process (e.g., batch_produce.py) currently owns the render lock."""
+    if not RENDER_LOCK_PATH.exists():
+        return None
+    try:
+        data = json.loads(RENDER_LOCK_PATH.read_text(encoding="utf-8"))
+        pid = int(data.get("pid") or 0)
+        if pid != os.getpid() and _is_pid_alive(pid):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def _acquire_render_lock(job_id: str, source: str = "app") -> None:
+    RENDER_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ext = _read_active_external_lock()
+    if ext is not None:
+        raise RuntimeError(
+            f"Render concorrente detectado (PID {ext.get('pid')} / {ext.get('source')} no job {ext.get('job_id')})."
+        )
+    RENDER_LOCK_PATH.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "job_id": job_id,
+                "source": source,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _release_render_lock() -> None:
+    try:
+        if RENDER_LOCK_PATH.exists():
+            data = json.loads(RENDER_LOCK_PATH.read_text(encoding="utf-8"))
+            if int(data.get("pid") or 0) == os.getpid():
+                RENDER_LOCK_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def check_disk_headroom(min_free_gb: float = 10.0) -> float:
+    """Verify SSD headroom before starting heavy renders (prevents 0-byte disk lockups)."""
+    free_gb = shutil.disk_usage(BASE_DIR).free / (1024**3)
+    if free_gb < min_free_gb:
+        raise HTTPException(
+            status_code=507,
+            detail=(
+                f"Espaço livre insuficiente no SSD ({free_gb:.2f} GB < mínimo {min_free_gb:.1f} GB). "
+                "Conecte o Google Drive (./setup_gdrive.sh) ou libere espaço antes de iniciar novo render."
+            ),
+        )
+    return round(free_gb, 2)
+
+
+def _terminate_child_render_processes() -> None:
+    """Best-effort cleanup of orphan ffmpeg / camoufox child processes spawned by this server on shutdown."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-P", str(os.getpid())],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        for line in (out.stdout or "").splitlines():
+            try:
+                cpid = int(line.strip())
+                if cpid > 0 and cpid != os.getpid():
+                    os.kill(cpid, signal.SIGTERM)
+            except Exception:
+                continue
+    except Exception:
+        pass
 
 
 async def _get_flow_status_safe() -> Dict[str, Any]:
@@ -244,10 +343,35 @@ async def _get_flow_status_safe() -> Dict[str, Any]:
 async def _job_worker() -> None:
     while True:
         task = await JOB_QUEUE.get()
+        job_id = str(task.get("job_id") or "")
         try:
-            await run_video_job(**task)
+            # Wait politely if an external CLI render (batch_produce.py) currently holds the SSD/GPU lock
+            while _read_active_external_lock() is not None:
+                await asyncio.sleep(5.0)
+            # Disk headroom guard before rendering
+            opts = task.get("options") or {}
+            is_long_doc = (
+                str(opts.get("engine_style") or "") == "netflix_doc"
+                and (float(opts.get("target_minutes") or 0.0) >= 5.0 or int(opts.get("target_duration_s") or 0) >= 300)
+            )
+            min_gb = 10.0 if is_long_doc else 3.0
+            free_gb = shutil.disk_usage(BASE_DIR).free / (1024**3)
+            if free_gb < min_gb:
+                msg = f"SSD sem espaço mínimo ({free_gb:.2f} GB < {min_gb:.1f} GB exigidos). Libere espaço ou ative auto-prune no Google Drive."
+                update_job(job_id, status="error", stage="SSD sem espaço livre")
+                append_job_log(job_id, f"❌ {msg}")
+                continue
+
+            _acquire_render_lock(job_id, source="app")
+            try:
+                await run_video_job(**task)
+            finally:
+                _release_render_lock()
+        except asyncio.CancelledError:
+            _release_render_lock()
+            raise
         except Exception as exc:
-            print(f"[FrimeRise Worker] Erro no job {task.get('job_id')}: {exc}")
+            print(f"[FrimeRise Worker] Erro no job {job_id}: {exc}")
         finally:
             JOB_QUEUE.task_done()
 
@@ -289,9 +413,19 @@ async def _check_due_schedules() -> None:
 
 
 async def _recover_interrupted_jobs() -> None:
-    """Auto-resume jobs left in 'running'/'queued' when uvicorn restarts (max 2 auto-resumes)."""
+    """Auto-resume jobs left in 'running'/'queued' when uvicorn restarts (max 2 auto-resumes),
+    skipping any job currently owned by a live external CLI render process (`batch_produce.py`).
+    """
+    ext_lock = _read_active_external_lock()
+    ext_job_id = str(ext_lock.get("job_id") or "") if ext_lock else ""
     for job in list_incomplete_jobs():
         job_id = str(job["id"])
+        if ext_lock is not None and (not ext_job_id or ext_job_id == job_id):
+            print(
+                f"[FrimeRise Recovery] Ignorando job '{job_id}' — em execução ativa por PID {ext_lock.get('pid')} ({ext_lock.get('source')}).",
+                flush=True,
+            )
+            continue
         try:
             opts = json.loads(job.get("options_json") or "{}")
             if not isinstance(opts, dict):
@@ -338,11 +472,12 @@ async def _recover_interrupted_jobs() -> None:
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    global _WORKER_TASK
     init_db()
     bootstrap_initial_credentials_if_missing()
     seed_twin_channels_and_queue()
     probe_quicksync()
-    asyncio.create_task(_job_worker())
+    _WORKER_TASK = asyncio.create_task(_job_worker())
     await _recover_interrupted_jobs()
     SCHEDULER.add_job(_check_due_schedules, "interval", seconds=45, id="autopilot_tick", replace_existing=True)
     SCHEDULER.start()
@@ -350,10 +485,19 @@ async def on_startup() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    global _WORKER_TASK
     try:
         SCHEDULER.shutdown(wait=False)
     except Exception:
         pass
+    if _WORKER_TASK is not None and not _WORKER_TASK.done():
+        _WORKER_TASK.cancel()
+        try:
+            await asyncio.wait_for(_WORKER_TASK, timeout=3.0)
+        except Exception:
+            pass
+    _terminate_child_render_processes()
+    _release_render_lock()
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +542,8 @@ DURATION_PRESETS: List[Dict[str, Any]] = [
     {"seconds": 180, "label": "3 min", "tag": "Mini-Doc / Storytelling"},
     {"seconds": 480, "label": "8 min", "tag": "YouTube Mid-Roll High-RPM"},
     {"seconds": 900, "label": "15 min", "tag": "Documentário Cinema Completo"},
+    {"seconds": 1020, "label": "17 min", "tag": "Documentário Cinema v3.0.0 (Ideal)"},
+    {"seconds": 1200, "label": "20 min", "tag": "Documentário Especial Estendido"},
 ]
 
 VISUAL_LIBRARIES_CATALOG: List[Dict[str, Any]] = [
@@ -449,6 +595,7 @@ CAPTION_STYLES_CATALOG: List[Dict[str, str]] = [
     {"id": "hormozi_neon", "label": "⚡ Hormozi Pílula Neon (CapCut Spring Bounce + Tilt)"},
     {"id": "karaoke_glow", "label": "🌈 Karaokê Glow (Wipe Gradiente Neon Palavra-a-Palavra)"},
     {"id": "word_slam", "label": "💥 Word Slam 3D (Impacto Metálico + Shake Viral)"},
+    {"id": "selective_emphasis", "label": "🎯 Selective Emphasis (Doc 16:9 Keyword Stamp • Courier Prime 64px)"},
     {"id": "cinema_minimal", "label": "🎬 Cinema Minimalista (Netflix Blur-Reveal Dourado)"},
     {"id": "typewriter_highlight", "label": "📰 Dossiê Highlighter (Typewriter + Marca-Texto Neon)"},
     {"id": "none", "label": "🚫 Sem Legendas"},
@@ -479,7 +626,7 @@ class ManufacturePayload(BaseModel):
     doc_lang: str = "pt_br"  # pt_br | en_us | es
     target_minutes: float = 0.5
     thumb_3words: Optional[str] = None
-    auto_shorts_cascade: bool = True
+    auto_shorts_cascade: bool = False
     topic: str = ""
     batch_topics: List[str] = []
     source_url: str = ""
@@ -495,12 +642,12 @@ class ManufacturePayload(BaseModel):
     voice_id: Optional[str] = None
     voice_rate: str = "+8%"
     voice_pitch: str = "+0Hz"
-    target_duration_s: Optional[int] = None  # e.g. 15..900 seconds
+    target_duration_s: Optional[int] = None  # e.g. 15..1200 seconds (up to 20 min)
     cut_cadence_s: float = 3.5  # seconds per scene cut
     fps: Optional[int] = None  # 30 or 60
     music_file: Optional[str] = None  # "auto" | "none" | filename in assets/music/ | "flow_vault"
     music_volume: float = 0.18
-    caption_style: str = "hormozi_neon"  # "hormozi_neon" | "karaoke_glow" | "word_slam" | "cinema_minimal" | "typewriter_highlight" | "none"
+    caption_style: str = "hormozi_neon"  # "hormozi_neon" | "karaoke_glow" | "word_slam" | "selective_emphasis" | "cinema_minimal" | "typewriter_highlight" | "none"
     language: str = "pt_br"  # "pt_br" | "en_us" | "es"
     visual_libraries: List[str] = []
     custom_directives: str = ""
@@ -510,11 +657,12 @@ class DocQueueManufacturePayload(BaseModel):
     episode_id: int
     target: str = "both"  # pt_br | en_us | both
     aspect_ratio: str = "16:9"
-    target_minutes: float = 0.5
-    auto_shorts_cascade: bool = True
+    target_minutes: float = 17.0
+    auto_shorts_cascade: bool = False
     flow_mode: str = "economico_pro"
     max_credits_cap: int = 45
     use_flow_music: bool = False
+    caption_style: Optional[str] = None
 
 
 class AnalyzeUrlPayload(BaseModel):
@@ -836,7 +984,9 @@ async def api_flow_login(payload: FlowLoginPayload, background_tasks: Background
 def _enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
     if not job:
         return job
-    qr_path = OUTPUTS_DIR / str(job.get("id", "")) / "quality_report.json"
+    job_id = str(job.get("id", ""))
+    job_dir = OUTPUTS_DIR / job_id
+    qr_path = job_dir / "quality_report.json"
     if qr_path.exists():
         try:
             job["quality_report"] = json.loads(qr_path.read_text(encoding="utf-8"))
@@ -844,6 +994,40 @@ def _enrich_job(job: Dict[str, Any]) -> Dict[str, Any]:
             job["quality_report"] = {}
     else:
         job["quality_report"] = {}
+
+    qc_path = job_dir / "qc_report.json"
+    if qc_path.exists():
+        try:
+            job["qc_report"] = json.loads(qc_path.read_text(encoding="utf-8"))
+        except Exception:
+            job["qc_report"] = {}
+    else:
+        job["qc_report"] = {}
+
+    gd_backup = (job["quality_report"] or {}).get("gdrive_backup") or {}
+    job["gdrive_backup"] = gd_backup
+    job["drive_url"] = str(gd_backup.get("drive_url") or "")
+
+    master_p = job_dir / "master.mp4"
+    # Never misrepresent a pruned preview_540p.mp4 as the 1080p master
+    if job.get("master_path") and str(job["master_path"]).endswith("preview_540p.mp4") and not master_p.exists():
+        job["master_path"] = ""
+
+    job["artifacts_available"] = {
+        "master": master_p.exists(),
+        "preview": (job_dir / "preview_540p.mp4").exists(),
+        "edl": (job_dir / "edl_timeline.json").exists(),
+        "script": (job_dir / "script.json").exists() or bool(job.get("script_json") and job.get("script_json") != "{}"),
+        "qc": qc_path.exists(),
+        "quality_report": qr_path.exists(),
+        "capcut": (job_dir / "capcut_project.zip").exists(),
+        "otio": (job_dir / "timeline.otio").exists(),
+        "cover": (job_dir / "cover_9x16.png").exists(),
+        "tiktok": bool(job.get("tiktok_path") and (BASE_DIR / str(job["tiktok_path"])).exists()),
+        "reels": bool(job.get("reels_path") and (BASE_DIR / str(job["reels_path"])).exists()),
+        "shorts": bool(job.get("shorts_path") and (BASE_DIR / str(job["shorts_path"])).exists()),
+        "hook_b": bool(job.get("hook_b_path") and (BASE_DIR / str(job["hook_b_path"])).exists()),
+    }
     return job
 
 
@@ -928,8 +1112,15 @@ async def api_manufacture_doc_queue(payload: DocQueueManufacturePayload):
     if target not in ("pt_br", "en_us", "both"):
         target = "both"
 
+    if payload.target_minutes >= 5.0:
+        check_disk_headroom(10.0)
+    else:
+        check_disk_headroom(3.0)
+
     langs_to_launch = ["pt_br", "en_us"] if target == "both" else [target]
     created_jobs: List[Dict[str, Any]] = []
+    eff_cap_style = payload.caption_style or ("selective_emphasis" if payload.aspect_ratio == "16:9" else "cinema_minimal")
+    clamped_minutes = max(0.35, min(20.0, float(payload.target_minutes or 17.0)))
 
     for lang_key in langs_to_launch:
         ch = queue_data["channels"][lang_key]
@@ -942,7 +1133,10 @@ async def api_manufacture_doc_queue(payload: DocQueueManufacturePayload):
             "preset_id": ch.get("preset_id", "magnates_doc"),
             "lut_file": ch.get("lut_file", "02_dark_wealth.cube"),
             "doc_lang": lang_key,
-            "target_minutes": payload.target_minutes,
+            "language": lang_key,
+            "target_minutes": clamped_minutes,
+            "target_duration_s": int(round(clamped_minutes * 60)),
+            "caption_style": eff_cap_style,
             "thumb_3words": thumb_hook,
             "auto_shorts_cascade": payload.auto_shorts_cascade,
             "flow_mode": payload.flow_mode,
@@ -1271,6 +1465,17 @@ async def api_save_dna_as_preset(payload: SaveDnaPresetPayload):
 
 @app.post("/api/factory/manufacture")
 async def api_manufacture(payload: ManufacturePayload):
+    clamped_dur_s = (
+        max(10, min(1200, int(payload.target_duration_s)))
+        if payload.target_duration_s is not None
+        else None
+    )
+    clamped_min = max(0.25, min(20.0, float(payload.target_minutes or 0.5)))
+    is_long_render = (payload.engine_style == "netflix_doc") and (
+        clamped_min >= 5.0 or (clamped_dur_s is not None and clamped_dur_s >= 300)
+    )
+    check_disk_headroom(10.0 if is_long_render else 3.0)
+
     created_jobs = []
     common_opts = {
         "preset_id": payload.preset_id,
@@ -1285,7 +1490,7 @@ async def api_manufacture(payload: ManufacturePayload):
         "max_credits_cap": payload.max_credits_cap,
         "use_flow_music": payload.use_flow_music,
         "doc_lang": payload.doc_lang,
-        "target_minutes": payload.target_minutes,
+        "target_minutes": clamped_min,
         "thumb_3words": payload.thumb_3words,
         "auto_shorts_cascade": payload.auto_shorts_cascade,
         "motion_cards": payload.motion_cards,
@@ -1298,7 +1503,7 @@ async def api_manufacture(payload: ManufacturePayload):
         "voice_id": payload.voice_id,
         "voice_rate": payload.voice_rate,
         "voice_pitch": payload.voice_pitch,
-        "target_duration_s": payload.target_duration_s,
+        "target_duration_s": clamped_dur_s,
         "cut_cadence_s": payload.cut_cadence_s,
         "fps": payload.fps,
         "music_file": payload.music_file,
@@ -1655,6 +1860,27 @@ async def api_download_artifact(job_id: str, artifact: str):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job não encontrado")
+    job_dir = OUTPUTS_DIR / job_id
+
+    # Direct v3 JSON deliverables (always preserved locally even after Google Drive prune!)
+    json_artifacts = {
+        "edl": (job_dir / "edl_timeline.json", f"FrimeRise_{job_id}_edl_timeline.json"),
+        "script": (job_dir / "script.json", f"FrimeRise_{job_id}_script.json"),
+        "qc": (job_dir / "qc_report.json", f"FrimeRise_{job_id}_qc_report.json"),
+        "quality_report": (job_dir / "quality_report.json", f"FrimeRise_{job_id}_quality_report.json"),
+    }
+    if artifact in json_artifacts:
+        fpath, dl_name = json_artifacts[artifact]
+        if fpath.exists():
+            return FileResponse(str(fpath), filename=dl_name, media_type="application/json")
+        if artifact == "script" and job.get("script_json") and job.get("script_json") != "{}":
+            return Response(
+                content=str(job["script_json"]),
+                media_type="application/json",
+                headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+            )
+        raise HTTPException(status_code=404, detail=f"Artefato '{artifact}' não disponível para este job")
+
     mapping = {
         "master": ("master_path", f"FrimeRise_{job_id}_MASTER.mp4"),
         "hook_a": ("hook_a_path", f"FrimeRise_{job_id}_HOOK_A.mp4"),
@@ -1671,6 +1897,18 @@ async def api_download_artifact(job_id: str, artifact: str):
         raise HTTPException(status_code=400, detail="Artefato inválido")
     col, dl_name = mapping[artifact]
     rel = job.get(col)
+    # NEVER serve preview_540p.mp4 masquerading as the 1080p MASTER
+    if artifact == "master":
+        real_master = job_dir / "master.mp4"
+        if real_master.exists():
+            return FileResponse(str(real_master), filename=dl_name)
+        enriched = _enrich_job(dict(job))
+        if enriched.get("drive_url") or (enriched.get("gdrive_backup") or {}).get("status") == "uploaded":
+            raise HTTPException(
+                status_code=404,
+                detail="Master 1080p foi arquivado e podado do SSD após upload ao Google Drive. Baixe pelo link do Google Drive na Central VIP ou use a Prévia 540p.",
+            )
+        raise HTTPException(status_code=404, detail="Master 1080p não encontrado no disco")
     if not rel:
         raise HTTPException(status_code=404, detail="Artefato ainda não disponível")
     full = BASE_DIR / rel
