@@ -3,7 +3,8 @@
 Connects the user's Google AI Pro subscription (`https://flow.google` & `https://flowmusic.app`)
 via a persistent authenticated browser profile in C++ `AsyncCamoufox`:
 - Persistent Profile: `data/profiles/google_flow_pro/`
-- Strictly 1 browser instance at a time on the Acer Aspire 5 Core i5 via module-level `FLOW_LOCK = asyncio.Lock()`
+- Strictly 1 browser instance at a time on the Acer Aspire 5 Core i5 via thread-safe `FLOW_LOCK = threading.Lock()`
+  plus an OS-level `fcntl.flock` on `data/profiles/google_flow_pro/.camoufox.lock`
 - Interactive Login & Session Warmer: `open_google_flow_login_session(target="flow", warm_seconds=180)`
 - Real-Time & Offline-Safe Telemetry: `get_google_flow_credits_status()` (defaults cleanly to cached/tracked
   balance out of 10,000 Pro credits so the Topbar always displays real telemetry without crashing)
@@ -22,6 +23,7 @@ via a persistent authenticated browser profile in C++ `AsyncCamoufox`:
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import hashlib
 import json
 import math
@@ -29,10 +31,16 @@ import os
 import re
 import shutil
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 import httpx
 import skia
@@ -63,8 +71,98 @@ FLOW_PROFILE_DIR = PROFILES_DIR / "google_flow_pro"
 FLOW_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 FLOW_STATE_PATH = FLOW_PROFILE_DIR / "flow_state.json"
 
-# Module-level lock ensuring strictly ONE Camoufox browser instance runs at a time on the Core i5
-FLOW_LOCK = asyncio.Lock()
+# Thread-safe module-level lock + OS-level flock ensuring strictly ONE Camoufox browser instance
+# runs at a time across event loops, threads, and processes on the Core i5.
+FLOW_LOCK = threading.Lock()
+FLOW_OS_LOCK_PATH = FLOW_PROFILE_DIR / ".camoufox.lock"
+
+
+@asynccontextmanager
+async def _acquire_flow_lock() -> AsyncIterator[None]:
+    """Acquire thread-safe `FLOW_LOCK` (safe across event loops) plus OS-level `fcntl.flock`
+    on `FLOW_PROFILE_DIR / '.camoufox.lock'` so concurrent login + render never collide or corrupt
+    the persistent Camoufox Firefox profile.
+    """
+    cancel_ev = threading.Event()
+    state_lock = threading.Lock()
+    state: Dict[str, Any] = {
+        "acquired": False,
+        "cancelled": False,
+        "flocked": False,
+        "fd": None,
+    }
+
+    def _acquire_thread_lock() -> bool:
+        while not cancel_ev.is_set():
+            if FLOW_LOCK.acquire(timeout=0.2):
+                with state_lock:
+                    if state["cancelled"]:
+                        FLOW_LOCK.release()
+                        return False
+                    state["acquired"] = True
+                    return True
+        return False
+
+    def _acquire_os_flock() -> bool:
+        if fcntl is None:
+            return True
+        FLOW_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(FLOW_OS_LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            while not cancel_ev.is_set():
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with state_lock:
+                        if state["cancelled"]:
+                            try:
+                                fcntl.flock(fd, fcntl.LOCK_UN)
+                            finally:
+                                os.close(fd)
+                            return False
+                        state["fd"] = fd
+                        state["flocked"] = True
+                        return True
+                except BlockingIOError:
+                    cancel_ev.wait(0.2)
+            os.close(fd)
+            return False
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            raise
+
+    try:
+        ok_thread = await asyncio.to_thread(_acquire_thread_lock)
+        if not ok_thread:
+            raise asyncio.CancelledError()
+        ok_os = await asyncio.to_thread(_acquire_os_flock)
+        if not ok_os:
+            raise asyncio.CancelledError()
+        yield
+    finally:
+        cancel_ev.set()
+        with state_lock:
+            state["cancelled"] = True
+            should_unflock = bool(state["flocked"])
+            lock_fd = state["fd"]
+            state["flocked"] = False
+            state["fd"] = None
+            should_release = bool(state["acquired"])
+            state["acquired"] = False
+        if lock_fd is not None:
+            if should_unflock and fcntl is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except Exception:
+                    pass
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
+        if should_release:
+            FLOW_LOCK.release()
 
 FLOW_GOOGLE_URL = "https://flow.google"
 FLOW_LABS_URL = "https://labs.google/fx/tools/flow"
@@ -363,7 +461,7 @@ async def open_google_flow_login_session(
         primary_url = FLOW_GOOGLE_URL
         secondary_url = FLOW_MUSIC_URL
 
-    async with FLOW_LOCK:
+    async with _acquire_flow_lock():
         state = _load_flow_state()
         state["last_target"] = clean_target
         has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -959,8 +1057,120 @@ def generate_flow_scene_image_sync(
     return Path(res["image_path"])
 
 
-def _validate_real_photo_image(img_path: Path, min_w: int = 384, min_h: int = 320) -> bool:
-    """Ensure a generated image is a genuine non-blank photograph/artwork (never an error page)."""
+FLOW_PROJECT_ROTATE_INTERVAL = 18
+
+_WIDE_916_PHRASES_RE = re.compile(
+    r"\b(?:ultra[- ]?wide|wide\s+establishing(?:\s+shot)?|wide[- ]?angle|widescreen|"
+    r"wide\s+panoramic|panoramic\s+wide|wide\s+shot|wide)\b[,:\s-]*",
+    re.IGNORECASE,
+)
+
+_FLOW_MATCH_BOILERPLATE_WORDS: Set[str] = {
+    "dark", "gothic", "cinema", "still", "eerie", "chiaroscuro", "candlelight",
+    "shadows", "grain", "photorealistic", "watermark", "gritty", "documentary",
+    "photograph", "tungsten", "night", "lighting", "cinematic", "museum", "grade",
+    "historical", "dramatic", "rembrandt", "photography", "sleek", "moody",
+    "prestige", "glass", "reflections", "anamorphic", "photo", "image", "scene",
+    "frame", "style", "there", "their", "where", "which", "about", "under",
+    "above", "through", "between", "before", "after", "around", "without",
+    "within", "while", "during", "being", "having", "could", "would", "should",
+}
+
+
+def _strip_wide_phrases_for_vertical(prompt_text: str, aspect_ratio: Optional[str]) -> str:
+    """Strip landscape/wide framing phrases when generating vertical 9:16 images."""
+    clean = re.sub(r"\s+", " ", (prompt_text or "").strip())
+    if not clean:
+        return ""
+    if str(aspect_ratio or "").strip() == "9:16":
+        clean = _WIDE_916_PHRASES_RE.sub("", clean)
+        clean = re.sub(r"\s+", " ", clean).strip(" ,;:-")
+    return clean
+
+
+def _extract_distinctive_prompt_tokens(text: str) -> Set[str]:
+    """Extract distinctive >=5-char tokens from a prompt (excluding boilerplate mood suffixes)."""
+    low = re.sub(r"\s+", " ", (text or "").lower())
+    return {
+        tok
+        for tok in re.findall(r"[a-z0-9]{5,}", low)
+        if tok not in _FLOW_MATCH_BOILERPLATE_WORDS
+    }
+
+
+def _match_flow_card_to_pending(
+    ctx_text: str,
+    pending_by_key: Dict[str, Dict[str, Any]],
+    allow_single_fallback: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Strictly match a rendered Google Flow DOM card back to its true pending prompt item.
+
+    - Matches by normalized 30-char prompt prefix OR >=3 distinctive >=5-char prompt words
+      present in the card's DOM ancestor text.
+    - NEVER falls back blindly to `unmatched[0]` when more than 1 prompt is in flight globally!
+    - Only falls back to the sole pending item when `len(pending_by_key) == 1` and
+      `allow_single_fallback=True` (i.e. single-prompt session with no sibling cards in DOM).
+    """
+    if not pending_by_key:
+        return None
+
+    ctx_low = re.sub(r"\s+", " ", (ctx_text or "").lower()).strip()
+    if not ctx_low:
+        if len(pending_by_key) == 1 and allow_single_fallback:
+            return next(iter(pending_by_key.values()))
+        return None
+    ctx_tokens = set(re.findall(r"[a-z0-9]{5,}", ctx_low))
+
+    scored: List[Tuple[Tuple[int, int, int, float], str, Dict[str, Any]]] = []
+    for key, cand_it in pending_by_key.items():
+        norm_styled = re.sub(r"\s+", " ", str(cand_it.get("styled_prompt") or "").lower()).strip()
+        norm_raw = re.sub(r"\s+", " ", str(cand_it.get("raw_prompt") or "").lower()).strip()
+
+        prefix_30 = norm_styled[:30]
+        raw_prefix_30 = norm_raw[:30] if len(norm_raw) >= 20 else ""
+        prefix_hit = bool(
+            (len(prefix_30) >= 20 and prefix_30 in ctx_low)
+            or (raw_prefix_30 and raw_prefix_30 in ctx_low)
+            or (12 <= len(norm_styled) < 30 and norm_styled in ctx_low)
+        )
+        prefix_60 = norm_styled[:60]
+        prefix60_hit = bool(len(prefix_60) >= 40 and prefix_60 in ctx_low)
+
+        cand_tokens = _extract_distinctive_prompt_tokens(norm_raw) if norm_raw else set()
+        if len(cand_tokens) < 3:
+            cand_tokens = _extract_distinctive_prompt_tokens(norm_styled)
+        token_hits = len(cand_tokens & ctx_tokens)
+        token_ratio = token_hits / float(max(1, len(cand_tokens)))
+
+        if prefix_hit or token_hits >= 3:
+            score = (1 if prefix60_hit else 0, 1 if prefix_hit else 0, token_hits, token_ratio)
+            scored.append((score, key, cand_it))
+
+    if not scored:
+        if len(pending_by_key) == 1 and allow_single_fallback:
+            return next(iter(pending_by_key.values()))
+        return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if len(scored) == 1 or scored[0][0] > scored[1][0]:
+        return scored[0][2]
+
+    # Exact score tie between 2+ in-flight prompts: resolve only if exact full styled_prompt matches uniquely
+    exact_hits = [
+        it for _, _, it in scored
+        if re.sub(r"\s+", " ", str(it.get("styled_prompt") or "").lower()).strip() in ctx_low
+    ]
+    if len(exact_hits) == 1:
+        return exact_hits[0]
+    return None
+
+
+def _validate_real_photo_image(
+    img_path: Path,
+    min_w: int = 384,
+    min_h: int = 320,
+    aspect_ratio: Optional[str] = None,
+) -> bool:
+    """Ensure a generated image is a genuine non-blank photograph/artwork matching expected orientation."""
     try:
         if not img_path.exists() or img_path.stat().st_size < 18_000:
             return False
@@ -973,6 +1183,11 @@ def _validate_real_photo_image(img_path: Path, min_w: int = 384, min_h: int = 32
         h, w = bgr.shape[:2]
         if w < min_w or h < min_h:
             return False
+        ar = str(aspect_ratio or "").strip()
+        if ar == "9:16" and h < w * 1.25:
+            return False
+        if ar == "16:9" and w < h * 1.25:
+            return False
         if float(np.std(bgr)) < 14.0:
             return False
         return True
@@ -980,8 +1195,12 @@ def _validate_real_photo_image(img_path: Path, min_w: int = 384, min_h: int = 32
         return False
 
 
-def _style_flow_cinema_prompt(prompt_en: str, mood: str = "dark_horror") -> str:
-    clean_p = re.sub(r"\s+", " ", (prompt_en or "").strip())
+def _style_flow_cinema_prompt(
+    prompt_en: str,
+    mood: str = "dark_horror",
+    aspect_ratio: str = "9:16",
+) -> str:
+    clean_p = _strip_wide_phrases_for_vertical(prompt_en, aspect_ratio)
     if not clean_p:
         return ""
     mood_style = {
@@ -991,8 +1210,11 @@ def _style_flow_cinema_prompt(prompt_en: str, mood: str = "dark_horror") -> str:
         "corporate_thriller": "sleek moody prestige cinema photograph, dark glass reflections, 35mm anamorphic lens, no text, no watermark",
     }.get(mood, "cinematic 35mm documentary photograph, dramatic lighting, no text, no watermark")
     if "no text" in clean_p.lower():
-        return clean_p[:420]
-    return f"{clean_p}, {mood_style}"[:420]
+        styled = clean_p
+    else:
+        styled = f"{clean_p}, {mood_style}"
+    styled = _strip_wide_phrases_for_vertical(styled, aspect_ratio)
+    return styled[:420]
 
 
 def _is_flow_generated_img_url(src: str) -> bool:
@@ -1006,6 +1228,94 @@ def _is_flow_generated_img_url(src: str) -> bool:
     )
 
 
+async def _configure_flow_composer_settings(page: Any, ar_target: str) -> bool:
+    """Configure Nano Banana 2.1: Image mode + target aspect ratio (9:16 or 16:9) + x1,
+    verifying `aria-checked="true"` after clicking each option (retrying if needed).
+    """
+    all_verified = True
+    try:
+        cfg_btn = page.locator(
+            'button[aria-label="Gatilho de configurações"], button[aria-label*="Settings"], button:has-text("Nano Banana")'
+        ).first
+        if await cfg_btn.count() == 0:
+            return False
+        await cfg_btn.click(timeout=5_000)
+        await asyncio.sleep(0.9)
+        radio_targets = (
+            ("image_mode", '[role="radio"]:has-text("Imagem"), [role="radio"]:has-text("Image")'),
+            (f"aspect_{ar_target}", f'[role="radio"]:has-text("{ar_target}")'),
+            ("count_x1", '[role="radio"]:has-text("x1")'),
+        )
+        for label, sel in radio_targets:
+            loc = page.locator(sel).first
+            verified = False
+            for attempt in range(3):
+                try:
+                    if await loc.count() == 0 or not await loc.is_visible():
+                        if attempt == 0:
+                            await asyncio.sleep(0.3)
+                            continue
+                        break
+                    checked = (await loc.get_attribute("aria-checked") or "").strip().lower()
+                    if checked == "true":
+                        verified = True
+                        break
+                    await loc.click(timeout=2_500, force=(attempt > 0))
+                    await asyncio.sleep(0.35)
+                    checked_after = (await loc.get_attribute("aria-checked") or "").strip().lower()
+                    if checked_after == "true":
+                        verified = True
+                        break
+                except Exception:
+                    await asyncio.sleep(0.25)
+            if not verified:
+                all_verified = False
+                print(
+                    f"[GoogleFlow] Settings verification warning: '{label}' did not confirm aria-checked='true'",
+                    flush=True,
+                )
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
+    except Exception as cfg_exc:
+        all_verified = False
+        print(f"[GoogleFlow] Composer settings warning: {cfg_exc}", flush=True)
+    return all_verified
+
+
+async def _open_fresh_flow_project(page: Any, ar_target: str) -> Tuple[bool, Set[str]]:
+    """Navigate to `https://flow.google.com/`, open a clean 'Novo projeto', configure Nano Banana 2.1,
+    and return `(ok, initial_seen_srcs)`.
+    """
+    await page.goto("https://flow.google.com/", wait_until="domcontentloaded", timeout=24_000)
+    await asyncio.sleep(3.0)
+    url_now = (page.url or "").lower()
+    if "accounts.google.com" in url_now or "signin" in url_now:
+        print("[GoogleFlow] Session expired — please reconnect Google Flow Pro profile.", flush=True)
+        return False, set()
+
+    new_btn = page.locator(
+        'button:has-text("Novo projeto"), button:has-text("New project")'
+    ).first
+    if await new_btn.count() == 0:
+        return False, set()
+    await new_btn.click(timeout=8_000)
+    try:
+        await page.wait_for_url("**/project/**", timeout=16_000)
+    except Exception:
+        return False, set()
+    await asyncio.sleep(2.8)
+
+    await _configure_flow_composer_settings(page, ar_target)
+
+    seen_srcs: Set[str] = set(
+        await page.eval_on_selector_all(
+            "img",
+            "els => els.map(e => e.currentSrc || e.src || '').filter(Boolean)",
+        )
+    )
+    return True, seen_srcs
+
+
 async def _run_google_flow_camoufox_batch_async(
     pending_items: List[Dict[str, Any]],
     aspect_ratio: str = "9:16",
@@ -1013,8 +1323,9 @@ async def _run_google_flow_camoufox_batch_async(
     wave_size: int = 3,
 ) -> Dict[str, Path]:
     """Generate multiple bespoke Nano Banana 2.1 images in ONE single logged-in Google Flow Pro session.
-    Submits prompts in pipelined waves of `wave_size` (Google Flow renders them concurrently server-side!)
-    and matches each finished `https://flow.google.com/asb/...` image back to its exact prompt card.
+    Submits prompts in pipelined waves of `wave_size`, tracks `pending_by_key` globally across waves
+    (preventing cross-contamination from late cards), enforces strict aspect-ratio validation, and
+    rotates to a fresh 'Novo projeto' every 18 prompts to avoid Firefox DOM bloat on large batches.
     """
     results: Dict[str, Path] = {}
     if not pending_items or not _has_profile_cookies():
@@ -1026,8 +1337,24 @@ async def _run_google_flow_camoufox_batch_async(
         return results
 
     ar_target = "9:16" if str(aspect_ratio or "9:16").strip() == "9:16" else "16:9"
+    eff_wave = max(1, min(4, int(wave_size)))
+    total_items = len(pending_items)
+    done_count = 0
 
-    async with FLOW_LOCK:
+    # Normalize & sanitize prompts defensively (strips "Wide " phrases in 9:16)
+    sanitized_items: List[Dict[str, Any]] = []
+    for raw_it in pending_items:
+        it_copy = dict(raw_it)
+        it_copy["styled_prompt"] = _strip_wide_phrases_for_vertical(
+            str(it_copy.get("styled_prompt") or ""), ar_target
+        )[:420]
+        if it_copy.get("raw_prompt"):
+            it_copy["raw_prompt"] = _strip_wide_phrases_for_vertical(
+                str(it_copy.get("raw_prompt") or ""), ar_target
+            )
+        sanitized_items.append(it_copy)
+
+    async with _acquire_flow_lock():
         try:
             async with AsyncCamoufox(
                 headless=True,
@@ -1035,167 +1362,173 @@ async def _run_google_flow_camoufox_batch_async(
                 user_data_dir=str(FLOW_PROFILE_DIR),
             ) as browser:
                 page = browser.pages[0] if browser.pages else await browser.new_page()
-                await page.goto("https://flow.google.com/", wait_until="domcontentloaded", timeout=24_000)
-                await asyncio.sleep(3.0)
-                url_now = (page.url or "").lower()
-                if "accounts.google.com" in url_now or "signin" in url_now:
-                    print("[GoogleFlow] Session expired — please reconnect Google Flow Pro profile.", flush=True)
-                    return results
 
-                # Click "Novo projeto" / "New project" to open a clean Nano Banana 2.1 project workspace
-                new_btn = page.locator(
-                    'button:has-text("Novo projeto"), button:has-text("New project")'
-                ).first
-                if await new_btn.count() == 0:
-                    return results
-                await new_btn.click(timeout=8_000)
-                try:
-                    await page.wait_for_url("**/project/**", timeout=16_000)
-                except Exception:
-                    return results
-                await asyncio.sleep(2.8)
-
-                # Configure Nano Banana 2.1: Image mode + target aspect ratio (9:16 or 16:9) + Médio/Alto + x1
-                try:
-                    cfg_btn = page.locator(
-                        'button[aria-label="Gatilho de configurações"], button[aria-label*="Settings"], button:has-text("Nano Banana")'
-                    ).first
-                    if await cfg_btn.count() > 0:
-                        await cfg_btn.click(timeout=5_000)
-                        await asyncio.sleep(0.9)
-                        for sel in (
-                            '[role="radio"]:has-text("Imagem"), [role="radio"]:has-text("Image")',
-                            f'[role="radio"]:has-text("{ar_target}")',
-                            '[role="radio"]:has-text("x1")',
-                        ):
-                            loc = page.locator(sel).first
-                            try:
-                                if await loc.count() > 0 and await loc.is_visible():
-                                    await loc.click(timeout=2_500)
-                                    await asyncio.sleep(0.3)
-                            except Exception:
-                                pass
-                        await page.keyboard.press("Escape")
-                        await asyncio.sleep(0.5)
-                except Exception as cfg_exc:
-                    print(f"[GoogleFlow] Composer settings warning: {cfg_exc}", flush=True)
-
-                seen_srcs: set[str] = set(
-                    await page.eval_on_selector_all(
+                async def _poll_and_collect(
+                    seen_srcs: Set[str],
+                    pending_by_key: Dict[str, Dict[str, Any]],
+                    wave_keys: Set[str],
+                    allow_single_fallback: bool,
+                ) -> None:
+                    nonlocal done_count
+                    cards = await page.eval_on_selector_all(
                         "img",
-                        "els => els.map(e => e.currentSrc || e.src || '').filter(Boolean)",
-                    )
-                )
-
-                tb = page.locator('[role="textbox"]').first
-                gen_btn = page.locator(
-                    'button[aria-label*="Iniciar gera"], button[aria-label*="Generate"], button:has-text("arrow_forward")'
-                ).first
-
-                eff_wave = max(1, min(4, int(wave_size)))
-                total_items = len(pending_items)
-                done_count = 0
-
-                for w_start in range(0, total_items, eff_wave):
-                    wave = pending_items[w_start : w_start + eff_wave]
-                    submitted: List[Dict[str, Any]] = []
-                    for item in wave:
-                        prompt_txt = str(item["styled_prompt"])[:420]
-                        try:
-                            await tb.click(timeout=5_000)
-                            await page.keyboard.press("Control+A")
-                            await page.keyboard.press("Backspace")
-                            await asyncio.sleep(0.15)
-                            await page.keyboard.type(prompt_txt, delay=1)
-                            await asyncio.sleep(0.35)
-                            if not await gen_btn.is_disabled():
-                                await gen_btn.click(timeout=5_000)
-                                submitted.append(item)
-                                await asyncio.sleep(1.8)
-                        except Exception as sub_exc:
-                            print(f"[GoogleFlow] Submit error ({item['key']}): {sub_exc}", flush=True)
-
-                    if not submitted:
-                        continue
-
-                    unmatched = list(submitted)
-                    deadline = asyncio.get_running_loop().time() + max(per_image_timeout_s, 45.0 + 10.0 * len(submitted))
-
-                    while unmatched and asyncio.get_running_loop().time() < deadline:
-                        await asyncio.sleep(1.4)
-                        cards = await page.eval_on_selector_all(
-                            "img",
-                            """els => els
-                                .filter(e => e.complete && Math.max(e.naturalWidth, e.naturalHeight) >= 400 && Math.min(e.naturalWidth, e.naturalHeight) >= 220)
-                                .map(e => {
-                                    let node = e;
-                                    let ctx = '';
-                                    for (let i = 0; i < 8 && node; i++) {
-                                        const txt = (node.innerText || '').trim();
-                                        if (txt.length >= 25 && txt.length <= 900) { ctx = txt; break; }
-                                        node = node.parentElement;
+                        """els => els
+                            .filter(e => e.complete && Math.max(e.naturalWidth, e.naturalHeight) >= 400 && Math.min(e.naturalWidth, e.naturalHeight) >= 220)
+                            .map(e => {
+                                const parts = [];
+                                const alt = (e.getAttribute('alt') || e.getAttribute('aria-label') || e.getAttribute('title') || '').trim();
+                                if (alt) parts.push(alt);
+                                let node = e.parentElement;
+                                for (let i = 0; i < 12 && node; i++) {
+                                    const aria = (node.getAttribute && (node.getAttribute('aria-label') || node.getAttribute('title'))) || '';
+                                    if (aria && aria.length >= 20 && aria.length <= 1200) parts.push(aria);
+                                    const txt = (node.innerText || '').trim();
+                                    if (txt.length >= 25 && txt.length <= 1200) {
+                                        parts.push(txt);
+                                        break;
                                     }
-                                    return {
-                                        src: e.currentSrc || e.src || '',
-                                        w: e.naturalWidth,
-                                        h: e.naturalHeight,
-                                        ctx: ctx
-                                    };
-                                })""",
+                                    node = node.parentElement;
+                                }
+                                return {
+                                    src: e.currentSrc || e.src || '',
+                                    w: e.naturalWidth,
+                                    h: e.naturalHeight,
+                                    ctx: parts.join(' ')
+                                };
+                            })""",
+                    )
+                    new_cards = [
+                        c for c in cards
+                        if c.get("src") and c["src"] not in seen_srcs and _is_flow_generated_img_url(str(c["src"]))
+                    ]
+                    for card in new_cards:
+                        if not pending_by_key:
+                            break
+                        src = str(card["src"])
+                        hi_src = re.sub(r"=[swh]\d+[^/]*$", "=s0", src)
+                        matched_item = _match_flow_card_to_pending(
+                            str(card.get("ctx") or ""),
+                            pending_by_key,
+                            allow_single_fallback=allow_single_fallback,
                         )
-                        new_cards = [
-                            c for c in cards
-                            if c.get("src") and c["src"] not in seen_srcs and _is_flow_generated_img_url(str(c["src"]))
-                        ]
-                        for card in new_cards:
-                            src = str(card["src"])
-                            hi_src = re.sub(r"=s\d+[^/]*$", "=s0", src)
-                            ctx_low = re.sub(r"\s+", " ", str(card.get("ctx") or "").lower())
-                            # Match to exact prompt by checking first 36 chars of prompt inside card text
-                            matched_item = None
-                            for cand_it in unmatched:
-                                p_sig = re.sub(r"\s+", " ", str(cand_it["styled_prompt"]).lower())[:36]
-                                if p_sig and p_sig in ctx_low:
-                                    matched_item = cand_it
-                                    break
-                            if matched_item is None and unmatched:
-                                matched_item = unmatched[0]
-                            if matched_item is None:
-                                continue
+                        if matched_item is None:
+                            continue
 
-                            seen_srcs.add(src)
-                            vault_jpg = Path(matched_item["vault_jpg"])
-                            try:
-                                resp = await page.request.get(hi_src, timeout=18_000)
-                                if not resp.ok:
-                                    resp = await page.request.get(src, timeout=18_000)
-                                if resp.ok:
-                                    import cv2 as _cv2
-                                    import numpy as _np
+                        matched_key = str(matched_item["key"])
+                        seen_srcs.add(src)
+                        vault_jpg = Path(matched_item["vault_jpg"])
+                        try:
+                            resp = await page.request.get(hi_src, timeout=18_000)
+                            if not resp.ok:
+                                resp = await page.request.get(src, timeout=18_000)
+                            if resp.ok:
+                                import cv2 as _cv2
+                                import numpy as _np
 
-                                    raw_b = await resp.body()
-                                    bgr_im = _cv2.imdecode(_np.frombuffer(raw_b, _np.uint8), _cv2.IMREAD_COLOR)
-                                    if bgr_im is not None and bgr_im.size > 0:
-                                        vault_jpg.parent.mkdir(parents=True, exist_ok=True)
-                                        _cv2.imwrite(str(vault_jpg), bgr_im, [int(_cv2.IMWRITE_JPEG_QUALITY), 93])
-                                        if _validate_real_photo_image(vault_jpg):
-                                            results[str(matched_item["key"])] = vault_jpg
-                                            unmatched.remove(matched_item)
-                                            done_count += 1
-                                            print(
-                                                f"[GoogleFlow] Nano Banana 2.1 ({done_count}/{total_items}) ready [{ar_target} {bgr_im.shape[1]}x{bgr_im.shape[0]}]: {vault_jpg.name}",
-                                                flush=True,
-                                            )
-                                        else:
-                                            vault_jpg.unlink(missing_ok=True)
-                            except Exception:
-                                continue
+                                raw_b = await resp.body()
+                                bgr_im = _cv2.imdecode(_np.frombuffer(raw_b, _np.uint8), _cv2.IMREAD_COLOR)
+                                if bgr_im is not None and bgr_im.size > 0:
+                                    vault_jpg.parent.mkdir(parents=True, exist_ok=True)
+                                    _cv2.imwrite(str(vault_jpg), bgr_im, [int(_cv2.IMWRITE_JPEG_QUALITY), 93])
+                                    if _validate_real_photo_image(vault_jpg, aspect_ratio=ar_target):
+                                        results[matched_key] = vault_jpg
+                                        pending_by_key.pop(matched_key, None)
+                                        wave_keys.discard(matched_key)
+                                        done_count += 1
+                                        print(
+                                            f"[GoogleFlow] Nano Banana 2.1 ({done_count}/{total_items}) ready [{ar_target} {bgr_im.shape[1]}x{bgr_im.shape[0]}]: {vault_jpg.name}",
+                                            flush=True,
+                                        )
+                                    else:
+                                        print(
+                                            f"[GoogleFlow] Rejected card failing orientation/quality ({bgr_im.shape[1]}x{bgr_im.shape[0]} vs {ar_target}): {matched_key}",
+                                            flush=True,
+                                        )
+                                        vault_jpg.unlink(missing_ok=True)
+                                        pending_by_key.pop(matched_key, None)
+                                        wave_keys.discard(matched_key)
+                        except Exception:
+                            continue
 
-                    if unmatched:
+                # Chunk large batches (>18 prompts) into fresh "Novo projeto" tabs to avoid Firefox DOM bloat
+                for proj_start in range(0, total_items, FLOW_PROJECT_ROTATE_INTERVAL):
+                    project_chunk = sanitized_items[proj_start : proj_start + FLOW_PROJECT_ROTATE_INTERVAL]
+                    if proj_start > 0:
                         print(
-                            f"[GoogleFlow] Wave partial timeout ({len(unmatched)} remaining: {[u['key'] for u in unmatched]})",
+                            f"[GoogleFlow] Rotating to fresh 'Novo projeto' at prompt {proj_start + 1}/{total_items} to prevent DOM bloat",
                             flush=True,
                         )
+                    ok_proj, seen_srcs = await _open_fresh_flow_project(page, ar_target)
+                    if not ok_proj:
+                        break
+
+                    tb = page.locator('[role="textbox"]').first
+                    gen_btn = page.locator(
+                        'button[aria-label*="Iniciar gera"], button[aria-label*="Generate"], button:has-text("arrow_forward")'
+                    ).first
+
+                    # Global pending map across all waves within this project session so late Wave K cards
+                    # always resolve to their true key instead of polluting Wave K+1!
+                    pending_by_key: Dict[str, Dict[str, Any]] = {}
+                    submitted_in_project = 0
+
+                    for w_start in range(0, len(project_chunk), eff_wave):
+                        wave = project_chunk[w_start : w_start + eff_wave]
+                        submitted: List[Dict[str, Any]] = []
+                        for item in wave:
+                            prompt_txt = str(item["styled_prompt"])[:420]
+                            try:
+                                await tb.click(timeout=5_000)
+                                await page.keyboard.press("Control+A")
+                                await page.keyboard.press("Backspace")
+                                await asyncio.sleep(0.15)
+                                await page.keyboard.type(prompt_txt, delay=1)
+                                await asyncio.sleep(0.35)
+                                if not await gen_btn.is_disabled():
+                                    await gen_btn.click(timeout=5_000)
+                                    submitted.append(item)
+                                    pending_by_key[str(item["key"])] = item
+                                    submitted_in_project += 1
+                                    await asyncio.sleep(1.8)
+                            except Exception as sub_exc:
+                                print(f"[GoogleFlow] Submit error ({item['key']}): {sub_exc}", flush=True)
+
+                        if not submitted:
+                            continue
+
+                        wave_keys: Set[str] = {str(it["key"]) for it in submitted}
+                        deadline = asyncio.get_running_loop().time() + max(
+                            per_image_timeout_s,
+                            75.0 + 18.0 * len(submitted),
+                        )
+
+                        while wave_keys and asyncio.get_running_loop().time() < deadline:
+                            await asyncio.sleep(1.4)
+                            await _poll_and_collect(
+                                seen_srcs,
+                                pending_by_key,
+                                wave_keys,
+                                allow_single_fallback=(submitted_in_project <= 1),
+                            )
+
+                        if wave_keys:
+                            print(
+                                f"[GoogleFlow] Wave partial timeout ({len(wave_keys)} still pending globally: {sorted(wave_keys)})",
+                                flush=True,
+                            )
+
+                    # Brief grace window before rotating/closing so any late cards still land under their true key
+                    if pending_by_key:
+                        grace_deadline = asyncio.get_running_loop().time() + 15.0
+                        grace_keys: Set[str] = set(pending_by_key.keys())
+                        while pending_by_key and asyncio.get_running_loop().time() < grace_deadline:
+                            await asyncio.sleep(1.4)
+                            await _poll_and_collect(
+                                seen_srcs,
+                                pending_by_key,
+                                grace_keys,
+                                allow_single_fallback=(submitted_in_project <= 1),
+                            )
         except Exception as exc:
             print(f"[GoogleFlow] Batch session error: {exc}", flush=True)
     return results
@@ -1219,7 +1552,8 @@ def generate_flow_batch_images_sync(
     for it in items:
         key = str(it["key"])
         out_path = Path(it["out_path"])
-        styled = _style_flow_cinema_prompt(str(it.get("prompt_en") or ""), mood=mood)
+        raw_clean = _strip_wide_phrases_for_vertical(str(it.get("prompt_en") or ""), aspect_ratio)
+        styled = _style_flow_cinema_prompt(raw_clean, mood=mood, aspect_ratio=aspect_ratio)
         if not styled:
             continue
         hit = vault.lookup_asset(
@@ -1230,16 +1564,21 @@ def generate_flow_batch_images_sync(
         )
         if hit and Path(hit["abs_path"]).exists() and str(hit.get("provider_source") or "") != "nano_banana_2_skia_studio":
             src = Path(hit["abs_path"])
-            if _validate_real_photo_image(src):
+            if _validate_real_photo_image(src, aspect_ratio=aspect_ratio):
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 if src.resolve() != out_path.resolve():
                     shutil.copy2(src, out_path)
                 ready[key] = out_path
                 continue
+            print(
+                f"[GoogleFlow] Ignoring poisoned/misoriented FlowVault cache hit ({aspect_ratio}): {src.name}",
+                flush=True,
+            )
         img_hash = compute_vault_hash(styled, kind="images", aspect_ratio=aspect_ratio)
         vault_jpg = vault.images_dir / f"flow_nb2_{img_hash}.jpg"
         pending.append({
             "key": key,
+            "raw_prompt": raw_clean,
             "styled_prompt": styled,
             "vault_jpg": vault_jpg,
             "out_path": out_path,
@@ -1248,7 +1587,7 @@ def generate_flow_batch_images_sync(
     if not pending or not _has_profile_cookies():
         return ready
 
-    total_timeout = max(120.0, len(pending) * 32.0 + 60.0)
+    total_timeout = max(180.0, len(pending) * 45.0 + 90.0)
     try:
         asyncio.get_running_loop()
         # Running inside an active loop — execute on a clean worker thread
@@ -1278,7 +1617,7 @@ def generate_flow_batch_images_sync(
     for it in pending:
         key = str(it["key"])
         vpath = gen_map.get(key)
-        if vpath is not None and vpath.exists():
+        if vpath is not None and vpath.exists() and _validate_real_photo_image(vpath, aspect_ratio=aspect_ratio):
             vault.store_asset(
                 kind="image",
                 prompt_or_mood=str(it["styled_prompt"]),
@@ -1305,34 +1644,56 @@ def _try_google_flow_camoufox_image_sync(
     out_path: Path,
     timeout_s: float = 38.0,
     aspect_ratio: str = "9:16",
+    skip_browser: bool = False,
 ) -> bool:
-    """Single-image wrapper over the authenticated Google Flow Pro Nano Banana 2.1 generator."""
+    """Single-image wrapper over the authenticated Google Flow Pro Nano Banana 2.1 generator.
+    Thread-pool safe when invoked inside an active asyncio event loop; supports `skip_browser=True`
+    (or `FRIMERISE_SKIP_FLOW_SINGLE_BROWSER=1`) to avoid redundant browser launches after batch runs.
+    """
+    if skip_browser or os.environ.get("FRIMERISE_SKIP_FLOW_SINGLE_BROWSER") == "1":
+        return False
     if not _has_profile_cookies():
+        return False
+    clean_prompt = _strip_wide_phrases_for_vertical(prompt, aspect_ratio)[:420]
+    if not clean_prompt:
         return False
     pending = [{
         "key": "single",
-        "styled_prompt": prompt[:420],
+        "raw_prompt": clean_prompt,
+        "styled_prompt": clean_prompt,
         "vault_jpg": Path(out_path),
         "out_path": Path(out_path),
     }]
-    try:
-        asyncio.get_running_loop()
-        return False
-    except RuntimeError:
-        try:
-            res = asyncio.run(
-                asyncio.wait_for(
-                    _run_google_flow_camoufox_batch_async(
-                        pending,
-                        aspect_ratio=aspect_ratio,
-                        per_image_timeout_s=timeout_s,
-                    ),
-                    timeout=timeout_s + 22.0,
-                )
+
+    def _run_batch() -> Dict[str, Path]:
+        return asyncio.run(
+            asyncio.wait_for(
+                _run_google_flow_camoufox_batch_async(
+                    pending,
+                    aspect_ratio=aspect_ratio,
+                    per_image_timeout_s=timeout_s,
+                    wave_size=1,
+                ),
+                timeout=max(timeout_s + 30.0, 95.0),
             )
-            return "single" in res and Path(out_path).exists()
-        except Exception:
-            return False
+        )
+
+    try:
+        try:
+            asyncio.get_running_loop()
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                res = ex.submit(_run_batch).result()
+        except RuntimeError:
+            res = _run_batch()
+        return (
+            "single" in res
+            and Path(out_path).exists()
+            and _validate_real_photo_image(Path(out_path), aspect_ratio=aspect_ratio)
+        )
+    except Exception:
+        return False
 
 
 def generate_flow_bespoke_photo_sync(
@@ -1343,22 +1704,14 @@ def generate_flow_bespoke_photo_sync(
     try_browser: bool = True,
 ) -> Optional[Path]:
     """Generate a genuine photorealistic/cinematic documentary image via:
-      1. FlowVault cache (0 credits, instant)
+      1. FlowVault cache (0 credits, instant, orientation-verified)
       2. Authenticated Google Flow (`flow.google` Nano Banana 2) via persistent Camoufox profile
       3. Pollinations Flux photorealistic dark-cinema endpoint (0 credits)
     NEVER returns geometric Skia placeholder cards (returns None if all photo generators fail).
     """
-    clean_p = re.sub(r"\s+", " ", (prompt_en or "").strip())
-    if not clean_p:
+    styled_prompt = _style_flow_cinema_prompt(prompt_en, mood=mood, aspect_ratio=aspect_ratio)
+    if not styled_prompt:
         return None
-
-    mood_style = {
-        "dark_horror": "dark gothic 35mm cinema still, eerie chiaroscuro candlelight, mist, deep shadows, film grain, photorealistic, no text, no watermark",
-        "investigative_crime": "gritty neo-noir documentary photograph, tungsten night lighting, 35mm film grain, photorealistic, no text, no watermark",
-        "epic_history": "cinematic museum-grade historical film still, dramatic Rembrandt lighting, 35mm photography, no text, no watermark",
-        "corporate_thriller": "sleek moody prestige cinema photograph, dark glass reflections, 35mm anamorphic lens, no text, no watermark",
-    }.get(mood, "cinematic 35mm documentary photograph, dramatic lighting, no text, no watermark")
-    styled_prompt = f"{clean_p}, {mood_style}"
 
     vault = get_flow_vault()
     hit = vault.lookup_asset(
@@ -1368,24 +1721,34 @@ def generate_flow_bespoke_photo_sync(
         record_reuse=True,
     )
     if hit and Path(hit["abs_path"]).exists():
-        # Ignore legacy geometric Skia cards stored in vault
+        # Ignore legacy geometric Skia cards or poisoned misoriented assets stored in vault
         if str(hit.get("provider_source") or "") != "nano_banana_2_skia_studio":
             src = Path(hit["abs_path"])
-            if _validate_real_photo_image(src):
+            if _validate_real_photo_image(src, aspect_ratio=aspect_ratio):
                 out_path = Path(out_path)
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 if src.resolve() != out_path.resolve():
                     shutil.copy2(src, out_path)
                 return out_path
+            print(
+                f"[GoogleFlow] Ignoring poisoned/misoriented FlowVault bespoke cache hit ({aspect_ratio}): {src.name}",
+                flush=True,
+            )
 
     img_hash = compute_vault_hash(styled_prompt, kind="images", aspect_ratio=aspect_ratio)
     vault_jpg = vault.images_dir / f"flow_bespoke_{img_hash}.jpg"
-    w, h = (768, 1280) if aspect_ratio == "9:16" else (1280, 720)
+    w, h = (768, 1344) if str(aspect_ratio or "9:16").strip() == "9:16" else (1280, 720)
     used_source = ""
 
     # 1. Try authenticated Google Flow browser session (if cookies present & enabled)
     if try_browser and _has_profile_cookies():
-        if _try_google_flow_camoufox_image_sync(styled_prompt, vault_jpg, timeout_s=36.0, aspect_ratio=aspect_ratio):
+        if _try_google_flow_camoufox_image_sync(
+            styled_prompt,
+            vault_jpg,
+            timeout_s=36.0,
+            aspect_ratio=aspect_ratio,
+            skip_browser=not try_browser,
+        ):
             used_source = "google_flow_pro_nano_banana_2"
 
     # 2. Fallback to Pollinations Flux photorealistic cinema generator
@@ -1406,7 +1769,7 @@ def generate_flow_bespoke_photo_sync(
                             if "image" in ct or r.content[:2] == b"\xff\xd8" or r.content[:4] == b"\x89PNG":
                                 vault_jpg.parent.mkdir(parents=True, exist_ok=True)
                                 vault_jpg.write_bytes(r.content)
-                                if _validate_real_photo_image(vault_jpg):
+                                if _validate_real_photo_image(vault_jpg, aspect_ratio=aspect_ratio):
                                     used_source = "flow_pollinations_flux"
                                     break
                                 vault_jpg.unlink(missing_ok=True)
@@ -1415,7 +1778,7 @@ def generate_flow_bespoke_photo_sync(
         except Exception:
             pass
 
-    if not used_source or not vault_jpg.exists():
+    if not used_source or not vault_jpg.exists() or not _validate_real_photo_image(vault_jpg, aspect_ratio=aspect_ratio):
         return None
 
     vault.store_asset(

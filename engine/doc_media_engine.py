@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import quote
@@ -164,13 +165,22 @@ OFFTOPIC_MEDIA_TAGS = (
     "toddler",
     "toy",
     "toys",
+    "figurine",
+    "miniature",
+    "statuette",
+    "doll",
+    "action figure",
+    "collectible",
+    "toy soldier",
+    "plush",
+    "mannequin",
+    "wax figure",
     "wallpaper",
     "seamless",
     "texture",
     "abstract",
     "glitter",
     "sparkle",
-    "confetti",
     "emoji",
     "cartoon",
     "anime",
@@ -414,7 +424,8 @@ _CRIME_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_GEMINI_IMAGE_QUOTA_EXHAUSTED: bool = False
+_GEMINI_IMAGE_QUOTA_COOLDOWN_UNTIL: float = 0.0
+_GEMINI_IMAGE_QUOTA_COOLDOWN_S: float = 600.0
 _U2NETP_SESSION = None
 
 
@@ -751,31 +762,99 @@ def _download_thumb_bgr(client: httpx.Client, url: str, timeout: float = 6.5) ->
         return None
 
 
+def _check_dark_horror_visual_guard(bgr: np.ndarray) -> Tuple[bool, str]:
+    """Fast OpenCV HSV brightness / blue-sky / bright-greenery guard for `dark_horror` mood.
+    Rejects sunny daytime skies, sunlit summer ruins/walls, bright daytime greenery, and overly
+    bright studio/plastic toy photos while preserving dark gothic, candlelit, misty, and archival visuals.
+    """
+    try:
+        if bgr is None or bgr.size == 0 or bgr.ndim < 3:
+            return False, "invalid_frame"
+        h0, w0 = bgr.shape[:2]
+        if max(h0, w0) > 320:
+            scale = 320.0 / float(max(h0, w0))
+            sample = cv2.resize(
+                bgr,
+                (max(16, int(round(w0 * scale))), max(16, int(round(h0 * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            sample = bgr
+        hsv = cv2.cvtColor(sample, cv2.COLOR_BGR2HSV)
+        h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+        mean_v = float(np.mean(v_ch))
+        p80_v = float(np.percentile(v_ch, 80))
+        bright_ratio = float(np.mean(v_ch >= 185))
+
+        top_h = h_ch[: max(1, h_ch.shape[0] // 2), :]
+        top_s = s_ch[: max(1, s_ch.shape[0] // 2), :]
+        top_v = v_ch[: max(1, v_ch.shape[0] // 2), :]
+        blue_sky_top = float(
+            np.mean((top_h >= 88) & (top_h <= 135) & (top_s >= 35) & (top_v >= 135))
+        )
+        bright_green = float(
+            np.mean((h_ch >= 30) & (h_ch <= 88) & (s_ch >= 45) & (v_ch >= 100))
+        )
+
+        if mean_v > 130.0 or (mean_v > 118.0 and p80_v >= 195.0 and bright_ratio >= 0.30):
+            return False, f"bright_daytime(v={mean_v:.0f})"
+        if (blue_sky_top >= 0.16 and mean_v >= 96.0) or (blue_sky_top >= 0.28 and p80_v >= 150.0):
+            return False, f"sunny_blue_sky({blue_sky_top:.0%})"
+        if bright_green >= 0.14 and mean_v >= 88.0:
+            return False, f"bright_greenery({bright_green:.0%})"
+        return True, "ok"
+    except Exception:
+        return True, "guard_skip"
+
+
 def vision_select_best_candidate(
     thumb_bgrs: List[np.ndarray],
     query: str,
     scene_context: str = "",
     mood: str = "dark_horror",
     min_score: int = 7,
+    strict_vision: bool = True,
 ) -> Tuple[int, int, str]:
     """Multimodal Gemini Flash Lite Vision Critic: inspects up to 4 candidate thumbnails in ONE
     ~1s API call via a labeled 2x2 grid (`1`, `2`, `3`, `4`) and returns `(best_idx_0based, score, reason)`.
-    Returns `(-1, 0, reason)` if NONE of the candidates truly fit the historical/documentary scene!
+    FAIL-CLOSED when `strict_vision=True`: returns `(-1, 0, reason)` on missing API key, HTTP/network/JSON
+    error, dark-horror brightness/sky rejection, or when no candidate reaches `min_score`.
     """
     if not thumb_bgrs:
         return -1, 0, "no_candidates"
     gkey = _read_gemini_api_key()
     if not gkey:
+        if strict_vision:
+            return -1, 0, "no_vision_key"
         return 0, 7, "no_vision_key"
 
-    n_c = min(4, len(thumb_bgrs))
+    raw_n = min(4, len(thumb_bgrs))
+    kept_indices: List[int] = []
+    kept_bgrs: List[np.ndarray] = []
+    last_guard_reason = ""
+    if mood == "dark_horror":
+        for idx in range(raw_n):
+            ok_g, g_why = _check_dark_horror_visual_guard(thumb_bgrs[idx])
+            if ok_g:
+                kept_indices.append(idx)
+                kept_bgrs.append(thumb_bgrs[idx])
+            else:
+                last_guard_reason = g_why
+        if not kept_indices:
+            return -1, 0, f"dark_horror_guard:{last_guard_reason or 'sunny_or_bright'}"
+    else:
+        kept_indices = list(range(raw_n))
+        kept_bgrs = list(thumb_bgrs[:raw_n])
+
+    n_c = len(kept_bgrs)
     cell_w, cell_h = 320, 220
     cols = 2 if n_c > 1 else 1
     rows = 2 if n_c > 2 else 1
     grid = np.zeros((rows * cell_h, cols * cell_w, 3), dtype=np.uint8)
 
     for idx in range(n_c):
-        bgr = thumb_bgrs[idx]
+        bgr = kept_bgrs[idx]
         tile = _center_crop_resize_bgr(bgr, cell_w, cell_h, high_quality=False)
         # Draw high-contrast label badge ("1", "2", "3", "4") in top-left corner
         cv2.rectangle(tile, (4, 4), (48, 44), (0, 0, 0), -1)
@@ -785,23 +864,41 @@ def vision_select_best_candidate(
 
     ok_enc, buf = cv2.imencode(".jpg", grid, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     if not ok_enc:
-        return 0, 7, "encode_skip"
+        if strict_vision:
+            return -1, 0, "encode_failed"
+        return kept_indices[0], 7, "encode_skip"
     b64_img = base64.b64encode(buf.tobytes()).decode("ascii")
 
     mood_desc = {
-        "dark_horror": "dark gothic historical horror documentary (strictly NO sunny beaches, paragliders, modern cars/buses, steampunk vehicles, tropical resorts, cosplayers, or cheerful stock photos)",
-        "epic_history": "authentic historical cinema documentary (strictly NO modern vehicles, sports, tourists, neon, or anachronistic modern objects)",
-        "investigative_crime": "gritty noir investigative true-crime documentary (strictly NO cartoons, bright vacation scenes, or stock clip-art)",
+        "dark_horror": (
+            "dark gothic historical horror documentary (strictly NO sunny daytime skies, NO blue summer sky, "
+            "NO bright sunlit ruins or green meadows, NO plastic figurines/miniatures/statuettes/dolls/toys/collectibles, "
+            "NO glossy 3D plastic CGI renders, NO beaches, paragliders, modern cars/buses, steampunk vehicles, "
+            "tropical resorts, cosplayers, or cheerful stock photos)"
+        ),
+        "epic_history": "authentic historical cinema documentary (strictly NO modern vehicles, sports, tourists, neon, toys/figurines, or anachronistic modern objects)",
+        "investigative_crime": "gritty noir investigative true-crime documentary (strictly NO cartoons, bright vacation scenes, toys, or stock clip-art)",
         "corporate_thriller": "prestige financial/corporate documentary thriller",
     }.get(mood, "prestige cinematic documentary")
+
+    dark_rule = (
+        "DARK HORROR STRICT GATE: Immediately REJECT (set best=0) any image with sunny daytime lighting, "
+        "clear blue summer sky, bright sunlit greenery/grass, plastic/painted toy figurines, miniatures, "
+        "dolls, mannequins, collectibles, or glossy 3D plastic CGI renders. Accept ONLY dark, moody, "
+        "cinematic, chiaroscuro, nocturnal/overcast, or authentic period archival visuals.\n"
+        if mood == "dark_horror"
+        else ""
+    )
 
     prompt_txt = (
         f"You are the strict Visual Director for a {mood_desc}.\n"
         f"Target shot prompt: {query}\n"
         f"Scene narration context: {(scene_context or query)[:260]}\n"
+        f"{dark_rule}"
         f"Look at the {n_c} candidate images labeled 1..{n_c} in the grid.\n"
         f"Pick the SINGLE best image that genuinely depicts the target subject and period/mood with ZERO modern anachronisms, "
-        f"ZERO watermarks/text overlays, ZERO off-topic scenery (e.g. paragliders, steampunk buses, tropical resorts, tile floors, butterflies, modern tourists).\n"
+        f"ZERO watermarks/text overlays, ZERO toys/figurines/miniatures/3D plastic CGI, ZERO off-topic scenery "
+        f"(e.g. sunny blue-sky ruins, bright greenery, paragliders, steampunk buses, tropical resorts, tile floors, butterflies, modern tourists).\n"
         f"If NONE of the images score at least {min_score}/10 for this exact scene, set best=0.\n"
         'Reply STRICT JSON ONLY: {"best": 0, "score": 0, "reason": "short"}'
     )
@@ -814,29 +911,42 @@ def vision_select_best_candidate(
         }],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "maxOutputTokens": 120,
+            "maxOutputTokens": 220,
             "temperature": 0.1,
         },
     }
     try:
-        resp = httpx.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
-            json=payload,
-            headers={"Content-Type": "application/json", "x-goog-api-key": gkey},
-            timeout=12.0,
-        )
-        if resp.status_code != 200:
-            return 0, 7, f"http_{resp.status_code}"
-        raw_txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        resp = None
+        for attempt in range(2):
+            resp = httpx.post(
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
+                json=payload,
+                headers={"Content-Type": "application/json", "x-goog-api-key": gkey},
+                timeout=12.0,
+            )
+            if resp.status_code in (429, 503) and attempt == 0:
+                time.sleep(1.0)
+                continue
+            break
+        if resp is None or resp.status_code != 200:
+            code = resp.status_code if resp is not None else 0
+            if strict_vision:
+                return -1, 0, f"http_{code}"
+            return kept_indices[0], 7, f"http_{code}"
+        raw_txt = str(resp.json()["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
+        if raw_txt.startswith("```"):
+            raw_txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_txt, flags=re.IGNORECASE | re.DOTALL).strip()
         parsed = json.loads(raw_txt)
         best_1 = int(parsed.get("best") or 0)
         score = int(parsed.get("score") or 0)
         reason = str(parsed.get("reason") or "")[:90]
         if 1 <= best_1 <= n_c and score >= min_score:
-            return best_1 - 1, score, reason
+            return kept_indices[best_1 - 1], score, reason
         return -1, score, reason
     except Exception as exc:
-        return 0, 7, f"vision_err:{str(exc)[:40]}"
+        if strict_vision:
+            return -1, 0, f"vision_err:{str(exc)[:40]}"
+        return kept_indices[0], 7, f"vision_err:{str(exc)[:40]}"
 
 
 def verify_video_frame_vision(
@@ -845,8 +955,11 @@ def verify_video_frame_vision(
     scene_context: str = "",
     mood: str = "dark_horror",
     min_score: int = 7,
+    strict_vision: bool = True,
 ) -> Tuple[bool, int, str]:
-    """Extract a representative frame from a downloaded video and verify semantic relevance via Gemini Vision."""
+    """Extract a representative frame from a downloaded video and verify semantic relevance via Gemini Vision.
+    FAIL-CLOSED (`return False, 0, reason`) when `strict_vision=True`.
+    """
     try:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -866,9 +979,12 @@ def verify_video_frame_vision(
             scene_context=scene_context,
             mood=mood,
             min_score=min_score,
+            strict_vision=strict_vision,
         )
         return (idx == 0), score, reason
-    except Exception:
+    except Exception as exc:
+        if strict_vision:
+            return False, 0, f"verify_err:{str(exc)[:40]}"
         return True, 7, "verify_skip"
 
 
@@ -1096,7 +1212,7 @@ def generate_doc_gemini_image(
     targeting `gemini-2.5-flash-image` / `gemini-3.1-flash-image` with persistent disk caching in
     `data/doc_photo_cache/`. Returns None cleanly (without crashing) if key is missing or quota-limited.
     """
-    global _GEMINI_IMAGE_QUOTA_EXHAUSTED
+    global _GEMINI_IMAGE_QUOTA_COOLDOWN_UNTIL
     clean_prompt = _normalize_query(prompt_en, "")
     if not clean_prompt:
         return None
@@ -1116,7 +1232,7 @@ def generate_doc_gemini_image(
             return _materialize_photo_in_work_dir(cached_jpg, work_dir, tag, p_hash)
         cached_jpg.unlink(missing_ok=True)
 
-    if _GEMINI_IMAGE_QUOTA_EXHAUSTED:
+    if time.monotonic() < _GEMINI_IMAGE_QUOTA_COOLDOWN_UNTIL:
         return None
 
     gkey = _read_gemini_api_key()
@@ -1207,6 +1323,7 @@ def generate_doc_gemini_image(
                         })
                         _save_photo_query_index(q_hash, entries)
 
+                    _GEMINI_IMAGE_QUOTA_COOLDOWN_UNTIL = 0.0
                     print(
                         f"[DocMedia] Bespoke Gemini photo ready ({model_id}): {cached_jpg.name} ({w}x{h}) | q='{clean_prompt[:55]}'",
                         flush=True,
@@ -1216,8 +1333,11 @@ def generate_doc_gemini_image(
                     break
 
     if quota_hits >= len(GEMINI_IMAGE_MODELS):
-        _GEMINI_IMAGE_QUOTA_EXHAUSTED = True
-        print("[DocMedia] Gemini Image API quota currently throttled (429) — seamlessly blending Pixabay & Wikimedia archival photos.", flush=True)
+        _GEMINI_IMAGE_QUOTA_COOLDOWN_UNTIL = time.monotonic() + _GEMINI_IMAGE_QUOTA_COOLDOWN_S
+        print(
+            "[DocMedia] Gemini Image API quota currently throttled (429) — cooling down 10 min and seamlessly blending Pixabay & Wikimedia archival photos.",
+            flush=True,
+        )
     return None
 
 
@@ -1228,6 +1348,7 @@ def _fetch_pollinations_photo(
     used_urls: Set[str],
     min_width: int = 640,
     mood: str = "",
+    aspect_ratio: str = "16:9",
 ) -> Optional[Tuple[Path, str, int, int]]:
     seed = int(q_hash[:8], 16) % 99999
     if used_urls:
@@ -1237,10 +1358,12 @@ def _fetch_pollinations_photo(
         "epic_history": "authentic historical documentary photograph, archival 35mm film grain, museum lighting, no text",
         "investigative_crime": "gritty nocturnal investigative documentary photograph, 35mm noir cinema lighting, no text",
     }.get(mood, "editorial documentary photograph, 35mm film photography, realistic natural lighting, sharp focus, no text")
+    ar_clean = "9:16" if str(aspect_ratio or "16:9").strip() == "9:16" else "16:9"
+    pw, ph = (768, 1344) if ar_clean == "9:16" else (1280, 720)
     prompt = f"{query}, {style_hint}"
     url = (
         f"https://image.pollinations.ai/prompt/{quote(prompt)}"
-        f"?width=1280&height=720&model=flux&nologo=true&seed={seed}"
+        f"?width={pw}&height={ph}&model=flux&nologo=true&seed={seed}"
     )
     if url in used_urls:
         return None
@@ -1315,9 +1438,12 @@ def fetch_doc_real_photo(
     resolved_mood = _infer_media_mood(f"{query} {bespoke_prompt_en}", mood)
     mood_defaults = MOOD_DOC_PHOTO_QUERIES.get(resolved_mood, CURATED_DOC_PHOTO_QUERIES)
     norm_q = _normalize_query(query, mood_defaults[0])
+    ar_clean = "9:16" if str(aspect_ratio or "16:9").strip() == "9:16" else "16:9"
     used = used_urls if used_urls is not None else set()
     dhashes = used_dhashes if used_dhashes is not None else set()
     q_hash = hashlib.sha256(norm_q.lower().encode("utf-8")).hexdigest()[:16]
+    flow_key_payload = f"{norm_q.lower()}||{str(bespoke_prompt_en or '').strip().lower()}||{ar_clean}"
+    flow_hash = hashlib.sha256(flow_key_payload.encode("utf-8")).hexdigest()[:16]
     eff_min_w = max(320, int(min_width))
     ctx_text = (scene_context or bespoke_prompt_en or norm_q).strip()
 
@@ -1331,20 +1457,37 @@ def fetch_doc_real_photo(
             dhashes.add(dh)
         return True
 
-    # 0. Fast persistent cache lookup by query hash (respecting used_urls, dhash AND Vision check)
+    def _orientation_matches_ar(w_px: int, h_px: int) -> bool:
+        if ar_clean == "9:16":
+            return h_px >= w_px * 1.25
+        return w_px >= h_px * 1.25
+
+    # 0. Fast persistent cache lookup by query hash (respecting used_urls, AR, dhash AND Vision check)
     cached_entries = _load_photo_query_index(q_hash)
     for entry in cached_entries:
         c_url = str(entry.get("url") or "")
         c_file = DOC_PHOTO_CACHE_DIR / str(entry.get("file") or "")
+        c_src = str(entry.get("source") or "")
         if not c_url or c_url in used:
             continue
-        ok, _, _ = _validate_photo_file(c_file, min_width=min(eff_min_w, 320))
+        ok, cw, ch = _validate_photo_file(c_file, min_width=min(eff_min_w, 320))
         if not ok:
             continue
-        if strict_vision and str(entry.get("source") or "") not in ("google_flow_bespoke", "google_flow_pro_nano_banana_2"):
+        if c_src in ("google_flow_bespoke", "google_flow_pro_nano_banana_2"):
+            c_ar = str(entry.get("aspect_ratio") or "").strip()
+            if (c_ar and c_ar != ar_clean) or not _orientation_matches_ar(cw, ch):
+                continue
+        if strict_vision and c_src not in ("google_flow_bespoke", "google_flow_pro_nano_banana_2"):
             bgr_c = cv2.imread(str(c_file), cv2.IMREAD_COLOR)
             if bgr_c is not None:
-                v_idx, v_sc, v_why = vision_select_best_candidate([bgr_c], query=norm_q, scene_context=ctx_text, mood=resolved_mood, min_score=7)
+                v_idx, v_sc, v_why = vision_select_best_candidate(
+                    [bgr_c],
+                    query=norm_q,
+                    scene_context=ctx_text,
+                    mood=resolved_mood,
+                    min_score=7,
+                    strict_vision=strict_vision,
+                )
                 if v_idx != 0:
                     print(f"[DocMedia] Vision rejected cached photo ({v_sc}/10: {v_why}) -> {c_file.name}", flush=True)
                     continue
@@ -1368,6 +1511,7 @@ def fetch_doc_real_photo(
                 "source": src_name,
                 "width": w,
                 "height": h,
+                "aspect_ratio": ar_clean,
                 "query": norm_q,
                 "mood": resolved_mood,
             })
@@ -1430,6 +1574,10 @@ def fetch_doc_real_photo(
                 tbgr = _download_thumb_bgr(client, t_url)
                 if tbgr is None:
                     continue
+                if resolved_mood == "dark_horror":
+                    ok_g, _ = _check_dark_horror_visual_guard(tbgr)
+                    if not ok_g:
+                        continue
                 dh = compute_image_dhash(tbgr)
                 if not allow_duplicate and is_perceptual_duplicate(dh, dhashes, max_hamming=8):
                     continue
@@ -1445,6 +1593,7 @@ def fetch_doc_real_photo(
                 scene_context=ctx_text,
                 mood=resolved_mood,
                 min_score=7,
+                strict_vision=strict_vision,
             )
             if best_i < 0:
                 print(
@@ -1469,18 +1618,18 @@ def fetch_doc_real_photo(
                 from engine.google_flow_bridge import generate_flow_bespoke_photo_sync
 
                 flow_prompt = bespoke_prompt_en.strip() if bespoke_prompt_en.strip() else norm_q
-                flow_target = DOC_PHOTO_CACHE_DIR / f"flow_{q_hash}.jpg"
+                flow_target = DOC_PHOTO_CACHE_DIR / f"flow_{flow_hash}.jpg"
                 flow_path = generate_flow_bespoke_photo_sync(
                     prompt_en=flow_prompt,
                     out_path=flow_target,
-                    aspect_ratio=aspect_ratio,
+                    aspect_ratio=ar_clean,
                     mood=resolved_mood,
                     try_browser=True,
                 )
                 if flow_path is not None and flow_path.exists():
                     ok_v, fw, fh = _validate_photo_file(flow_path, min_width=320, min_height=200)
-                    if ok_v:
-                        return _record_and_return(flow_path, f"flow://{q_hash}", "google_flow_bespoke", fw, fh)
+                    if ok_v and _orientation_matches_ar(fw, fh):
+                        return _record_and_return(flow_path, f"flow://{flow_hash}", "google_flow_bespoke", fw, fh)
             except Exception:
                 pass
             return None
@@ -1562,16 +1711,42 @@ def _get_u2netp_session():
     return _U2NETP_SESSION
 
 
+def _guided_filter_gray(
+    guide_f32: np.ndarray,
+    src_f32: np.ndarray,
+    r: int = 6,
+    eps: float = 1e-3,
+) -> np.ndarray:
+    """Fast OpenCV box-filter Guided Image Filter (He et al.) aligning a low-res mask
+    sharply onto full-resolution grayscale edges without needing opencv-contrib.
+    """
+    ksize = (2 * int(r) + 1, 2 * int(r) + 1)
+    mean_i = cv2.boxFilter(guide_f32, cv2.CV_32F, ksize, borderType=cv2.BORDER_REFLECT)
+    mean_p = cv2.boxFilter(src_f32, cv2.CV_32F, ksize, borderType=cv2.BORDER_REFLECT)
+    mean_ip = cv2.boxFilter(guide_f32 * src_f32, cv2.CV_32F, ksize, borderType=cv2.BORDER_REFLECT)
+    cov_ip = mean_ip - mean_i * mean_p
+    mean_ii = cv2.boxFilter(guide_f32 * guide_f32, cv2.CV_32F, ksize, borderType=cv2.BORDER_REFLECT)
+    var_i = mean_ii - mean_i * mean_i
+    a = cov_ip / (var_i + float(eps))
+    b = mean_p - a * mean_i
+    mean_a = cv2.boxFilter(a, cv2.CV_32F, ksize, borderType=cv2.BORDER_REFLECT)
+    mean_b = cv2.boxFilter(b, cv2.CV_32F, ksize, borderType=cv2.BORDER_REFLECT)
+    return np.clip(mean_a * guide_f32 + mean_b, 0.0, 1.0)
+
+
 def separate_photo_25d_u2netp(
     img_path: Path,
     target_w: int,
     target_h: int,
 ) -> Tuple[Optional[skia.Image], Optional[skia.Image]]:
     """Separate a photo into `(bg_inpainted_skia_img, fg_cutout_skia_img)` at `(target_w, target_h)`
-    using `~/.u2net/u2netp.onnx` via `onnxruntime` + `cv2.inpaint` (TELEA).
+    using `~/.u2net/u2netp.onnx` via `onnxruntime`, OpenCV Guided Filter edge refinement, and
+    half-res TELEA background hole-filling.
 
-    Both returned `skia.Image` objects use `kBGRA_8888_ColorType` (unpremultiplied alpha)
-    so `parallax_25d_photo` can pan/zoom foreground 2.2x faster than the inpainted background!
+    Strictly requires ONE clean dominant single subject (`0.10 <= solid_cov <= 0.55`,
+    `largest_area / total_area >= 0.80`, `<= 4` small secondary blobs). For landscapes,
+    crowds, architecture, fragmented masks, or unavailable `u2netp`, returns
+    `(sharp_full_bg_skia, None)` with ZERO fake ellipse cutout or halo blur!
     """
     if img_path is None:
         return None, None
@@ -1586,58 +1761,88 @@ def separate_photo_25d_u2netp(
     th = max(32, int(target_h))
     bgr = _center_crop_resize_bgr(bgr_raw, tw, th, high_quality=True)
 
-    alpha = np.zeros((th, tw), dtype=np.uint8)
+    def _sharp_bg_only() -> Tuple[skia.Image, None]:
+        sharp_bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+        return (
+            skia.Image.fromarray(
+                np.ascontiguousarray(sharp_bgra),
+                colorType=skia.ColorType.kBGRA_8888_ColorType,
+            ),
+            None,
+        )
+
     sess = _get_u2netp_session()
-    if sess is not None:
-        try:
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            resized = cv2.resize(rgb, (320, 320), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-            std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-            norm = (resized - mean) / std
-            inp = np.transpose(norm, (2, 0, 1))[np.newaxis, :, :, :].astype(np.float32)
-            in_name = sess.get_inputs()[0].name
-            pred = sess.run(None, {in_name: inp})[0][0, 0]
-            p_min, p_max = float(np.min(pred)), float(np.max(pred))
-            mask_320 = (pred - p_min) / max(1e-5, p_max - p_min)
-            alpha = (cv2.resize(mask_320, (tw, th), interpolation=cv2.INTER_LINEAR) * 255.0).astype(np.uint8)
-        except Exception:
-            alpha = np.zeros((th, tw), dtype=np.uint8)
+    if sess is None:
+        return _sharp_bg_only()
 
-    solid_cov = float(np.mean(alpha > 128))
-    if 0.06 <= solid_cov <= 0.85:
-        # Mild contrast stretch keeps genuine u2netp subjects crisp while feathering edges smoothly
-        alpha_f = np.clip((alpha.astype(np.float32) / 255.0 - 0.12) / 0.76, 0.0, 1.0)
-        alpha = (alpha_f * 255.0).astype(np.uint8)
-    else:
-        # Smooth architectural/subject focal ellipse fallback for uniform landscapes/skylines
-        yy, xx = np.ogrid[:th, :tw]
-        dist = ((xx - tw * 0.50) / max(1.0, tw * 0.30)) ** 2 + ((yy - th * 0.54) / max(1.0, th * 0.36)) ** 2
-        alpha = np.clip((1.08 - dist) * 255.0, 0, 255).astype(np.uint8)
+    try:
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (320, 320), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        norm = (resized - mean) / std
+        inp = np.transpose(norm, (2, 0, 1))[np.newaxis, :, :, :].astype(np.float32)
+        in_name = sess.get_inputs()[0].name
+        pred = sess.run(None, {in_name: inp})[0][0, 0]
+        p_min, p_max = float(np.min(pred)), float(np.max(pred))
+        if (p_max - p_min) < 1e-4:
+            return _sharp_bg_only()
+        mask_320 = ((pred - p_min) / max(1e-5, p_max - p_min)).astype(np.float32)
+        mask_full_f = cv2.resize(mask_320, (tw, th), interpolation=cv2.INTER_LINEAR)
+        alpha_raw = np.clip(mask_full_f * 255.0, 0.0, 255.0).astype(np.uint8)
+    except Exception:
+        return _sharp_bg_only()
 
-    # Clean anti-aliased alpha edge for foreground cutout
-    alpha_feathered = cv2.GaussianBlur(alpha, (9, 9), 0)
+    solid_mask = (alpha_raw > 128).astype(np.uint8)
+    solid_cov = float(np.mean(solid_mask))
+    if not (0.10 <= solid_cov <= 0.55):
+        return _sharp_bg_only()
+
+    # Require ONE clean dominant single subject (reject crowds, multi-subject & fragmented masks)
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(solid_mask, connectivity=8)
+    if num_labels <= 1:
+        return _sharp_bg_only()
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    total_area = int(np.sum(areas))
+    if total_area <= 0:
+        return _sharp_bg_only()
+    largest_area = int(np.max(areas))
+    dominance = largest_area / float(total_area)
+    min_blob_px = max(4, min(16, int(tw * th * 0.00005)))
+    significant_blobs = int(np.sum(areas >= min_blob_px))
+    secondary_blobs = max(0, significant_blobs - 1)
+    if dominance < 0.80 or secondary_blobs > 4:
+        return _sharp_bg_only()
+
+    # Edge-preserving Guided Filter refinement against full-res grayscale (locks mask onto real HD contours!)
+    gray_f = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    refined_f = _guided_filter_gray(gray_f, mask_full_f, r=6, eps=1e-3)
+    alpha_f = np.clip((refined_f - 0.15) / 0.70, 0.0, 1.0)
+    alpha_u8 = (alpha_f * 255.0).astype(np.uint8)
+
+    # 1px erode + minimal (3, 3) feather (zero muddy halo blur!)
+    erode_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    alpha_eroded = cv2.erode(alpha_u8, erode_kernel, iterations=1)
+    alpha_feathered = cv2.GaussianBlur(alpha_eroded, (3, 3), 0)
     fg_bgra = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
     fg_bgra[:, :, 3] = alpha_feathered
 
-    # Fast CPU background hole-filling at ~1/3 scale, composited ONLY over the dilated mask
-    # so untouched background pixels keep 100% original crisp resolution!
-    small_w = max(160, min(480, tw // 3))
-    small_h = max(120, min(360, th // 3))
-    bgr_small = cv2.resize(bgr, (small_w, small_h), interpolation=cv2.INTER_AREA)
-    mask_small = cv2.resize(
-        (alpha > 42).astype(np.uint8) * 255,
-        (small_w, small_h),
+    # Clean half-res (tw // 2) background hole-filling with thin (5, 5) dilation, inpaintRadius=4 & (7, 7) blend
+    half_w = max(32, tw // 2)
+    half_h = max(32, th // 2)
+    bgr_half = cv2.resize(bgr, (half_w, half_h), interpolation=cv2.INTER_AREA)
+    mask_half = cv2.resize(
+        (alpha_eroded > 64).astype(np.uint8) * 255,
+        (half_w, half_h),
         interpolation=cv2.INTER_NEAREST,
     )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-    dilated_small = cv2.dilate(mask_small, kernel, iterations=1)
-    inpainted_small = cv2.inpaint(bgr_small, dilated_small, inpaintRadius=6, flags=cv2.INPAINT_TELEA)
-    inpainted_up = cv2.resize(inpainted_small, (tw, th), interpolation=cv2.INTER_LINEAR)
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dilated_half = cv2.dilate(mask_half, dilate_kernel, iterations=1)
+    inpainted_half = cv2.inpaint(bgr_half, dilated_half, inpaintRadius=4, flags=cv2.INPAINT_TELEA)
+    inpainted_up = cv2.resize(inpainted_half, (tw, th), interpolation=cv2.INTER_LINEAR)
 
-    # Blend inpainted hole smoothly into crisp full-res background
-    hole_mask_full = cv2.resize(dilated_small, (tw, th), interpolation=cv2.INTER_LINEAR)
-    hole_mask_soft = cv2.GaussianBlur(hole_mask_full, (15, 15), 0).astype(np.float32) / 255.0
+    hole_mask_full = cv2.resize(dilated_half, (tw, th), interpolation=cv2.INTER_LINEAR)
+    hole_mask_soft = cv2.GaussianBlur(hole_mask_full, (7, 7), 0).astype(np.float32) / 255.0
     hole_mask_3 = hole_mask_soft[:, :, np.newaxis]
     bg_inpainted = np.clip(
         inpainted_up.astype(np.float32) * hole_mask_3 + bgr.astype(np.float32) * (1.0 - hole_mask_3),
@@ -1695,11 +1900,12 @@ def _pick_cpu_friendly_pixabay_video_variant(
         w = int(v.get("width") or 0)
         h = int(v.get("height") or 0)
         size = int(v.get("size") or 0)
-        if w < 640 or h < 360:
+        if max(w, h) < 640 or min(w, h) < 360:
             continue
         is_landscape = w >= h
-        orient_penalty = 0 if (is_landscape == want_landscape) else 2_000
-        # Target ~1280..1920 wide and <= 24MB for fast download & silky 30fps CPU decoding
+        orient_match = (is_landscape == want_landscape)
+        orient_penalty = 0 if orient_match else 2_000
+        # Target ~1280..1920 long-edge and <= 24MB for fast download & silky 30fps CPU decoding
         if 1200 <= max(w, h) <= 2048 and size <= 24_000_000:
             res_score = abs(max(w, h) - 1920) // 4 + (size // 200_000)
         elif max(w, h) > 2048:
@@ -1708,6 +1914,7 @@ def _pick_cpu_friendly_pixabay_video_variant(
             res_score = 400 + abs(max(w, h) - 1280)
         candidates.append({
             "score": orient_penalty + res_score,
+            "orient_match": orient_match,
             "url": str(v["url"]),
             "width": w,
             "height": h,
@@ -1731,8 +1938,9 @@ def _fetch_pixabay_doc_broll(
     used_dhashes: Optional[Set[int]] = None,
     strict_vision: bool = True,
 ) -> Optional[Tuple[Path, str]]:
-    """Fast Pixabay HD B-roll search preferring 1080p/720p MP4s with strict anti-junk filtering
-    AND Multimodal Gemini Vision thumbnail pre-screening BEFORE downloading full MP4s!
+    """Fast Pixabay HD B-roll search preferring 1080p/720p MP4s with hit-list-level orientation
+    ranking, strict anti-junk filtering, AND Multimodal Gemini Vision thumbnail pre-screening
+    (fail-closed when `strict_vision=True`) BEFORE downloading full MP4s!
     """
     if not api_key:
         return None
@@ -1750,7 +1958,7 @@ def _fetch_pixabay_doc_broll(
                 params={
                     "key": api_key,
                     "q": clean_q,
-                    "per_page": 14,
+                    "per_page": 20,
                     "safesearch": "true",
                 },
                 timeout=10.0,
@@ -1761,8 +1969,9 @@ def _fetch_pixabay_doc_broll(
         except Exception:
             continue
 
-        # Rank hits strictly by semantic relevance & filter out butterflies/steampunk/paraglider/bus junk!
-        ranked_hits: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
+        # Rank hits at the HIT-LIST level by orientation match first (portrait clips first for 9:16!),
+        # then semantic relevance, then variant quality, while filtering out off-topic junk!
+        ranked_hits: List[Tuple[Tuple[int, int, int], Dict[str, Any], Dict[str, Any]]] = []
         for hit in hits:
             tags = str(hit.get("tags") or "").lower()
             if any(bad in tags for bad in BAD_TAG_WORDS):
@@ -1779,14 +1988,19 @@ def _fetch_pixabay_doc_broll(
             hsh = hashlib.sha256(picked["url"].encode("utf-8")).hexdigest()[:16]
             if hsh in used_hashes:
                 continue
-            ranked_hits.append((rel_score, hit, picked))
+            orient_rank = 1 if picked.get("orient_match") else 0
+            rank_key = (orient_rank, rel_score, -int(picked["score"]))
+            ranked_hits.append((rank_key, hit, picked))
         ranked_hits.sort(key=lambda x: x[0], reverse=True)
         if not ranked_hits:
             continue
 
-        # Pre-screen top 4 candidate video thumbnails in ONE 1-second Gemini Vision call BEFORE downloading!
-        ordered_candidates = ranked_hits[:6]
-        if strict_vision and _read_gemini_api_key():
+        # Pre-screen top candidate video thumbnails in ONE 1-second Gemini Vision call BEFORE downloading!
+        ordered_candidates = ranked_hits[:8]
+        if strict_vision:
+            if not _read_gemini_api_key():
+                print(f"[DocMedia] Strict Vision skipped Pixabay video query '{q}' (missing Gemini API key)", flush=True)
+                continue
             v_items: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
             v_bgrs: List[np.ndarray] = []
             for _, hit, picked in ordered_candidates:
@@ -1802,32 +2016,43 @@ def _fetch_pixabay_doc_broll(
                 tbgr = _download_thumb_bgr(client, t_url) if t_url else None
                 if tbgr is None:
                     continue
+                if mood == "dark_horror":
+                    ok_g, _ = _check_dark_horror_visual_guard(tbgr)
+                    if not ok_g:
+                        continue
                 dh = compute_image_dhash(tbgr)
                 if is_perceptual_duplicate(dh, dhashes, max_hamming=8):
                     continue
                 v_items.append((hit, picked))
                 v_bgrs.append(tbgr)
 
-            if v_items:
-                best_i, v_score, v_reason = vision_select_best_candidate(
-                    v_bgrs,
-                    query=q,
-                    scene_context=scene_context or q,
-                    mood=mood or "dark_horror",
-                    min_score=7,
-                )
-                if best_i < 0:
-                    print(
-                        f"[DocMedia] Vision rejected all {len(v_items)} Pixabay video hits for '{q}' ({v_score}/10: {v_reason})",
-                        flush=True,
-                    )
-                    continue
-                win_hit, win_picked = v_items[best_i]
+            if not v_items:
                 print(
-                    f"[DocMedia] Vision APPROVED Pixabay video ({v_score}/10: {v_reason}) | q='{q}'",
+                    f"[DocMedia] Strict Vision skipped Pixabay video query '{q}' (no verifiable/dark-compliant thumbnails)",
                     flush=True,
                 )
-                ordered_candidates = [(99, win_hit, win_picked)]
+                continue
+
+            best_i, v_score, v_reason = vision_select_best_candidate(
+                v_bgrs,
+                query=q,
+                scene_context=scene_context or q,
+                mood=mood or "dark_horror",
+                min_score=7,
+                strict_vision=True,
+            )
+            if best_i < 0:
+                print(
+                    f"[DocMedia] Vision rejected all {len(v_items)} Pixabay video hits for '{q}' ({v_score}/10: {v_reason})",
+                    flush=True,
+                )
+                continue
+            win_hit, win_picked = v_items[best_i]
+            print(
+                f"[DocMedia] Vision APPROVED Pixabay video ({v_score}/10: {v_reason}) | q='{q}'",
+                flush=True,
+            )
+            ordered_candidates = [((1, 99, 0), win_hit, win_picked)]
 
         for _, hit, picked in ordered_candidates:
             url = picked["url"]
@@ -1935,7 +2160,12 @@ def fetch_doc_broll_clip(
                     continue
                 if strict_vision:
                     ok_v, v_sc, v_why = verify_video_frame_vision(
-                        clip, query=q, scene_context=scene_context or norm_q, mood=resolved_mood, min_score=7
+                        clip,
+                        query=q,
+                        scene_context=scene_context or norm_q,
+                        mood=resolved_mood,
+                        min_score=7,
+                        strict_vision=True,
                     )
                     if not ok_v:
                         print(f"[DocMedia] Vision rejected smart_vision clip ({v_sc}/10: {v_why}) -> {clip.name}", flush=True)
