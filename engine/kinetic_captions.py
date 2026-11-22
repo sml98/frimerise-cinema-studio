@@ -35,6 +35,65 @@ DEFAULT_CAPTION_PALETTE: List[Tuple[str, str, Tuple[int, int, int, int]]] = [
     ("#FFD166", "#0B0713", (255, 209, 102, 195)), # Dourado Editorial + Ink escuro
 ]
 
+# Dark-Cinema 3-color historical/horror rotation: Blood Crimson + Antique Gold + Torch Amber
+# Eliminates upbeat neon lime green & bubblegum pink in dark-history / horror / investigative documentaries.
+DARK_CINEMA_PILL_PALETTE: List[Tuple[str, str, Tuple[int, int, int, int]]] = [
+    ("#9E1B24", "#FFFFFF", (185, 28, 38, 175)),   # Blood Crimson + Pure White
+    ("#FFD166", "#0B0713", (255, 209, 102, 170)), # Antique Gold + Obsidian Ink
+    ("#D97706", "#FFFFFF", (225, 125, 18, 165)),  # Torch Amber + Pure White
+]
+
+ACTIVE_PILL_PALETTE: List[Tuple[str, str, Tuple[int, int, int, int]]] = DEFAULT_CAPTION_PALETTE
+
+DARK_CINEMA_MOODS: Tuple[str, ...] = (
+    "dark_horror",
+    "epic_history",
+    "investigative_crime",
+    "dark_cinema",
+    "dark_mystery",
+    "dark_horror_cinema",
+    "dark_investigative",
+    "historical_epic",
+)
+
+
+def _is_default_neon_palette(
+    pal: Optional[List[Tuple[str, str, Tuple[int, int, int, int]]]]
+) -> bool:
+    """Return True if `pal` is None or contains the default neon lime/pink palette colors."""
+    if not pal:
+        return True
+    if pal == DEFAULT_CAPTION_PALETTE:
+        return True
+    bg_hexes = {
+        str(item[0]).strip().upper()
+        for item in pal
+        if isinstance(item, (tuple, list)) and len(item) >= 2
+    }
+    return "#B8FF01" in bg_hexes or "#FF2E93" in bg_hexes
+
+
+def resolve_caption_palette(
+    palette: Optional[List[Tuple[str, str, Tuple[int, int, int, int]]]] = None,
+    mood: str = "",
+    style: Optional[str] = None,
+) -> List[Tuple[str, str, Tuple[int, int, int, int]]]:
+    """Auto-select DARK_CINEMA_PILL_PALETTE whenever mood is dark/historical/investigative
+    or style is 'dark_cinema' and no custom non-neon palette was forced.
+    """
+    mood_norm = str(mood or "").strip().lower()
+    style_norm = str(style or "").strip().lower().replace("-", "_").replace(" ", "_")
+    is_dark = (
+        mood_norm in DARK_CINEMA_MOODS
+        or style_norm == "dark_cinema"
+        or any(k in mood_norm for k in ("horror", "history", "investig", "crime", "macabr", "dark"))
+    )
+    if is_dark and _is_default_neon_palette(palette):
+        return list(DARK_CINEMA_PILL_PALETTE)
+    if palette and len(palette) > 0:
+        return list(palette)
+    return list(DEFAULT_CAPTION_PALETTE)
+
 CAPTION_STYLES: Dict[str, Dict[str, Any]] = {
     "hormozi_neon": {
         "id": "hormozi_neon",
@@ -96,6 +155,7 @@ _STYLE_ALIASES: Dict[str, str] = {
     "capcut": "hormozi_neon",
     "capcut_pro": "hormozi_neon",
     "neon": "hormozi_neon",
+    "dark_cinema": "hormozi_neon",
     "default": "hormozi_neon",
     "karaoke_glow": "karaoke_glow",
     "karaoke": "karaoke_glow",
@@ -786,6 +846,8 @@ def _render_karaoke_glow(
         wipe_x = -tw * 0.5 + tw * fill_prog
 
         # Seamless elliptical neon aura tracking the live karaoke sweep edge
+        use_dark_pal = not _is_default_neon_palette(palette)
+        halo_rgb = (255, 209, 102) if use_dark_pal else (196, 245, 42)
         if tok["active"] or fill_prog > 0.02:
             halo_rx = max(tw * 0.62, base_size * 0.98)
             halo_ry = max(ascent * 0.92, base_size * 0.62)
@@ -797,7 +859,7 @@ def _render_karaoke_glow(
                 -ascent * 0.36,
                 halo_rx,
                 halo_ry,
-                (196, 245, 42),
+                halo_rgb,
                 halo_a,
             )
 
@@ -818,7 +880,7 @@ def _render_karaoke_glow(
         unlit_fill = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(215, 205, 214, 230))
         canvas.drawString(tok["text"], -tw * 0.5, 0.0, tok["font"], unlit_fill)
 
-        # Layer 2: Clipped left-to-right neon gold -> electric lime gradient wipe via canvas.clipRect
+        # Layer 2: Clipped left-to-right gradient wipe via canvas.clipRect
         if fill_prog > 0.005:
             clip_w = max(1.0, tw * fill_prog + 4.0)
             clip_rect = skia.Rect.MakeXYWH(
@@ -830,22 +892,35 @@ def _render_karaoke_glow(
             canvas.save()
             canvas.clipRect(clip_rect)
 
-            # Vivid left-to-right neon gold -> bright lime gradient text fill + tight neon glow
+            wipe_colors = (
+                [
+                    skia.ColorSetARGB(255, 255, 236, 170),  # Antique Gold Highlight
+                    skia.ColorSetARGB(255, 255, 209, 102),  # Antique Gold
+                    skia.ColorSetARGB(255, 217, 119, 6),    # Torch Amber
+                ]
+                if use_dark_pal
+                else [
+                    skia.ColorSetARGB(255, 255, 214, 70),   # Neon Gold
+                    skia.ColorSetARGB(255, 184, 255, 1),    # Electric Lime
+                    skia.ColorSetARGB(255, 232, 255, 128),  # Luminous Lime Highlight
+                ]
+            )
+            glow_sh_c = (
+                skia.ColorSetARGB(185, 255, 209, 102)
+                if use_dark_pal
+                else skia.ColorSetARGB(185, 184, 255, 1)
+            )
             grad_p = skia.Paint(AntiAlias=True)
             grad_p.setShader(
                 skia.GradientShader.MakeLinear(
                     points=[(-tw * 0.5, -ascent), (tw * 0.5, descent * 0.4)],
-                    colors=[
-                        skia.ColorSetARGB(255, 255, 214, 70),   # Neon Gold
-                        skia.ColorSetARGB(255, 184, 255, 1),    # Electric Lime
-                        skia.ColorSetARGB(255, 232, 255, 128),  # Luminous Lime Highlight
-                    ],
+                    colors=wipe_colors,
                     positions=[0.0, 0.60, 1.0],
                 )
             )
             if tok["active"]:
                 grad_p.setImageFilter(
-                    skia.ImageFilters.DropShadow(0.0, 0.0, 8.0, 8.0, skia.ColorSetARGB(185, 184, 255, 1))
+                    skia.ImageFilters.DropShadow(0.0, 0.0, 8.0, 8.0, glow_sh_c)
                 )
             canvas.drawString(tok["text"], -tw * 0.5, 0.0, tok["font"], grad_p)
             canvas.restore()
@@ -856,14 +931,19 @@ def _render_karaoke_glow(
                 bar_w = max(8.0, tw * fill_prog)
                 bar_rect = skia.Rect.MakeXYWH(-tw * 0.5, bar_y, bar_w, max(4.5, base_size * 0.065))
                 bar_p = skia.Paint(AntiAlias=True)
+                bar_end_c = (
+                    skia.ColorSetARGB(255, 185, 28, 38)
+                    if use_dark_pal
+                    else skia.ColorSetARGB(255, 184, 255, 1)
+                )
                 bar_p.setShader(
                     skia.GradientShader.MakeLinear(
                         points=[(-tw * 0.5, bar_y), (-tw * 0.5 + bar_w, bar_y)],
-                        colors=[skia.ColorSetARGB(255, 255, 209, 102), skia.ColorSetARGB(255, 184, 255, 1)],
+                        colors=[skia.ColorSetARGB(255, 255, 209, 102), bar_end_c],
                     )
                 )
                 bar_p.setImageFilter(
-                    skia.ImageFilters.DropShadow(0.0, 0.0, 10.0, 10.0, skia.ColorSetARGB(200, 184, 255, 1))
+                    skia.ImageFilters.DropShadow(0.0, 0.0, 10.0, 10.0, glow_sh_c)
                 )
                 canvas.drawRoundRect(bar_rect, 4.0, 4.0, bar_p)
 
@@ -925,7 +1005,8 @@ def _render_word_slam(
     max_w = float(w) * 0.84
     base_fit = min(1.0, max_w / (tw * 1.48 + slam_size * 0.25))
 
-    # Alternate metallic 3D gradients: Gold Chrome (#FFFFFF->#FFD166) & Neon Rose Chrome (#FFFFFF->#FF2E93)
+    # Alternate metallic 3D gradients: Gold Chrome & Crimson/Amber (dark-cinema) or Rose/Lime (neon)
+    use_dark_pal = not _is_default_neon_palette(palette)
     variant = tok["g_idx"] % 3
     if variant == 0:
         # Gold Metallic Chrome
@@ -938,25 +1019,47 @@ def _render_word_slam(
         extrude_color = skia.ColorSetARGB(alpha, 56, 32, 6)
         impact_rgb = (255, 209, 102)
     elif variant == 1:
-        # Neon Rose Metallic Chrome
-        grad_colors = [
-            skia.ColorSetARGB(alpha, 255, 255, 255),
-            skia.ColorSetARGB(alpha, 255, 214, 236),
-            skia.ColorSetARGB(alpha, 255, 46, 147),
-            skia.ColorSetARGB(alpha, 178, 16, 94),
-        ]
-        extrude_color = skia.ColorSetARGB(alpha, 52, 8, 34)
-        impact_rgb = (255, 46, 147)
+        if use_dark_pal:
+            # Blood Crimson Metallic Chrome
+            grad_colors = [
+                skia.ColorSetARGB(alpha, 255, 255, 255),
+                skia.ColorSetARGB(alpha, 255, 210, 214),
+                skia.ColorSetARGB(alpha, 185, 28, 38),
+                skia.ColorSetARGB(alpha, 120, 14, 22),
+            ]
+            extrude_color = skia.ColorSetARGB(alpha, 46, 6, 10)
+            impact_rgb = (185, 28, 38)
+        else:
+            # Neon Rose Metallic Chrome
+            grad_colors = [
+                skia.ColorSetARGB(alpha, 255, 255, 255),
+                skia.ColorSetARGB(alpha, 255, 214, 236),
+                skia.ColorSetARGB(alpha, 255, 46, 147),
+                skia.ColorSetARGB(alpha, 178, 16, 94),
+            ]
+            extrude_color = skia.ColorSetARGB(alpha, 52, 8, 34)
+            impact_rgb = (255, 46, 147)
     else:
-        # Electric Lime Metallic Chrome
-        grad_colors = [
-            skia.ColorSetARGB(alpha, 255, 255, 255),
-            skia.ColorSetARGB(alpha, 236, 255, 184),
-            skia.ColorSetARGB(alpha, 184, 255, 1),
-            skia.ColorSetARGB(alpha, 106, 176, 0),
-        ]
-        extrude_color = skia.ColorSetARGB(alpha, 20, 42, 4)
-        impact_rgb = (184, 255, 1)
+        if use_dark_pal:
+            # Torch Amber Metallic Chrome
+            grad_colors = [
+                skia.ColorSetARGB(alpha, 255, 255, 255),
+                skia.ColorSetARGB(alpha, 255, 230, 184),
+                skia.ColorSetARGB(alpha, 217, 119, 6),
+                skia.ColorSetARGB(alpha, 146, 64, 14),
+            ]
+            extrude_color = skia.ColorSetARGB(alpha, 48, 22, 4)
+            impact_rgb = (225, 125, 18)
+        else:
+            # Electric Lime Metallic Chrome
+            grad_colors = [
+                skia.ColorSetARGB(alpha, 255, 255, 255),
+                skia.ColorSetARGB(alpha, 236, 255, 184),
+                skia.ColorSetARGB(alpha, 184, 255, 1),
+                skia.ColorSetARGB(alpha, 106, 176, 0),
+            ]
+            extrude_color = skia.ColorSetARGB(alpha, 20, 42, 4)
+            impact_rgb = (184, 255, 1)
 
     canvas.save()
     canvas.translate(float(w) * 0.5 + shake_x, cy + shake_y)
@@ -1331,7 +1434,7 @@ def _render_typewriter_highlight(
 # ---------------------------------------------------------------------------
 def draw_kinetic_captions(
     canvas: skia.Canvas,
-    chunks: List[Dict[str, Any]],
+    chunks: Any,
     t: float,
     w: int,
     h: int,
@@ -1340,24 +1443,31 @@ def draw_kinetic_captions(
     y_ratio: float = 0.84,
     font_size: Optional[float] = None,
     palette: Optional[List[Tuple[str, str, Tuple[int, int, int, int]]]] = None,
+    mood: str = "",
+    caption_style: Optional[str] = None,
 ) -> None:
     """Render studio-grade frame-by-frame kinetic captions onto any Skia Canvas.
 
     Supports 5 animated presets (`hormozi_neon`, `karaoke_glow`, `word_slam`,
-    `cinema_minimal`, `typewriter_highlight`) plus `none`, smoothly across 30fps/60fps
-    and all aspect ratios (9:16, 16:9, 4:5, 1:1).
+    `cinema_minimal`, `typewriter_highlight`) plus `dark_cinema` and `none`, smoothly
+    across 30fps/60fps and all aspect ratios (9:16, 16:9, 4:5, 1:1).
+    Automatically selects `DARK_CINEMA_PILL_PALETTE` (Blood Crimson `#9E1B24`,
+    Antique Gold `#FFD166`, Torch Amber `#D97706`) whenever `mood` is dark/historical/investigative
+    or `style`/`caption_style` is `'dark_cinema'`.
     """
-    resolved_style = resolve_caption_style(style)
+    raw_style = caption_style if caption_style is not None else style
+    resolved_style = resolve_caption_style(raw_style)
     if resolved_style == "none" or not chunks or w <= 0 or h <= 0:
         return
 
-    chunk, chunk_idx = _find_active_chunk(chunks, float(t))
+    chunk_list: List[Dict[str, Any]] = [chunks] if isinstance(chunks, dict) else list(chunks)
+    chunk, chunk_idx = _find_active_chunk(chunk_list, float(t))
     if chunk is None:
         return
 
     cy = float(h) * max(0.12, min(0.94, float(y_ratio)))
     base_size = _resolve_base_font_size(int(w), int(h), resolved_style, font_size)
-    pal = palette if (palette and len(palette) > 0) else DEFAULT_CAPTION_PALETTE
+    pal = resolve_caption_palette(palette=palette, mood=mood, style=raw_style)
 
     if resolved_style == "karaoke_glow":
         _render_karaoke_glow(canvas, chunk, chunk_idx, float(t), int(w), int(h), typeface, cy, base_size, pal)
@@ -1369,3 +1479,7 @@ def draw_kinetic_captions(
         _render_typewriter_highlight(canvas, chunk, chunk_idx, float(t), int(w), int(h), typeface, cy, base_size, pal)
     else:
         _render_hormozi_neon(canvas, chunk, chunk_idx, float(t), int(w), int(h), typeface, cy, base_size, pal)
+
+
+# Alias for single-chunk / cross-module callers
+draw_kinetic_caption_chunk = draw_kinetic_captions

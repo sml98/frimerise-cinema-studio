@@ -31,7 +31,7 @@ SFX_DIR = ASSETS_DIR / "sfx"
 MUSIC_DIR = ASSETS_DIR / "music"
 
 SR = 48000
-PRO_SFX_VERSION = "pro_cinema_sfx_v3"
+PRO_SFX_VERSION = "pro_cinema_sfx_v6"
 VERSION_STAMP_FILE = SFX_DIR / ".pro_cinema_sfx_version.json"
 
 ALL_SFX_NAMES: Tuple[str, ...] = (
@@ -462,7 +462,7 @@ def synth_cinematic_hit() -> np.ndarray:
 
 
 def synth_whoosh_fast() -> np.ndarray:
-    """Realistic Premiere/DaVinci wind-whip transition swoosh (L->R panned bandpass pink noise + Doppler sub)."""
+    """Realistic Premiere/DaVinci wind-whip transition swoosh (L->R panned bandpass pink noise + mid-formant whip + Doppler sub)."""
     rng = _rng(4001)
     dur = 0.64
     n = int(dur * SR)
@@ -476,26 +476,32 @@ def synth_whoosh_fast() -> np.ndarray:
         np.exp(-((t - peak_t) / 0.175) ** 2),
     )
 
-    # Bandpass frequency sweep peaking right at the whip apex
+    # Bandpass frequency sweep peaking right at the whip apex with strong 300-2,600 Hz mid presence
     f_band = 240.0 + 3400.0 * (env ** 1.35)
+    f_mid = 360.0 + 1850.0 * (env ** 1.15)
     f_air = 1200.0 + 5200.0 * (env ** 1.6)
     pink1 = _pink_noise(n, rng)
     pink2 = _pink_noise(n, rng)
-    wind_core = _resonant_filter_sweep(pink1, f_band, q_curve=1.9, mode="bandpass") * env
-    wind_air = _resonant_filter_sweep(pink2, f_air, q_curve=1.3, mode="bandpass") * (env ** 1.4) * 0.55
+    pink3 = _pink_noise(n, rng)
+    wind_core = _resonant_filter_sweep(pink1, f_band, q_curve=1.8, mode="bandpass") * env
+    wind_mid = _resonant_filter_sweep(pink3, f_mid, q_curve=1.35, mode="bandpass") * (env ** 1.1) * 0.85
+    wind_air = _resonant_filter_sweep(pink2, f_air, q_curve=1.3, mode="bandpass") * (env ** 1.4) * 0.62
 
-    # Doppler LFE air-pressure body
-    f_doppler = 48.0 + 95.0 * env
-    doppler = np.sin(2.0 * math.pi * np.cumsum(f_doppler) / SR) * (env ** 1.3) * 0.62
+    # Doppler LFE + low-mid punch transit (62Hz -> 148Hz)
+    f_doppler = 62.0 + 88.0 * env
+    doppler = _soft_saturate(
+        np.sin(2.0 * math.pi * np.cumsum(f_doppler) / SR) * (env ** 1.25),
+        drive=1.6,
+    ) * 0.68
 
     # Smooth L -> R stereo fly-by pan
     pan_curve = np.tanh((t - peak_t) * 6.5) * 0.82
-    st_core = _stereo_pan(wind_core * 1.15 + doppler, pan_curve)
+    st_core = _stereo_pan(wind_core * 1.18 + wind_mid + doppler, pan_curve)
     st_air = _stereo_pan(wind_air, pan_curve * 0.95)
     dry = st_core + st_air
 
     wet = _dark_hall_reverb(dry, decay_s=0.65, predelay_ms=8.0, damp_hz=3800.0, mix=0.25, seed=4002)
-    return _master_stereo(wet, target_peak_db=-0.8, fade_in_ms=6.0, fade_out_ms=35.0, bus_drive=1.35)
+    return _master_stereo(wet, target_peak_db=-0.6, fade_in_ms=5.0, fade_out_ms=35.0, bus_drive=1.52)
 
 
 def synth_whoosh_deep() -> np.ndarray:
@@ -589,32 +595,35 @@ def synth_riser_tension() -> np.ndarray:
 
 
 def synth_paper_flip() -> np.ndarray:
-    """Crisp archival newspaper / dossier page snap & rustle."""
+    """Crisp archival newspaper / dossier page snap, parchment rustle & felt-tip pen/marker highlighter stroke."""
     rng = _rng(7001)
-    dur = 0.38
+    dur = 0.46
     n = int(dur * SR)
     t = np.arange(n, dtype=np.float64) / SR
 
-    # Stage 1: Finger-lift initial friction rustle (0 - 95ms)
-    e1 = np.exp(-((t - 0.048) / 0.032) ** 2)
-    rustle1 = _butter(_white_noise(n, rng), (1800.0, 8500.0), "bandpass", order=3) * e1 * 0.55
+    # Stage 1: Heavy parchment lift & initial friction rustle (0 - 95ms)
+    e1 = np.exp(-((t - 0.046) / 0.034) ** 2)
+    rustle1 = _butter(_white_noise(n, rng), (1500.0, 8200.0), "bandpass", order=3) * e1 * 0.72
 
-    # Stage 2: Crisp page turn snap crack (at 108ms)
-    dt2 = np.maximum(0.0, t - 0.098)
-    e2 = np.where(t >= 0.098, (1.0 - np.exp(-dt2 / 0.0025)) * np.exp(-dt2 / 0.032), 0.0)
-    snap = _butter(_white_noise(n, rng), (950.0, 6800.0), "bandpass", order=3) * e2 * 1.35
-    # Paper body flex resonant thump (280Hz - 750Hz)
-    flex = _butter(_pink_noise(n, rng), (260.0, 1200.0), "bandpass", order=2) * e2 * 0.85
+    # Stage 2: Crisp archival page snap crack + warm paper flex (at 95ms)
+    dt2 = np.maximum(0.0, t - 0.092)
+    e2 = np.where(t >= 0.092, (1.0 - np.exp(-dt2 / 0.0022)) * np.exp(-dt2 / 0.036), 0.0)
+    snap = _butter(_white_noise(n, rng), (850.0, 6800.0), "bandpass", order=3) * e2 * 1.45
+    flex = _butter(_pink_noise(n, rng), (240.0, 1350.0), "bandpass", order=2) * e2 * 1.05
 
-    # Stage 3: Page settle flutter (145ms - 310ms)
-    e3 = np.exp(-((t - 0.205) / 0.068) ** 2) * (0.65 + 0.35 * np.sin(2.0 * math.pi * 29.0 * t))
-    settle = _butter(_white_noise(n, rng), (1400.0, 5600.0), "bandpass", order=2) * e3 * 0.45
+    # Stage 3: Tactile archival felt-tip pen / marker highlighter stroke glide across paper grain (145ms - 385ms)
+    dt_m = np.maximum(0.0, t - 0.145)
+    m_win = np.where((t >= 0.145) & (t <= 0.395), np.sin(np.pi * np.clip((t - 0.145) / 0.250, 0.0, 1.0)) ** 0.75, 0.0)
+    grain_mod = 0.72 + 0.28 * np.sin(2.0 * math.pi * 64.0 * dt_m + 1.2 * np.sin(2.0 * math.pi * 17.0 * dt_m))
+    f_marker = 1450.0 + 1650.0 * np.clip((t - 0.145) / 0.250, 0.0, 1.0)
+    marker_core = _resonant_filter_sweep(_pink_noise(n, rng), f_marker, q_curve=2.2, mode="bandpass") * m_win * grain_mod * 1.15
+    marker_nib = _butter(_white_noise(n, rng), (2600.0, 7600.0), "bandpass", order=2) * m_win * grain_mod * 0.68
 
-    # Slight L -> R spatial page turn sweep
-    pan = np.clip((t - 0.14) * 3.5, -0.55, 0.55)
-    dry = _stereo_pan(rustle1 + snap + flex + settle, pan)
-    wet = _dark_hall_reverb(dry, decay_s=0.35, predelay_ms=6.0, damp_hz=4500.0, mix=0.14, seed=7002)
-    return _master_stereo(wet, target_peak_db=-0.9, fade_in_ms=2.0, fade_out_ms=25.0, bus_drive=1.25)
+    # Slight L -> R spatial page & marker sweep
+    pan = np.clip((t - 0.18) * 3.2, -0.58, 0.58)
+    dry = _stereo_pan(rustle1 + snap + flex + marker_core + marker_nib, pan)
+    wet = _dark_hall_reverb(dry, decay_s=0.38, predelay_ms=6.0, damp_hz=4600.0, mix=0.16, seed=7002)
+    return _master_stereo(wet, target_peak_db=-0.7, fade_in_ms=1.5, fade_out_ms=25.0, bus_drive=1.48)
 
 
 def synth_flash_impact() -> np.ndarray:
@@ -809,18 +818,32 @@ def synth_typing_tick() -> np.ndarray:
 
 
 def synth_ui_click() -> np.ndarray:
-    """Sleek modern documentary HUD / dossier pin tactile click."""
+    """Precision mechanical chronometer / odometer escapement tick & dossier pin lock."""
     rng = _rng(15001)
-    dur = 0.11
+    dur = 0.16
     n = int(dur * SR)
     t = np.arange(n, dtype=np.float64) / SR
 
-    # Tactile woodblock-like ping + crisp micro-transient
-    f = 780.0 + 620.0 * np.exp(-t / 0.005)
-    ping = np.sin(2.0 * math.pi * np.cumsum(f) / SR) * np.exp(-t / 0.015)
-    tick = _butter(_white_noise(n, rng), (2600.0, 9500.0), "bandpass", order=2) * np.exp(-t / 0.004) * 0.65
-    dry = _to_stereo(ping * 0.95 + tick, delay_ms=0.3, side_gain=0.16)
-    return _master_stereo(dry, target_peak_db=-0.9, fade_in_ms=0.4, fade_out_ms=12.0, bus_drive=1.25)
+    # Stage 1: Primary brass chronometer escapement strike (t = 0.001s)
+    f1 = 840.0 + 780.0 * np.exp(-t / 0.0055)
+    ping1 = (
+        np.sin(2.0 * math.pi * np.cumsum(f1) / SR) * np.exp(-t / 0.019)
+        + 0.48 * np.sin(2.0 * math.pi * 2380.0 * t) * np.exp(-t / 0.011)
+        + 0.55 * np.sin(2.0 * math.pi * 390.0 * t) * np.exp(-t / 0.022)
+    )
+    tick1 = _butter(_white_noise(n, rng), (2100.0, 9600.0), "bandpass", order=2) * np.exp(-t / 0.0045) * 0.85
+
+    # Stage 2: Secondary chronometer ratchet gear catch (t = 0.044s)
+    dt2 = np.maximum(0.0, t - 0.044)
+    m2 = (t >= 0.044).astype(np.float64)
+    ping2 = m2 * (
+        0.52 * np.sin(2.0 * math.pi * 1480.0 * dt2) * np.exp(-dt2 / 0.013)
+        + 0.34 * np.sin(2.0 * math.pi * 3120.0 * dt2) * np.exp(-dt2 / 0.008)
+    )
+    tick2 = m2 * _butter(_white_noise(n, rng), (2600.0, 10200.0), "bandpass", order=2) * np.exp(-dt2 / 0.0035) * 0.48
+
+    dry = _to_stereo(ping1 * 0.98 + tick1 + ping2 + tick2, delay_ms=0.35, side_gain=0.18)
+    return _master_stereo(dry, target_peak_db=-0.7, fade_in_ms=0.4, fade_out_ms=14.0, bus_drive=1.45)
 
 
 _SFX_BUILDERS = {
@@ -850,14 +873,28 @@ def synthesize_dark_mystery_horror_music(
     duration_s: float = 45.0,
     thermal_limit_c: float = 85.0,
 ) -> Path:
-    """Synthesize a seamless 45s dark ambient mystery/horror cinema music bed:
-    - Deep bowed cello/contrabass drone evolving across D minor / Phrygian harmony
-    - Haunting sparse minor piano / celesta-bell motifs with cathedral decay
-    - Subtle dark tension sub-pulse (68 BPM) + eerie air texture
-    - Equal-power seamless loop splice + FFmpeg broadcast stereo 48kHz MP3 master.
+    """Synthesize a seamless 45s Netflix/A24 dark mystery/horror cinema music bed (-16.0 LUFS)
+    with rich 250-2,200 Hz mid-range presence:
+    - Tense bowed Cello & Viola Ostinato in D Minor (66 BPM: D3 146.8Hz, F3 174.6Hz, A3 220Hz, Bb3 233.1Hz, G#3 207.6Hz)
+    - Haunting Macabre Music-Box / Celesta & Minor Piano motifs (D5 587Hz, F5 698Hz, A5 880Hz, Bb5 932Hz, G#5 830Hz, E5 659Hz)
+    - Distant Cathedral Tubular Bells (D4 293.7Hz + inharmonic bell partials) + deep heartbeat sub-pulse (55-90Hz).
     """
     out_mp3 = Path(out_mp3)
     out_mp3.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from engine.flow_vault import _synthesize_procedural_track
+
+        meta = _synthesize_procedural_track(
+            out_mp3=out_mp3,
+            mood_raw="dark_horror_cinema",
+            profile_key="dark_horror_cinema",
+            duration_s=duration_s,
+        )
+        res_p = Path(meta["path"])
+        if res_p.exists() and res_p.stat().st_size > 4096:
+            return res_p
+    except Exception:
+        pass
     rng = _rng(77001)
 
     xfade_s = 3.0
