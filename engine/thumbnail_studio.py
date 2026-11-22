@@ -261,12 +261,50 @@ def _refine_soft_alpha_matte(raw_mask: np.ndarray) -> np.ndarray:
     return feathered
 
 
+def _evaluate_mask_organic_portrait(alpha_f: np.ndarray) -> Tuple[bool, float, float]:
+    """Check if a refined u2netp alpha mask [0..1] is a clean organic portrait/character silhouette
+    rather than a boxy/rectangular architectural cutout (like a wooden door, window, or sign).
+
+    A rectangular wooden door fills > 0.85 of its bounding box; organic human/character portraits
+    have non-rectangular fill_ratio < 0.82 and reasonable portrait/bust aspect ratio.
+    Returns `(is_organic_portrait, fill_ratio, bbox_aspect)`.
+    """
+    bin_m = (alpha_f > 0.38).astype(np.uint8)
+    ys, xs = np.where(bin_m > 0)
+    if len(xs) < 400:
+        return False, 1.0, 1.0
+    tight_bw = int(np.max(xs) - np.min(xs) + 1)
+    tight_bh = int(np.max(ys) - np.min(ys) + 1)
+    if tight_bw <= 8 or tight_bh <= 8:
+        return False, 1.0, 1.0
+    bbox_aspect = float(tight_bw) / float(max(1, tight_bh))
+    tight_fill = float(len(xs)) / float(max(1, tight_bw * tight_bh))
+
+    min_rect_fill = tight_fill
+    try:
+        cnts, _ = cv2.findContours(bin_m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cnts:
+            max_c = max(cnts, key=cv2.contourArea)
+            c_area = float(cv2.contourArea(max_c))
+            rect = cv2.minAreaRect(max_c)
+            r_area = float(rect[1][0] * rect[1][1])
+            if r_area > 64.0:
+                min_rect_fill = c_area / r_area
+    except Exception:
+        pass
+
+    fill_ratio = max(tight_fill, min_rect_fill)
+    is_organic_portrait = (fill_ratio < 0.82) and (0.28 <= bbox_aspect <= 1.85)
+    return is_organic_portrait, fill_ratio, bbox_aspect
+
+
 def _cutout_subject_u2netp(
     frame_or_bgr: Union[Path, np.ndarray],
     out_cutout_png: Optional[Path] = None,
 ) -> Tuple[Optional[np.ndarray], float, Dict[str, Any]]:
     """Isolate foreground subject with u2netp + soft-feathered matte, edge decontamination,
     and organic border dissolves so it composites like a studio movie poster (ZERO jagged artifacts).
+    Rejects boxy/rectangular door/window cutouts (`fill_ratio >= 0.82`).
     Returns `(bgra_cropped_uint8, coverage_ratio, meta_dict)`.
     """
     if isinstance(frame_or_bgr, np.ndarray):
@@ -287,6 +325,16 @@ def _cutout_subject_u2netp(
     if len(xs) < 600 or cov < 0.04 or cov > 0.92:
         return None, cov, {}
 
+    is_organic_portrait, fill_ratio, bbox_aspect = _evaluate_mask_organic_portrait(alpha_f)
+    base_meta: Dict[str, Any] = {
+        "fill_ratio": round(fill_ratio, 4),
+        "bbox_aspect": round(bbox_aspect, 4),
+        "is_organic_portrait": bool(is_organic_portrait),
+        "coverage": cov,
+    }
+    if not is_organic_portrait or fill_ratio >= 0.82:
+        return None, cov, base_meta
+
     # Reject fragmented multi-blob architectural/landscape masks so thumb_B never floats chopped rooflines
     bin_m = (alpha_f > 0.45).astype(np.uint8)
     n_cc, _, cc_stats, _ = cv2.connectedComponentsWithStats(bin_m, connectivity=8)
@@ -295,7 +343,7 @@ def _cutout_subject_u2netp(
         total_cc = float(np.sum(cc_areas))
         largest_cc = float(np.max(cc_areas)) if len(cc_areas) > 0 else 0.0
         if total_cc > 0 and (largest_cc / total_cc) < 0.72:
-            return None, cov, {}
+            return None, cov, base_meta
 
     pad = max(14, int(round(min(h, w) * 0.02)))
     x0 = max(0, int(np.min(xs)) - pad)
@@ -357,6 +405,9 @@ def _cutout_subject_u2netp(
         "touches_top": touches_top,
         "touches_bottom": touches_bottom,
         "coverage": cov,
+        "fill_ratio": round(fill_ratio, 4),
+        "bbox_aspect": round(bbox_aspect, 4),
+        "is_organic_portrait": bool(is_organic_portrait),
     }
     return bgra, cov, meta
 
@@ -971,15 +1022,15 @@ def _acquire_hero_assets(
         except Exception as exc:
             print(f"[ThumbStudio] Editorial photo fallback notice: {exc}", flush=True)
 
-    # 2b. Harvest distinct existing cinema hero stills from _work/ (photo_thumb_hero_*, flow_*.jpg, photo_*.jpg)
-    # whenever fewer than 3 distinct heroes were acquired, so thumb_A / thumb_B / thumb_C ALWAYS stay distinct!
-    if len(assets) < 3 and work_dir.exists():
+    # 2b. Harvest distinct existing cinema hero stills from _work/ (flow_*.jpg, photo_thumb_hero_*, photo_*.jpg)
+    # up to 5 candidates so _select_hero_roles can reject any boxy door/window stock cutout in favor of bespoke plates!
+    if len(assets) < 5 and work_dir.exists():
         existing_sigs = {
             hashlib.md5(cv2.resize(existing_bgr, (32, 18)).tobytes()).hexdigest()
             for _, existing_bgr, _ in assets
         }
         work_photo_cands: List[Path] = []
-        for pat in ("photo_thumb_hero_*.jpg", "flow_*.jpg", "photo_*.jpg"):
+        for pat in ("flow_*_shot00.jpg", "photo_thumb_hero_*.jpg", "flow_*.jpg", "photo_*.jpg"):
             for cand_p in sorted(work_dir.glob(pat)):
                 if cand_p.is_file() and cand_p.stat().st_size > 8_000 and cand_p not in work_photo_cands:
                     work_photo_cands.append(cand_p)
@@ -992,11 +1043,11 @@ def _acquire_hero_assets(
             if h_sig in existing_sigs:
                 continue
             existing_sigs.add(h_sig)
-            is_landscape = 1 if bgr_w.shape[1] >= bgr_w.shape[0] else 0
-            scored_work.append((is_landscape, _score_cinema_drama_bgr(bgr_w), cand_p, bgr_w, f"work_photo:{cand_p.name}"))
+            is_flow_or_landscape = 1 if (cand_p.name.startswith("flow_") or bgr_w.shape[1] >= bgr_w.shape[0]) else 0
+            scored_work.append((is_flow_or_landscape, _score_cinema_drama_bgr(bgr_w), cand_p, bgr_w, f"work_photo:{cand_p.name}"))
         scored_work.sort(key=lambda item: (item[0], item[1]), reverse=True)
         for _, _, cand_p, bgr_w, src_lbl in scored_work:
-            if len(assets) >= 3:
+            if len(assets) >= 5:
                 break
             assets.append((cand_p, bgr_w, src_lbl))
             if "work_photo" not in sources_used:
@@ -1728,13 +1779,22 @@ def _select_hero_roles(
         drama_score = _score_cinema_drama_bgr(bgr)
         focal = _detect_focal_point(bgr, mask=mask)
 
-        # Evaluate cutout suitability (clean prominent foreground silhouette covering 10%..74% of frame)
+        # Evaluate cutout suitability (clean prominent organic portrait silhouette covering 8%..78% of frame,
+        # strictly rejecting boxy/rectangular wooden doors or windows with fill_ratio >= 0.82!)
         cutout_bgra, cov, cut_meta = _cutout_subject_u2netp(
             bgr,
             out_cutout_png=work_dir / f"_thumb_cutout_cand_{idx}.png",
         )
+        fill_ratio = float(cut_meta.get("fill_ratio", 0.0) or 0.0)
+        is_organic = bool(cut_meta.get("is_organic_portrait", cutout_bgra is not None)) and (fill_ratio < 0.82)
+        if not is_organic:
+            cutout_bgra = None
+            # Penalize boxy door/window prop images so organic environmental scenes win role selection
+            if fill_ratio >= 0.82:
+                drama_score *= 0.35
+
         cutout_score = -1.0
-        if cutout_bgra is not None and 0.08 <= cov <= 0.78:
+        if cutout_bgra is not None and is_organic and 0.08 <= cov <= 0.78:
             # Ideal foreground coverage sits around 0.30..0.55
             cov_fit = 1.0 - min(1.0, abs(cov - 0.40) / 0.42)
             # Prefer portraits/figures not heavily chopped on all 4 sides
@@ -1742,7 +1802,8 @@ def _select_hero_roles(
                 1 for k in ("touches_left", "touches_right", "touches_top", "touches_bottom") if cut_meta.get(k)
             )
             edge_bonus = 1.0 if edge_touches <= 2 else (0.78 if edge_touches == 3 else 0.55)
-            cutout_score = drama_score * (0.65 + 0.55 * cov_fit) * edge_bonus
+            organic_bonus = 1.12 if fill_ratio < 0.76 else 1.0
+            cutout_score = drama_score * (0.65 + 0.55 * cov_fit) * edge_bonus * organic_bonus
 
         analyzed.append({
             "idx": idx,
@@ -1755,6 +1816,8 @@ def _select_hero_roles(
             "cutout_meta": cut_meta,
             "cutout_cov": cov,
             "cutout_score": cutout_score,
+            "is_organic_portrait": is_organic,
+            "fill_ratio": fill_ratio,
         })
 
     # Variant A (Dark Cinema / Editorial Mystery): strongly prefer idx=0 (our primary art-directed iconic
@@ -1944,166 +2007,190 @@ def generate_ab_thumbnails_16x9(
     cb = surf_b.getCanvas()
     cb.clear(hex_to_skia("#061017"))
 
-    # 1. Deeply blurred atmospheric photographic texture layer for rich studio backdrop depth
-    bg_b_src = roles["b_bg"]
-    bg_b_graded = _cinema_grade_bgr(bg_b_src["bgr"], style="mystery", mood=mood)
-    bg_b_cover = _compose_focal_canvas_bgr(
-        bg_b_graded,
-        target_w=W,
-        target_h=H,
-        src_focal=(0.5, 0.5),
-        dst_focal=(0.5, 0.5),
-        zoom=1.10,
-        allow_left_mist_extend=False,
-    )
-    bg_b_blur = cv2.GaussianBlur(bg_b_cover, (0, 0), sigmaX=20.0, sigmaY=20.0)
-    bg_b_dark = (bg_b_blur.astype(np.float32) * 0.42).astype(np.uint8)
-    cb.drawImageRect(_bgr_to_skia_image(bg_b_dark), skia.Rect.MakeWH(W, H), skia.SamplingOptions(skia.FilterMode.kLinear))
-
-    # 2. Cold-teal (left) vs. Warm-amber/crimson (right) split studio atmospheric lighting
-    cold_r, cold_g, cold_b = pal["b_cold_rgb"]
-    warm_r, warm_g, warm_b = pal["b_warm_rgb"]
-    split_base = skia.Paint(AntiAlias=True)
-    split_base.setShader(
-        skia.GradientShader.MakeLinear(
-            [(0.0, H * 0.15), (W, H * 0.85)],
-            [
-                skia.ColorSetARGB(215, cold_r, cold_g, cold_b),
-                skia.ColorSetARGB(195, 7, 13, 20),
-                skia.ColorSetARGB(198, warm_r, warm_g, warm_b),
-            ],
-            [0.0, 0.48, 1.0],
-        )
-    )
-    cb.drawRect(skia.Rect.MakeWH(W, H), split_base)
-
-    # Volumetric studio radial washes (cool cyan-teal mist left + fiery crimson/amber backlight right)
-    cool_wash = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
-    cool_wash.setShader(
-        skia.GradientShader.MakeRadial(
-            (W * 0.16, H * 0.34),
-            W * 0.48,
-            [
-                skia.ColorSetARGB(95, pal["b_rim_cold_rgb"][0], pal["b_rim_cold_rgb"][1], pal["b_rim_cold_rgb"][2]),
-                skia.ColorSetARGB(0, pal["b_rim_cold_rgb"][0], pal["b_rim_cold_rgb"][1], pal["b_rim_cold_rgb"][2]),
-            ],
-        )
-    )
-    cb.drawRect(skia.Rect.MakeWH(W, H), cool_wash)
-
-    warm_wash = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
-    warm_wash.setShader(
-        skia.GradientShader.MakeRadial(
-            (W * 0.78, H * 0.48),
-            W * 0.46,
-            [
-                skia.ColorSetARGB(135, pal["b_rim_outer_rgb"][0], pal["b_rim_outer_rgb"][1], pal["b_rim_outer_rgb"][2]),
-                skia.ColorSetARGB(65, pal["b_rim_warm_rgb"][0], pal["b_rim_warm_rgb"][1], pal["b_rim_warm_rgb"][2]),
-                skia.ColorSetARGB(0, pal["b_rim_outer_rgb"][0], pal["b_rim_outer_rgb"][1], pal["b_rim_outer_rgb"][2]),
-            ],
-            [0.0, 0.48, 1.0],
-        )
-    )
-    cb.drawRect(skia.Rect.MakeWH(W, H), warm_wash)
-
-    # 3. Shallow depth-of-field bokeh lights behind the subject
-    _draw_cinema_bokeh_lights(cb, W, H, pal["b_rim_warm_rgb"], pal["b_rim_cold_rgb"], seed=seed_base + 2)
-
-    # 4. u2netp isolated foreground hero subject with soft feathered rim-light halo
     subj_info = roles["b_subject"]
     cutout_bgra = subj_info["cutout_bgra"]
-    cut_meta = subj_info["cutout_meta"]
-    if cutout_bgra is None:
-        cutout_bgra, cut_meta = _fallback_feathered_vignette_cutout(subj_info["bgr"])
+    cut_meta = subj_info["cutout_meta"] or {}
+    b_fill_ratio = float(cut_meta.get("fill_ratio", subj_info.get("fill_ratio", 0.0)) or 0.0)
+    b_is_organic = (
+        cutout_bgra is not None
+        and bool(cut_meta.get("is_organic_portrait", subj_info.get("is_organic_portrait", True)))
+        and b_fill_ratio < 0.82
+    )
 
-    relit_bgra = _relight_cutout_bgra(cutout_bgra, mood=mood)
-    ch, cw = relit_bgra.shape[:2]
-    aspect = cw / max(1.0, float(ch))
+    cold_r, cold_g, cold_b = pal["b_cold_rgb"]
+    warm_r, warm_g, warm_b = pal["b_warm_rgb"]
 
-    # Scale hero subject generously for strong Netflix poster presence while preserving a clean
-    # breathing channel from the left headline. Wide horned/landscape subjects bleed subtly off
-    # the right frame edge so their head/eyes stay tall and commanding.
-    target_h = H * 0.92 if cut_meta.get("touches_bottom") else H * 0.86
-    target_w = target_h * aspect
-    max_subj_w = W * (0.58 if aspect > 1.18 else 0.50)
-    if target_w > max_subj_w:
-        target_w = max_subj_w
-        target_h = target_w / max(0.2, aspect)
-    elif target_w < W * 0.36:
-        target_w = min(W * 0.46, target_w * 1.15)
-        target_h = min(H * 0.94, target_w / max(0.2, aspect))
+    if b_is_organic and cutout_bgra is not None:
+        # 1. Grounded environmental photographic backdrop + split lighting
+        bg_b_src = roles["b_bg"]
+        bg_b_graded = _cinema_grade_bgr(bg_b_src["bgr"], style="mystery", mood=mood)
+        bg_b_cover = _compose_focal_canvas_bgr(
+            bg_b_graded,
+            target_w=W,
+            target_h=H,
+            src_focal=(0.5, 0.5),
+            dst_focal=(0.5, 0.5),
+            zoom=1.10,
+            allow_left_mist_extend=False,
+        )
+        bg_b_blur = cv2.GaussianBlur(bg_b_cover, (0, 0), sigmaX=12.0, sigmaY=12.0)
+        bg_b_dark = (bg_b_blur.astype(np.float32) * 0.54).astype(np.uint8)
+        cb.drawImageRect(_bgr_to_skia_image(bg_b_dark), skia.Rect.MakeWH(W, H), skia.SamplingOptions(skia.FilterMode.kLinear))
 
-    # Anchor cleanly to right & bottom borders for seamless grounded movie-poster presence
-    if cut_meta.get("touches_right") or aspect > 1.18:
-        sx = max(W * 0.47, W - target_w + 34.0)
+        # 2. Cold-teal (left) vs. Warm-amber/crimson (right) split studio atmospheric lighting
+        split_base = skia.Paint(AntiAlias=True)
+        split_base.setShader(
+            skia.GradientShader.MakeLinear(
+                [(0.0, H * 0.15), (W, H * 0.85)],
+                [
+                    skia.ColorSetARGB(195, cold_r, cold_g, cold_b),
+                    skia.ColorSetARGB(168, 7, 13, 20),
+                    skia.ColorSetARGB(182, warm_r, warm_g, warm_b),
+                ],
+                [0.0, 0.48, 1.0],
+            )
+        )
+        cb.drawRect(skia.Rect.MakeWH(W, H), split_base)
+
+        cool_wash = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+        cool_wash.setShader(
+            skia.GradientShader.MakeRadial(
+                (W * 0.16, H * 0.34),
+                W * 0.48,
+                [
+                    skia.ColorSetARGB(95, pal["b_rim_cold_rgb"][0], pal["b_rim_cold_rgb"][1], pal["b_rim_cold_rgb"][2]),
+                    skia.ColorSetARGB(0, pal["b_rim_cold_rgb"][0], pal["b_rim_cold_rgb"][1], pal["b_rim_cold_rgb"][2]),
+                ],
+            )
+        )
+        cb.drawRect(skia.Rect.MakeWH(W, H), cool_wash)
+
+        warm_wash = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+        warm_wash.setShader(
+            skia.GradientShader.MakeRadial(
+                (W * 0.78, H * 0.48),
+                W * 0.46,
+                [
+                    skia.ColorSetARGB(135, pal["b_rim_outer_rgb"][0], pal["b_rim_outer_rgb"][1], pal["b_rim_outer_rgb"][2]),
+                    skia.ColorSetARGB(65, pal["b_rim_warm_rgb"][0], pal["b_rim_warm_rgb"][1], pal["b_rim_warm_rgb"][2]),
+                    skia.ColorSetARGB(0, pal["b_rim_outer_rgb"][0], pal["b_rim_outer_rgb"][1], pal["b_rim_outer_rgb"][2]),
+                ],
+                [0.0, 0.48, 1.0],
+            )
+        )
+        cb.drawRect(skia.Rect.MakeWH(W, H), warm_wash)
+
+        # 3. Shallow depth-of-field bokeh lights behind the organic portrait subject
+        _draw_cinema_bokeh_lights(cb, W, H, pal["b_rim_warm_rgb"], pal["b_rim_cold_rgb"], seed=seed_base + 2)
+
+        # 4. u2netp isolated organic portrait silhouette with soft feathered rim-light halo
+        relit_bgra = _relight_cutout_bgra(cutout_bgra, mood=mood)
+        ch, cw = relit_bgra.shape[:2]
+        aspect = cw / max(1.0, float(ch))
+
+        target_h = H * 0.92 if cut_meta.get("touches_bottom") else H * 0.86
+        target_w = target_h * aspect
+        max_subj_w = W * (0.58 if aspect > 1.18 else 0.50)
+        if target_w > max_subj_w:
+            target_w = max_subj_w
+            target_h = target_w / max(0.2, aspect)
+        elif target_w < W * 0.36:
+            target_w = min(W * 0.46, target_w * 1.15)
+            target_h = min(H * 0.94, target_w / max(0.2, aspect))
+
+        if cut_meta.get("touches_right") or aspect > 1.18:
+            sx = max(W * 0.47, W - target_w + 34.0)
+        else:
+            sx = max(W * 0.50, W - target_w - 22.0)
+        sy = (H - target_h + 10.0) if cut_meta.get("touches_bottom") else max(28.0, (H - target_h) * 0.68)
+        dst_rect = skia.Rect.MakeXYWH(sx, sy, target_w, target_h)
+
+        sil_outer = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_outer_rgb"], side="right")
+        sil_warm = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_warm_rgb"], side="right")
+        sil_cold = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_cold_rgb"], side="left")
+        sil_shadow = _make_colored_silhouette_skia(relit_bgra, (4, 6, 10), side="full")
+
+        rim_outer_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+        rim_outer_p.setAlphaf(0.36)
+        rim_outer_p.setImageFilter(skia.ImageFilters.Blur(24.0, 24.0))
+        cb.drawImageRect(
+            sil_outer,
+            skia.Rect.MakeXYWH(sx + 6.0, sy - 4.0, target_w, target_h),
+            skia.SamplingOptions(skia.FilterMode.kLinear),
+            rim_outer_p,
+        )
+
+        rim_warm_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+        rim_warm_p.setAlphaf(0.42)
+        rim_warm_p.setImageFilter(skia.ImageFilters.Blur(6.0, 6.0))
+        cb.drawImageRect(
+            sil_warm,
+            skia.Rect.MakeXYWH(sx + 4.5, sy - 1.5, target_w, target_h),
+            skia.SamplingOptions(skia.FilterMode.kLinear),
+            rim_warm_p,
+        )
+
+        rim_cold_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+        rim_cold_p.setAlphaf(0.22)
+        rim_cold_p.setImageFilter(skia.ImageFilters.Blur(5.0, 5.0))
+        cb.drawImageRect(
+            sil_cold,
+            skia.Rect.MakeXYWH(sx - 3.5, sy - 1.0, target_w, target_h),
+            skia.SamplingOptions(skia.FilterMode.kLinear),
+            rim_cold_p,
+        )
+
+        ground_p = skia.Paint(AntiAlias=True)
+        ground_p.setAlphaf(0.55)
+        ground_p.setImageFilter(skia.ImageFilters.Blur(10.0, 10.0))
+        cb.drawImageRect(
+            sil_shadow,
+            skia.Rect.MakeXYWH(sx - 2.0, sy + 5.0, target_w, target_h),
+            skia.SamplingOptions(skia.FilterMode.kLinear),
+            ground_p,
+        )
+
+        subj_img = _bgra_to_skia_image(relit_bgra)
+        cb.drawImageRect(subj_img, dst_rect, skia.SamplingOptions(skia.FilterMode.kLinear))
     else:
-        sx = max(W * 0.50, W - target_w - 22.0)
-    sy = (H - target_h + 10.0) if cut_meta.get("touches_bottom") else max(28.0, (H - target_h) * 0.68)
-    dst_rect = skia.Rect.MakeXYWH(sx, sy, target_w, target_h)
+        # Full Environmental Dark-Cinema Photograph Mode (NEVER float a boxy wooden door/window cutout in empty space!)
+        graded_b_full = _cinema_grade_bgr(subj_info["bgr"], style="closeup", mood=mood)
+        composed_b_full = _compose_focal_canvas_bgr(
+            graded_b_full,
+            target_w=W,
+            target_h=H,
+            src_focal=subj_info["focal"],
+            dst_focal=(0.66, 0.45),
+            zoom=1.15,
+            allow_left_mist_extend=True,
+        )
+        cb.drawImageRect(_bgr_to_skia_image(composed_b_full), skia.Rect.MakeWH(W, H), skia.SamplingOptions(skia.FilterMode.kLinear))
 
-    # Physically separated directional rim-light contours BEHIND shoulders/head (ZERO chalky white halo!)
-    # Warm right-side rim & cool left-side rim are masked to opposite sides so they never additively clip white.
-    sil_outer = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_outer_rgb"], side="right")
-    sil_warm = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_warm_rgb"], side="right")
-    sil_cold = _make_colored_silhouette_skia(relit_bgra, pal["b_rim_cold_rgb"], side="left")
-    sil_shadow = _make_colored_silhouette_skia(relit_bgra, (4, 6, 10), side="full")
-
-    # Restrained outer atmospheric crimson/amber backlight on right contour
-    rim_outer_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
-    rim_outer_p.setAlphaf(0.36)
-    rim_outer_p.setImageFilter(skia.ImageFilters.Blur(24.0, 24.0))
-    cb.drawImageRect(
-        sil_outer,
-        skia.Rect.MakeXYWH(sx + 6.0, sy - 4.0, target_w, target_h),
-        skia.SamplingOptions(skia.FilterMode.kLinear),
-        rim_outer_p,
-    )
-
-    # Sculpted tight warm rim-light kissing ONLY the right contour of hair/shoulders
-    rim_warm_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
-    rim_warm_p.setAlphaf(0.42)
-    rim_warm_p.setImageFilter(skia.ImageFilters.Blur(6.0, 6.0))
-    cb.drawImageRect(
-        sil_warm,
-        skia.Rect.MakeXYWH(sx + 4.5, sy - 1.5, target_w, target_h),
-        skia.SamplingOptions(skia.FilterMode.kLinear),
-        rim_warm_p,
-    )
-
-    # Subtle restrained cold-teal rim kiss ONLY on the left edge of subject
-    rim_cold_p = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
-    rim_cold_p.setAlphaf(0.22)
-    rim_cold_p.setImageFilter(skia.ImageFilters.Blur(5.0, 5.0))
-    cb.drawImageRect(
-        sil_cold,
-        skia.Rect.MakeXYWH(sx - 3.5, sy - 1.0, target_w, target_h),
-        skia.SamplingOptions(skia.FilterMode.kLinear),
-        rim_cold_p,
-    )
-
-    # Subtle dark grounding shadow directly behind cutout eliminates any pale cutout fringe
-    ground_p = skia.Paint(AntiAlias=True)
-    ground_p.setAlphaf(0.55)
-    ground_p.setImageFilter(skia.ImageFilters.Blur(10.0, 10.0))
-    cb.drawImageRect(
-        sil_shadow,
-        skia.Rect.MakeXYWH(sx - 2.0, sy + 5.0, target_w, target_h),
-        skia.SamplingOptions(skia.FilterMode.kLinear),
-        ground_p,
-    )
-
-    # Crisp feathered subject on top
-    subj_img = _bgra_to_skia_image(relit_bgra)
-    cb.drawImageRect(subj_img, dst_rect, skia.SamplingOptions(skia.FilterMode.kLinear))
+        # High-contrast crimson/gold right rim glow + cold slate left split wash over the full environmental frame
+        warm_env_glow = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+        warm_env_glow.setShader(
+            skia.GradientShader.MakeRadial(
+                (W * 0.72, H * 0.45),
+                W * 0.48,
+                [
+                    skia.ColorSetARGB(92, pal["b_rim_warm_rgb"][0], pal["b_rim_warm_rgb"][1], pal["b_rim_warm_rgb"][2]),
+                    skia.ColorSetARGB(64, pal["b_rim_outer_rgb"][0], pal["b_rim_outer_rgb"][1], pal["b_rim_outer_rgb"][2]),
+                    skia.ColorSetARGB(0, pal["b_rim_outer_rgb"][0], pal["b_rim_outer_rgb"][1], pal["b_rim_outer_rgb"][2]),
+                ],
+                [0.0, 0.48, 1.0],
+            )
+        )
+        cb.drawRect(skia.Rect.MakeWH(W, H), warm_env_glow)
+        _draw_cinema_light_leak(cb, W, H, pal["b_rim_outer_rgb"], pal["b_rim_warm_rgb"])
 
     # Subtle left-side dark contrast scrim + bottom atmospheric mist ground so subject & headline merge
     b_scrim = skia.Paint(AntiAlias=True)
     b_scrim.setShader(
         skia.GradientShader.MakeLinear(
-            [(0.0, 0.0), (W * 0.56, 0.0)],
+            [(0.0, 0.0), (W * 0.58, 0.0)],
             [
-                skia.ColorSetARGB(185, 5, 11, 16),
-                skia.ColorSetARGB(105, 5, 11, 16),
+                skia.ColorSetARGB(225 if not b_is_organic else 185, 5, 11, 16),
+                skia.ColorSetARGB(135 if not b_is_organic else 105, 5, 11, 16),
                 skia.ColorSetARGB(0, 5, 11, 16),
             ],
             [0.0, 0.62, 1.0],
@@ -2149,9 +2236,17 @@ def generate_ab_thumbnails_16x9(
     cc.clear(hex_to_skia("#050508"))
 
     hero_c = roles["c"]
+    c_meta = hero_c.get("cutout_meta") or {}
+    c_fill_ratio = float(c_meta.get("fill_ratio", hero_c.get("fill_ratio", 0.0)) or 0.0)
+    # If hero_c is a boxy/rectangular door/window prop (fill_ratio >= 0.82), swap to best organic environmental frame
+    if c_fill_ratio >= 0.82:
+        if float((roles["b_subject"].get("cutout_meta") or {}).get("fill_ratio", 0.0) or 0.0) < 0.82:
+            hero_c = roles["b_subject"]
+        elif float((roles["a"].get("cutout_meta") or {}).get("fill_ratio", 0.0) or 0.0) < 0.82:
+            hero_c = roles["a"]
+
     graded_c = _cinema_grade_bgr(hero_c["bgr"], style="closeup", mood=mood)
-    # Tight 1.32x cinematic focal close-up using 100% genuine edge-to-edge pixels (zero left seam)
-    # with gentle upper-right framing so heads/eyes stay cleanly inside the cinema frame.
+    # Tight 1.32x cinematic focal close-up using 100% genuine edge-to-edge environmental pixels (zero floating cutouts!)
     focal_dst_c = (0.60, 0.48)
     composed_c = _compose_focal_canvas_bgr(
         graded_c,
@@ -2164,20 +2259,36 @@ def generate_ab_thumbnails_16x9(
     )
     cc.drawImageRect(_bgr_to_skia_image(composed_c), skia.Rect.MakeWH(W, H), skia.SamplingOptions(skia.FilterMode.kLinear))
 
-    # Deep moody radial chiaroscuro vignette centered around the focal subject
+    # Dramatic high-contrast crimson/gold rim grading kiss around the close-up focal subject
     fx_c, fy_c = W * focal_dst_c[0], H * focal_dst_c[1]
+    rim_c_glow = skia.Paint(AntiAlias=True, BlendMode=skia.BlendMode.kScreen)
+    rim_c_glow.setShader(
+        skia.GradientShader.MakeRadial(
+            (fx_c + 72.0, fy_c - 28.0),
+            W * 0.42,
+            [
+                skia.ColorSetARGB(72, pal["b_rim_warm_rgb"][0], pal["b_rim_warm_rgb"][1], pal["b_rim_warm_rgb"][2]),
+                skia.ColorSetARGB(46, pal["b_rim_outer_rgb"][0], pal["b_rim_outer_rgb"][1], pal["b_rim_outer_rgb"][2]),
+                skia.ColorSetARGB(0, pal["b_rim_outer_rgb"][0], pal["b_rim_outer_rgb"][1], pal["b_rim_outer_rgb"][2]),
+            ],
+            [0.0, 0.50, 1.0],
+        )
+    )
+    cc.drawRect(skia.Rect.MakeWH(W, H), rim_c_glow)
+
+    # Balanced moody radial chiaroscuro vignette centered around the focal subject (grounded, never pure-black void)
     rad_vig_c = skia.Paint(AntiAlias=True)
     rad_vig_c.setShader(
         skia.GradientShader.MakeRadial(
             (fx_c, fy_c),
-            W * 0.74,
+            W * 0.78,
             [
                 skia.ColorSetARGB(0, 6, 5, 10),
-                skia.ColorSetARGB(62, 6, 5, 10),
-                skia.ColorSetARGB(185, 6, 5, 10),
-                skia.ColorSetARGB(242, 4, 4, 8),
+                skia.ColorSetARGB(48, 6, 5, 10),
+                skia.ColorSetARGB(152, 6, 5, 10),
+                skia.ColorSetARGB(204, 4, 4, 8),
             ],
-            [0.0, 0.36, 0.74, 1.0],
+            [0.0, 0.40, 0.76, 1.0],
         )
     )
     cc.drawRect(skia.Rect.MakeWH(W, H), rad_vig_c)

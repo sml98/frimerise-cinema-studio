@@ -97,10 +97,48 @@ except Exception:
     resolve_caption_style = None  # type: ignore
 
 try:
+    from engine.kinetic_captions import draw_kinetic_caption_chunk
+except Exception:
+    draw_kinetic_caption_chunk = None  # type: ignore
+
+try:
+    from engine.kinetic_captions import DARK_CINEMA_PILL_PALETTE
+except Exception:
+    DARK_CINEMA_PILL_PALETTE = [
+        ("#9E1B24", "#FFFFFF", (158, 27, 36, 210)),   # Blood Crimson + Pure White
+        ("#FFD166", "#0B0713", (255, 209, 102, 200)), # Antique Gold + Obsidian Ink
+        ("#D97706", "#FFFFFF", (217, 119, 6, 205)),   # Torch Amber + Pure White
+    ]
+
+try:
     from engine.pro_sfx_studio import ensure_pro_cinema_sfx, select_music_for_mood
 except Exception:
     ensure_pro_cinema_sfx = None  # type: ignore
     select_music_for_mood = None  # type: ignore
+
+try:
+    from engine.flow_vault import ensure_upgraded_dark_horror_music
+except Exception:
+    ensure_upgraded_dark_horror_music = None  # type: ignore
+
+try:
+    from engine.pro_motion_graphics import (
+        draw_anamorphic_film_burn_and_bokeh,
+        draw_depth_title_behind_subject,
+        draw_pro_archival_newspaper,
+        draw_pro_cartographic_map,
+        draw_pro_forensic_string_board,
+        draw_pro_odometer_timeline,
+        draw_pro_safezone_lower_third,
+    )
+except Exception:
+    draw_depth_title_behind_subject = None  # type: ignore
+    draw_anamorphic_film_burn_and_bokeh = None  # type: ignore
+    draw_pro_safezone_lower_third = None  # type: ignore
+    draw_pro_cartographic_map = None  # type: ignore
+    draw_pro_archival_newspaper = None  # type: ignore
+    draw_pro_odometer_timeline = None  # type: ignore
+    draw_pro_forensic_string_board = None  # type: ignore
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 ASSETS_DIR = BASE_DIR / "assets"
@@ -119,20 +157,40 @@ VisualModeType = Literal[
     "video_pip_evidence",
 ]
 
-# Cinema v3 visual rhythm: ~60% clean full-screen fast-cut multi-shot & full-bleed 2.5D art,
-# ~40% varied investigative set-pieces (newspaper, dark map, red-string board, timeline).
+# Cinema v6 Pro Studio visual rhythm: guaranteed rotation of ALL 4 signature animated graphics
+# (sliding_timeline, newspaper_highlighter, dark_map_route, red_string_board) interleaved with
+# multi-shot cinema & 2.5D parallax scenes with 3D depth titles behind subjects!
 VISUAL_MODES: Tuple[VisualModeType, ...] = (
-    "cinema_multishot",
-    "newspaper_highlighter",
-    "cinema_multishot",
-    "parallax_25d_photo",
-    "cinema_multishot",
-    "dark_map_route",
-    "cinema_multishot",
-    "red_string_board",
-    "cinema_multishot",
-    "sliding_timeline",
+    "cinema_multishot",       # Sc 0: Cold Open (with 2.5D Depth Title!)
+    "sliding_timeline",       # Sc 1: Mechanical Odometer Timeline + Data Bars
+    "cinema_multishot",       # Sc 2: Multi-shot story progression
+    "newspaper_highlighter",  # Sc 3: Archival Document / Newspaper with Bokeh & Highlighter
+    "parallax_25d_photo",     # Sc 4: 2.5D Parallax + Giant 3D Depth Title Behind Subject
+    "dark_map_route",         # Sc 5: Pro Cartographic European Map with Camera Zoom & Radar
+    "cinema_multishot",       # Sc 6: Multi-shot story progression
+    "red_string_board",       # Sc 7: Forensic String Board with Curved Bézier Strings & Spotlight
+    "cinema_multishot",       # Sc 8: Multi-shot climax
+    "parallax_25d_photo",     # Sc 9: 2.5D Parallax + Depth Title
 )
+
+
+def _select_visual_mode_for_scene(idx: int, total_scenes: int = 10) -> VisualModeType:
+    """Return the visual mode for scene `idx`, guaranteeing ALL 4 signature animated graphics
+    appear across both 6-7 scene documentaries and 8-12+ scene documentaries.
+    """
+    if total_scenes == 6:
+        six_pack: Tuple[VisualModeType, ...] = (
+            "cinema_multishot",
+            "sliding_timeline",
+            "newspaper_highlighter",
+            "parallax_25d_photo",
+            "dark_map_route",
+            "red_string_board",
+        )
+        return six_pack[idx % len(six_pack)]
+    if total_scenes == 7 and idx == 6:
+        return "red_string_board"
+    return VISUAL_MODES[idx % len(VISUAL_MODES)]
 
 PIP_ENABLED_MODES: Tuple[VisualModeType, ...] = (
     "broll_video_pip",
@@ -313,7 +371,7 @@ class NetflixDocPlan(BaseModel):
     mood: str = "corporate_thriller"
     lang: str = "pt_br"
     aspect_ratio: Literal["16:9", "9:16"] = "16:9"
-    target_minutes: float = 0.5
+    target_minutes: float = 2.75
     lut_file: str = "02_dark_wealth.cube"
     voice_id: str = "pt-BR-AntonioNeural"
     caption_style: str = "cinema_minimal"
@@ -1343,15 +1401,15 @@ def _ensure_topic_open_loops(
         ),
     }
     pool = bridges_by_mood.get(mood, bridges_by_mood["epic_history"])
-    # Skip artificial open-loop injection whenever the plan already has >= 2 natural '?' hooks
+    # Skip artificial open-loop injection whenever the plan already has >= 1 natural '?' hook
     existing_q_hooks = sum(1 for sc in scenes if "?" in str(sc.narration or ""))
-    if existing_q_hooks >= 2:
+    if existing_q_hooks >= 1:
         return
 
     since_loop_s = 0.0
     b_idx = 0
     for idx, sc in enumerate(scenes):
-        if existing_q_hooks >= 2:
+        if existing_q_hooks >= 1:
             break
         txt = sc.narration.strip()
         dur_est = max(2.2, len(txt.split()) / 2.05)
@@ -1359,7 +1417,7 @@ def _ensure_topic_open_loops(
         if "?" in txt or OPEN_LOOP_MARKERS_RE.search(txt):
             since_loop_s = 0.0
             continue
-        # Inject at most up to 2 total '?' hooks, only on scene 0 or when >= 24.0s elapsed without a hook
+        # Inject at most 1 '?' hook ONLY when the entire script had zero '?' marks
         if (idx == 0 or (idx < len(scenes) - 1 and since_loop_s >= 24.0)) and b_idx < len(pool):
             q = pool[b_idx]
             b_idx += 1
@@ -1367,6 +1425,65 @@ def _ensure_topic_open_loops(
             sc.narration = f"{base_clean}. {q}" if base_clean else q
             existing_q_hooks += 1
             since_loop_s = 0.0
+
+
+_BANNED_DARK_NEON_RE = re.compile(
+    r"\b(?:neon\s+reindeers?|neon\s+signs?|neon\s+lights?|neon\s+outlines?|"
+    r"pink[/\s-]*green\s+leds?|hot[\s-]*pink|lime[\s-]*green|electric[\s-]*blue\s+neon|"
+    r"cyberpunk|synthwave|bright\s+led\s+snowflakes?)\b",
+    re.IGNORECASE,
+)
+
+_PT_CARDINAL_TO_ORDINAL_CENTURY: Dict[str, str] = {
+    "um": "primeiro",
+    "dois": "segundo",
+    "três": "terceiro",
+    "tres": "terceiro",
+    "quatro": "quarto",
+    "cinco": "quinto",
+    "seis": "sexto",
+    "sete": "sétimo",
+    "oito": "oitavo",
+    "nove": "nono",
+    "dez": "décimo",
+}
+
+_PT_CENTURY_CARDINAL_RE = re.compile(
+    r"\b(s[eé]culo)\s+(um|dois|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_pt_century_ordinals_in_text(text: str, lang: str = "pt_br") -> str:
+    """Normalize Portuguese century cardinals I..X ('século quatro') into educated ordinals ('século quarto')."""
+    if str(lang).lower().startswith("en"):
+        return text
+
+    def _repl(m: re.Match[str]) -> str:
+        sec_word = m.group(1)
+        num_word = m.group(2).lower()
+        ord_word = _PT_CARDINAL_TO_ORDINAL_CENTURY.get(num_word, m.group(2))
+        if m.group(2).isupper():
+            ord_word = ord_word.upper()
+        elif m.group(2)[0].isupper():
+            ord_word = ord_word.capitalize()
+        return f"{sec_word} {ord_word}"
+
+    return _PT_CENTURY_CARDINAL_RE.sub(_repl, str(text or ""))
+
+
+def _sanitize_dark_history_prompt(prompt: str, mood: str) -> str:
+    """Ban cyberpunk neon / pink-green LED anachronisms in dark_horror and epic_history visual prompts."""
+    p = str(prompt or "").strip()
+    if not p:
+        return p
+    if str(mood or "").strip().lower() in ("dark_horror", "epic_history", "investigative_crime"):
+        if _BANNED_DARK_NEON_RE.search(p):
+            p = _BANNED_DARK_NEON_RE.sub(
+                "moody candlelit windows and warm vintage streetlamps casting dark shadows in an obsidian room",
+                p,
+            )
+    return re.sub(r"\s{2,}", " ", p).strip()
 
 
 def _call_open_topic_director_llm(
@@ -1431,12 +1548,13 @@ def _call_open_topic_director_llm(
         f"You are an Emmy-winning Netflix / A24 / Nostalgia / MagnatesMedia Documentary Showrunner & Historian writing in {lang_label}.\n"
         "Create a 100% ORIGINAL, deeply researched, spine-tingling, cinematic documentary script strictly about the user's EXACT TOPIC.\n"
         "ABSOLUTE STORYTELLING & VOICE RULES:\n"
-        "1. CONTINUOUS HUMAN NARRATIVE & STRICT CHRONOLOGICAL PROGRESSION: Write like a master human storyteller telling ONE gripping, continuous story from Cold Open to unforgettable ending — NEVER disjointed bullet points, NEVER repeating ideas across scenes, and NEVER pasting the user's raw prompt text inside narration or headlines! Scenes MUST progress STRICTLY FORWARD in historical time from earliest era to modern day (e.g., 4th century BCE -> 4th century CE -> 11th century -> 17th century -> Modern Day). NEVER jump backwards in time across scenes, and NEVER connect two different centuries with 'Enquanto isso' / 'Meanwhile'! Verify historical geography and climate accurately.\n"
-        "2. REAL HISTORICAL DEPTH: Cite real eras, real years (e.g., 1647, 4th century, 1890s), real places (Rome, Austrian Alps, Myra, London, Iceland), real historical figures/folklore/edicts, and genuine plot twists!\n"
+        "1. CONTINUOUS HUMAN NARRATIVE & STRICT FORWARD HISTORICAL CHRONOLOGY: Write like a master human storyteller telling ONE gripping, continuous story from Cold Open to unforgettable ending — NEVER disjointed bullet points, NEVER repeating ideas across scenes, and NEVER pasting the user's raw prompt text inside narration or headlines! Scenes MUST progress STRICTLY FORWARD in historical time from earliest era to modern day (e.g., for dark Christmas history: Act I Roman Saturnalia 217 a.C. & 336 d.C. Sol Invictus decree -> Act II 4th-century Bishop Nicholas of Myra -> Act III 11th/12th-century Alpine fusion with Krampus -> Act IV 1647 Puritan Ban by Oliver Cromwell & Plum Pudding Riots -> Epilogue 19th-century Victorian & modern corporate domestication — NEVER put 11th-c. Krampus before 4th-c. Saint Nicholas!). NEVER jump backwards in time across scenes, and NEVER connect two different centuries with 'Enquanto isso' / 'Meanwhile'! Verify historical geography and climate accurately.\n"
+        "2. REAL HISTORICAL DEPTH: Cite real eras, real years (e.g., 217 a.C., 336 d.C., 1647, 4th century, 1890s), real places (Rome, Myra, Austrian Alps, London, Iceland), real historical figures/folklore/edicts, and genuine plot twists!\n"
         f"3. STRICT DURATION & NATURAL SPOKEN RHYTHM (~{int(round(target_seconds))}s TOTAL): Each scene narration MUST be strictly {min_scene_words}-{max_scene_words} crisp, visceral spoken words (total script ~{total_min_w}-{total_max_w} words across all {n_scenes} scenes so final video hits ~{int(round(target_seconds))}s cleanly!). Write spoken Portuguese/English naturally with commas and clean periods — NEVER em-dashes ('—'). Spell out centuries naturally using Portuguese ordinals for I-X and cardinals for XI+ (write 'século quarto' instead of 'SÉC. IV' or 'século quatro', 'século onze' instead of 'SÉC. XI', and 'antes de Cristo' instead of 'a.C.').\n"
         "4. ZERO ROBOTIC AI CLICHÉS & ZERO OFF-TOPIC BRANDING: NEVER write 'Em um mundo onde', 'Vamos mergulhar', 'Em conclusão', 'Por trás da imagem familiar', 'As crônicas históricas conectaram', 'In a world where', or 'Let's dive in'. Invent a topic-authentic `channel_name` matching the mood (NEVER 'Dossiê Capital' or 'Vault Files' unless mood is 'corporate_thriller').\n"
-        "5. ORGANIC OPEN-LOOP TRANSITIONS WITH REAL PAYOFFS: Scene 0 MUST be an explosive, chilling Cold Open that grabs attention in 2 seconds and ends with a sharp open-loop question (?) directly answered by Scene 1. Include 1-2 natural mid-story open-loop questions (?) whose EXACT narrative payoff/answer is explicitly delivered in the opening line of the VERY NEXT scene! Never tack on generic unrelated questions.\n"
-        "6. VISUAL PRECISION (ZERO OFF-TOPIC STOCK!): Every scene needs concrete, atmospheric English visual queries:\n"
+        "5. CRITICAL NARRATIVE RULE: Do NOT end every scene with a rhetorical question! At least 75% of scenes MUST end with a concrete, visceral, mind-blowing historical fact or consequence (e.g. 'Em Mira, o próprio bispo Nicolau demoliu templos pagãos com as próprias mãos.', 'Em Londres, soldados invadiam casas pelo cheiro de carne assada e arrastavam famílias para a prisão.'). Use at most 1 or 2 open-loop transition questions across the entire script — and whenever a scene asks a question, the VERY NEXT SCENE MUST directly answer it in its opening sentence! Only the final scene ends with a haunting second-person question to the viewer ('E você... quando acende as luzes na noite de vinte e quatro de dezembro... ainda sente a sombra do que tentaram apagar?').\n"
+        "6. VISUAL PRECISION & BAN CYBERPUNK NEON IN DARK HISTORY (ZERO OFF-TOPIC STOCK!): Every scene needs concrete, atmospheric English visual queries:\n"
+        "   - STRICTLY FORBID 'neon signs', 'neon reindeer', 'pink/green LED', or 'cyberpunk' in `shot_prompts_en` and `bespoke_image_prompt_en` for `dark_horror` / `epic_history` (even in modern-era epilogue scenes, use moody candlelit windows, snow falling under warm vintage streetlamps, dark shadows cast by a Christmas tree in an obsidian room!).\n"
         "   - `broll_query_en` and `pip_broll_query_en` (MUST differ from each other): concrete, real atmospheric stock video phrases that exist on Pixabay (e.g., 'snow pine forest night', 'burning candle dark shadow', 'medieval stone castle fog', 'gothic cathedral interior', 'crackling fireplace dark', 'winter snow village night', 'old leather book candle', 'ancient roman stone ruins'). NEVER use abstract words like 'floor', 'butterfly', 'background', 'texture', or 'darkness' alone.\n"
         "   - `photo_query_en` and `extra_photo_queries_en` (3-4 distinct concrete English museum/historical/photographic subjects matching THAT exact scene — e.g., 'Krampus Austrian folklore mask', 'Roman Saturnalia festival painting', 'Saint Nicholas Byzantine icon', 'Puritan Oliver Cromwell 17th century engraving', 'Victorian gothic winter postcard').\n"
         f"{framing_rule}"
@@ -1654,19 +1772,19 @@ def _build_open_topic_offline_dossier(topic: str, clean_lang: str, mood: str) ->
         ]
         narr = (
             [
-                f"Por trás da imagem familiar de {clean_t}, arquivos antigos escondem uma origem muito mais sombria. O que realmente acontecia no começo?",
-                f"Manuscritos e crônicas de séculos passados mostram que {clean_t} nasceu em meio a temores antigos e rituais de inverno hoje quase esquecidos.",
-                "À medida que essas tradições cruzavam fronteiras pela Europa, figuras temidas e advertências noturnas moldaram o imaginário popular.",
-                "Com o passar dos séculos, relatos desconfortáveis foram reescritos para parecerem inofensivos. Mas qual detalhe sobreviveu nas entrelinhas?",
-                f"Ao revisitar os documentos originais de {clean_t}, fica claro que a história verdadeira nunca foi tão inocente quanto parecia.",
+                f"Arquivos antigos de {clean_t} revelam que a tradição nasceu em rituais de inverno repletos de excessos e sacrifícios.",
+                f"No século quarto, autoridades religiosas absorveram os antigos festivais pagãos e demoliram templos rivais com as próprias mãos.",
+                "Durante a Idade Média, lendas alpinas fundiram o inverno a criaturas sombrias que puniam os culpados na calada da noite.",
+                "Em 1647, soldados patrulhavam as ruas pelo cheiro de banquetes proibidos e arrastavam famílias inteiras para a prisão.",
+                f"E você, ao revisitar a origem de {clean_t}, ainda sente a sombra do que tentaram apagar?",
             ]
             if not is_en
             else [
-                f"Behind the familiar image of {clean_t}, ancient archives conceal a far darker origin. What truly happened in the beginning?",
-                f"Centuries-old chronicles reveal that {clean_t} took shape amid forgotten winter fears and stark ancient rituals.",
-                "As these traditions traveled across borders, grim folkloric figures and midnight warnings haunted entire villages.",
-                "Over generations, unsettling records were softened into harmless tales. Yet which chilling trace survived intact?",
-                f"Reopening the primary archives of {clean_t} proves the real history was never as innocent as modern memory claims.",
+                f"Ancient archives of {clean_t} reveal that the tradition began inside winter rituals of excess and blood sacrifice.",
+                "In the fourth century, early authorities absorbed pagan solstice feasts while tearing down rival temples with their bare hands.",
+                "Across medieval Europe, Alpine folklore fused winter nights with horned figures that punished the wicked in the dark.",
+                "By 1647, armed patrols hunted down forbidden feasts by the scent of roasting meat and dragged families to prison.",
+                f"And you, when the lights of {clean_t} flicker at midnight, do you still feel the shadow they tried to erase?",
             ]
         )
     else:
@@ -1695,19 +1813,19 @@ def _build_open_topic_offline_dossier(topic: str, clean_lang: str, mood: str) ->
         ]
         narr = (
             [
-                f"A história oficial sobre {clean_t} deixa de fora um capítulo decisivo. O que os arquivos antigos realmente escondem?",
-                f"Documentos de época mostram que as raízes de {clean_t} surgiram sob circunstâncias muito mais tensas do que se imagina.",
-                "Cada testemunho preservado conecta lugares distantes e revela como pequenas decisões alteraram o destino de milhares de pessoas.",
-                "Quando a cronologia completa é colocada lado a lado, o contraste entre mito e realidade chama atenção. Por que isso foi esquecido?",
-                f"Entender a verdadeira trajetória de {clean_t} muda completamente a forma como enxergamos esse episódio até hoje.",
+                f"A história oficial sobre {clean_t} ocultou durante séculos os registros primários que deram origem a tudo.",
+                f"Documentos de época provam que as raízes de {clean_t} surgiram sob decretos implacáveis e disputas de poder.",
+                "Cada testemunho preservado conecta lugares distantes e mostra como decisões secretas alteraram o destino de uma geração inteira.",
+                "Quando a cronologia completa veio à tona, as provas documentais desmontaram de vez a versão oficial.",
+                f"E você, diante das provas reais sobre {clean_t}, ainda acredita na versão que contaram nos livros?",
             ]
             if not is_en
             else [
-                f"The familiar story of {clean_t} leaves out its most decisive chapter. What do the original archives actually reveal?",
-                f"Period records show the roots of {clean_t} emerged under far more dramatic circumstances than most people realize.",
-                "Each preserved testimony connects distant places and exposes how pivotal turning points reshaped an entire generation.",
-                "When the complete timeline is placed side by side, myth separates sharply from reality. Why was this forgotten?",
-                f"Uncovering the true chronicle of {clean_t} transforms how we understand its lasting legacy today.",
+                f"Official chronicles of {clean_t} concealed for centuries the primary records that sparked the entire affair.",
+                f"Period documents prove the roots of {clean_t} emerged under ruthless decrees and high-stakes power struggles.",
+                "Each preserved testimony connects distant capitals and exposes how covert decisions reshaped an entire generation.",
+                "When the complete chronological archive surfaced, hard forensic evidence dismantled the official myth overnight.",
+                f"And you, seeing the primary evidence behind {clean_t}, do you still believe the version told in textbooks?",
             ]
         )
 
@@ -1769,7 +1887,7 @@ def _build_universal_dossier(topic: str, lang: str = "pt_br") -> Dict[str, Any]:
 def generate_netflix_doc_plan(
     topic: str,
     aspect_ratio: str = "16:9",
-    target_minutes: float = 0.5,
+    target_minutes: float = 2.75,
     lang: str = "pt_br",
     custom_directives: str = "",
     caption_style: Optional[str] = None,
@@ -1786,25 +1904,26 @@ def generate_netflix_doc_plan(
     ar: Literal["16:9", "9:16"] = "9:16" if str(aspect_ratio).strip() == "9:16" else "16:9"
     clean_lang = "en_us" if str(lang).lower().startswith("en") else "pt_br"
     is_en = clean_lang == "en_us"
-    t_min = max(0.35, min(15.0, float(target_minutes or 0.5)))
+    t_min = max(0.35, min(15.0, float(target_minutes or 2.75)))
     target_seconds = max(25.0, t_min * 60.0)
-    # Subtract real structural audio overhead (chapter cards 1.65s + inter-scene gaps 0.24s + 0.40s tail)
-    # and budget spoken narration at realistic ~2.05 w/s cinema voice-acting pace (60s -> 5 tight scenes x 18-22w = ~95-110w ≈ 56-66s!).
+    # Subtract real structural audio overhead (chapter cards 1.65s + inter-scene gaps 0.42s + 1.25s tail)
+    # and budget spoken narration at realistic ~2.05 w/s cinema voice-acting pace.
     pace_wps = 2.05
-    rough_scenes = max(4, min(60, int(round(max(20.0, target_seconds - 4.5) / 10.5))))
+    rough_scenes = max(4, min(60, int(round(max(20.0, target_seconds - 4.5) / 11.5))))
     est_chapters = _estimate_chapter_count(rough_scenes)
-    overhead_s = est_chapters * 1.65 + rough_scenes * 0.24 + 0.40
+    overhead_s = est_chapters * 1.65 + rough_scenes * 0.42 + 1.25
     spoken_budget_s = max(14.0, target_seconds - overhead_s)
     total_target_words = max(48, int(round(spoken_budget_s * pace_wps)))
-    n_scenes = max(4, min(60, int(round(total_target_words / 21.0))))
+    words_per_sc_divisor = 25.0 if target_seconds >= 120.0 else 21.0
+    n_scenes = max(4, min(60, int(round(total_target_words / words_per_sc_divisor))))
     est_chapters = _estimate_chapter_count(n_scenes)
-    overhead_s = est_chapters * 1.65 + n_scenes * 0.24 + 0.40
+    overhead_s = est_chapters * 1.65 + n_scenes * 0.42 + 1.25
     spoken_budget_s = max(14.0, target_seconds - overhead_s)
     total_target_words = max(48, int(round(spoken_budget_s * pace_wps)))
     avg_words_per_scene = total_target_words / float(n_scenes)
     if avg_words_per_scene >= 19.0:
         min_scene_words = max(14, int(math.floor(avg_words_per_scene)) - 4)
-        max_scene_words = min(26, int(math.floor(avg_words_per_scene)))
+        max_scene_words = min(28, int(math.floor(avg_words_per_scene)) + 1)
     else:
         min_scene_words = max(11, int(round(avg_words_per_scene)) - 2)
         max_scene_words = min(24, int(round(avg_words_per_scene)) + 2)
@@ -1889,7 +2008,7 @@ def generate_netflix_doc_plan(
         chapter_step = max(2, len(base_narr) // min(4, max(2, len(base_narr) // 2)))
 
         for idx, line_txt in enumerate(base_narr):
-            vmode: VisualModeType = VISUAL_MODES[idx % len(VISUAL_MODES)]
+            vmode: VisualModeType = _select_visual_mode_for_scene(idx, len(base_narr))
             chap_card: Optional[str] = None
             chap_sub: Optional[str] = None
             if idx == 0:
@@ -2103,7 +2222,7 @@ def generate_netflix_doc_plan(
         chapter_step = max(2, n_scenes // min(4, max(2, n_scenes // 2)))
 
         for idx, rs in enumerate(raw_scenes[:n_scenes]):
-            vmode = VISUAL_MODES[idx % len(VISUAL_MODES)]
+            vmode = _select_visual_mode_for_scene(idx, n_scenes)
             tp_cur = timeline_pts[idx % len(timeline_pts)]
             sc_orig = _safe_field(rs.get("map_origin"), global_origin)
             sc_dest = _safe_field(rs.get("map_destination"), global_dest)
@@ -2112,7 +2231,10 @@ def generate_netflix_doc_plan(
             lt_sub = _normalize_upper(_safe_field(rs.get("lower_third_subtitle"), f"{subtitle} • {tp_cur.value}"))
             sc_head = _safe_field(rs.get("evidence_headline"), global_headline)
             sc_quote = _safe_field(rs.get("evidence_quote"), global_quote)
-            sc_narr = _safe_field(rs.get("narration"), off_seed["narr"][idx % len(off_seed["narr"])])
+            sc_narr = _normalize_pt_century_ordinals_in_text(
+                _safe_field(rs.get("narration"), off_seed["narr"][idx % len(off_seed["narr"])]),
+                lang=clean_lang,
+            )
 
             chap_card = None
             chap_sub = None
@@ -2166,14 +2288,17 @@ def generate_netflix_doc_plan(
                 if ar == "9:16"
                 else f"cinematic 35mm dark documentary still of {photo_q}, dramatic chiaroscuro lighting, no text"
             )
-            bespoke_p = _safe_field(rs.get("bespoke_image_prompt_en"), default_bespoke)
+            bespoke_p = _sanitize_dark_history_prompt(
+                _safe_field(rs.get("bespoke_image_prompt_en"), default_bespoke),
+                mood=mood,
+            )
             if ar == "9:16":
                 bespoke_p = _enforce_vertical_prompt_framing(bespoke_p)
             raw_shots = rs.get("shot_prompts_en")
             shot_prompts: List[str] = []
             if isinstance(raw_shots, list):
                 for sp in raw_shots:
-                    sp_c = _safe_field(sp, "")
+                    sp_c = _sanitize_dark_history_prompt(_safe_field(sp, ""), mood=mood)
                     if ar == "9:16":
                         sp_c = _enforce_vertical_prompt_framing(sp_c)
                     if sp_c and sp_c.lower() not in {x.lower() for x in shot_prompts}:
@@ -2297,7 +2422,7 @@ def generate_netflix_doc_plan(
     chap_subs = off["chapter_subtitles"]
 
     for idx, line_txt in enumerate(base_narr[:n_scenes]):
-        vmode = VISUAL_MODES[idx % len(VISUAL_MODES)]
+        vmode = _select_visual_mode_for_scene(idx, n_scenes)
         chap_card = None
         chap_sub = None
         if idx == 0:
@@ -3404,6 +3529,136 @@ def _draw_mode_video_pip_evidence(
             qy += qf.getSize() * 1.32
 
 
+try:
+    from engine.pro_motion_graphics import extract_depth_stamp_text as _pro_extract_depth_stamp_text
+except Exception:
+    _pro_extract_depth_stamp_text = None  # type: ignore
+
+_CACHED_FALLBACK_TITLE_TF: Optional[skia.Typeface] = None
+
+_PT_ORDINAL_TO_ROMAN: Dict[str, str] = {
+    "PRIMEIRO": "I",
+    "SEGUNDO": "II",
+    "TERCEIRO": "III",
+    "QUARTO": "IV",
+    "QUINTO": "V",
+    "SEXTO": "VI",
+    "SÉTIMO": "VII",
+    "SETIMO": "VII",
+    "OITAVO": "VIII",
+    "NONO": "IX",
+    "DÉCIMO": "X",
+    "DECIMO": "X",
+    "ONZE": "XI",
+    "DOZE": "XII",
+    "TREZE": "XIII",
+    "QUATORZE": "XIV",
+    "CATORZE": "XIV",
+    "QUINZE": "XV",
+    "DEZESSEIS": "XVI",
+    "DEZESSETE": "XVII",
+    "DEZOITO": "XVIII",
+    "DEZENOVE": "XIX",
+    "VINTE": "XX",
+}
+
+
+def _extract_depth_stamp_text(scene: Optional[NetflixDocScene]) -> str:
+    """Extract a crisp 1-2 word stamp (year like '336 d.C.', '1647', 'SÉC. IV' or key entity from `scene.lower_third_title`)
+    for rendering behind the 2.5D foreground subject.
+    """
+    if _pro_extract_depth_stamp_text is not None and scene is not None:
+        try:
+            st = str(_pro_extract_depth_stamp_text(scene) or "").strip()
+            if st:
+                return st
+        except Exception:
+            pass
+    if scene is None:
+        return "ARQUIVO"
+    lt = _normalize_upper(str(getattr(scene, "lower_third_title", "") or "")).strip()
+    sub = _normalize_upper(str(getattr(scene, "lower_third_subtitle", "") or "")).strip()
+    combined = f"{lt} • {sub}"
+
+    # 1. Explicit year with era suffix (e.g. '336 D.C.', '217 A.C.')
+    m_era = re.search(r"\b(\d{1,4}\s*(?:D\.?\s*C\.?|A\.?\s*C\.?|B\.?\s*C\.?|A\.?\s*D\.?))\b", combined)
+    if m_era:
+        raw_era = re.sub(r"\s+", " ", m_era.group(1).strip())
+        raw_era = re.sub(r"D\.?\s*C\.?$", "d.C.", raw_era)
+        raw_era = re.sub(r"A\.?\s*C\.?$", "a.C.", raw_era)
+        return raw_era
+
+    # 2. Roman century stamp (e.g. 'SÉC. IV', 'SÉCULO XI')
+    m_sec_rom = re.search(r"\bS[ÉE]C(?:ULO|\.)?\s+([IVXLCDM]{1,5})\b", combined)
+    if m_sec_rom:
+        return f"SÉC. {m_sec_rom.group(1)}"
+
+    # 3. Spelled-out Portuguese century in lower-third (e.g. 'SÉCULO QUARTO' -> 'SÉC. IV')
+    m_sec_pt = re.search(
+        r"\bS[ÉE]C(?:ULO|\.)?\s+(PRIMEIRO|SEGUNDO|TERCEIRO|QUARTO|QUINTO|SEXTO|S[ÉE]TIMO|OITAVO|NONO|D[ÉE]CIMO|ONZE|DOZE|TREZE|QUATORZE|CATORZE|QUINZE|DEZESSEIS|DEZESSETE|DEZOITO|DEZENOVE|VINTE)\b",
+        combined,
+    )
+    if m_sec_pt:
+        rom = _PT_ORDINAL_TO_ROMAN.get(m_sec_pt.group(1), m_sec_pt.group(1))
+        return f"SÉC. {rom}"
+
+    # 4. 3 or 4 digit historical year (e.g. '1647', '1995', '336')
+    m_yr = re.search(r"\b(1\d{3}|20\d{2}|[2-9]\d{2})\b", combined)
+    if m_yr:
+        return m_yr.group(1)
+
+    # 5. Crisp 1-2 word key entity or location from lower_third_title
+    parts = [p.strip() for p in re.split(r"[•\-|]", lt) if p.strip()]
+    if parts:
+        for cand in reversed(parts):
+            words = cand.split()
+            if 1 <= len(words) <= 2 and len(cand) <= 16:
+                return cand
+        return " ".join(parts[0].split()[:2])[:16]
+    return "ARQUIVO"
+
+
+def _draw_fallback_depth_title_behind_subject(
+    canvas: skia.Canvas,
+    w: int,
+    h: int,
+    text: str,
+    shot_prog: float,
+    t: float,
+    title_tf: skia.Typeface,
+    mood: str = "dark_horror",
+) -> None:
+    """Built-in fallback 3D Depth Title rendered BETWEEN bg_img and fg_img when pro_motion_graphics is not yet merged."""
+    stamp = _sanitize_glyphs(str(text or "").strip().upper(), typeface=title_tf)
+    if not stamp:
+        return
+    is_wide = w >= h
+    target_w = w * 0.84
+    f_size = 240.0 if is_wide else 210.0
+    font = skia.Font(title_tf, f_size)
+    while f_size > 68.0 and float(font.measureText(stamp)) > target_w:
+        f_size -= 6.0
+        font = skia.Font(title_tf, f_size)
+    tw = float(font.measureText(stamp))
+    drift_x = (shot_prog - 0.5) * -22.0
+    cx = (w - tw) * 0.5 + drift_x
+    cy = h * (0.37 if is_wide else 0.34)
+
+    sh_p = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(190, 0, 0, 0))
+    sh_p.setImageFilter(skia.ImageFilters.DropShadowOnly(0.0, 14.0, 26.0, 26.0, skia.ColorSetARGB(215, 0, 0, 0)))
+    canvas.drawString(stamp, cx, cy, font, sh_p)
+
+    fill_p = skia.Paint(AntiAlias=True)
+    fill_p.setShader(
+        skia.GradientShader.MakeLinear(
+            [(cx, cy - f_size * 0.85), (cx, cy + f_size * 0.15)],
+            [hex_to_skia("#FFE082", 205), hex_to_skia("#D4AF37", 198), hex_to_skia("#9E1B24", 185)],
+            [0.0, 0.55, 1.0],
+        )
+    )
+    canvas.drawString(stamp, cx, cy, font, fill_p)
+
+
 def _draw_fullbleed_parallax_shot(
     canvas: skia.Canvas,
     w: int,
@@ -3413,10 +3668,19 @@ def _draw_fullbleed_parallax_shot(
     shot_prog: float,
     t: float,
     pan_dir: float = 1.0,
+    scene: Optional[NetflixDocScene] = None,
+    title_tf: Optional[skia.Typeface] = None,
+    shot_local_t: float = 0.0,
+    stamp_text: Optional[str] = None,
 ) -> None:
-    """Render an unobstructed full-bleed edge-to-edge 2.5D parallax cinema shot with crisp 16px depth (zero blurry halo!) & subtle embers."""
+    """Render an unobstructed full-bleed edge-to-edge 2.5D parallax cinema shot with 3D Depth Title BEHIND the 2.5D subject
+    (right AFTER drawing `bg_img` and BEFORE drawing `fg_img`) + anamorphic film burn & bokeh!
+    """
+    global _CACHED_FALLBACK_TITLE_TF
     full_r = skia.Rect.MakeXYWH(0, 0, w, h)
     canvas.clear(skia.ColorSetARGB(255, 9, 7, 16))
+    eff_mood = str(getattr(scene, "mood", "dark_horror") or "dark_horror") if scene is not None else "dark_horror"
+
     if bg_img is not None:
         bg_zoom = 1.03 + 0.045 * shot_prog
         bg_pan_x = (shot_prog - 0.5) * (-6.0 * pan_dir)
@@ -3435,6 +3699,24 @@ def _draw_fullbleed_parallax_shot(
             my_m = ((mi * 131 - t * (18 + (mi % 3) * 7)) % h)
             canvas.drawCircle(mx_m, my_m, 2.0 + (mi % 3) * 1.2, mote_p)
 
+        # Giant 3D Depth Title rendered right AFTER bg_img and BEFORE fg_img so the 2.5D character stands IN FRONT OF the 3D text!
+        if fg_img is not None:
+            resolved_stamp = str(stamp_text or _extract_depth_stamp_text(scene)).strip()
+            eff_tf = title_tf
+            if eff_tf is None:
+                if _CACHED_FALLBACK_TITLE_TF is None:
+                    _CACHED_FALLBACK_TITLE_TF, _ = _load_verified_typeface("Montserrat-Black.ttf", role="doc_title")
+                eff_tf = _CACHED_FALLBACK_TITLE_TF
+            if resolved_stamp and eff_tf is not None:
+                if draw_depth_title_behind_subject is not None:
+                    draw_depth_title_behind_subject(
+                        canvas, w, h, resolved_stamp, shot_prog, t, eff_tf, mood=eff_mood
+                    )
+                else:
+                    _draw_fallback_depth_title_behind_subject(
+                        canvas, w, h, resolved_stamp, shot_prog, t, eff_tf, mood=eff_mood
+                    )
+
         if fg_img is not None:
             fg_zoom = 1.05 + 0.065 * shot_prog
             fg_pan_x = (shot_prog - 0.5) * (10.0 * pan_dir)
@@ -3446,6 +3728,9 @@ def _draw_fullbleed_parallax_shot(
             fg_paint = skia.Paint(AntiAlias=True)
             _draw_image_cover(canvas, fg_img, full_r, paint=fg_paint)
             canvas.restore()
+
+    if draw_anamorphic_film_burn_and_bokeh is not None:
+        draw_anamorphic_film_burn_and_bokeh(canvas, w, h, t, shot_local_t, mood=eff_mood)
 
     # Subtle cinematic edge vignette (keeps center bright and dramatic)
     vig = skia.Paint()
@@ -3469,6 +3754,9 @@ def _draw_single_unique_shot_layer(
     primary_frame: Optional[skia.Image],
     pip_frame: Optional[skia.Image],
     pan_dir: float = 1.0,
+    scene: Optional[NetflixDocScene] = None,
+    title_tf: Optional[skia.Typeface] = None,
+    shot_local_t: float = 0.0,
 ) -> None:
     """Render one single unique visual shot (moving B-roll, 2.5D u2netp parallax, or Ken Burns bespoke still)."""
     kind, payload = layer
@@ -3509,6 +3797,9 @@ def _draw_single_unique_shot_layer(
             shot_prog,
             t,
             pan_dir=pan_dir,
+            scene=scene,
+            title_tf=title_tf,
+            shot_local_t=shot_local_t,
         )
     elif kind == "photo_still" and payload is not None:
         _draw_fullbleed_parallax_shot(
@@ -3520,6 +3811,9 @@ def _draw_single_unique_shot_layer(
             shot_prog,
             t,
             pan_dir=pan_dir,
+            scene=scene,
+            title_tf=title_tf,
+            shot_local_t=shot_local_t,
         )
     else:
         _draw_video_backdrop_layer(
@@ -3548,6 +3842,8 @@ def _draw_unique_shot_slice(
     pip_frame: Optional[skia.Image],
     s_idx: int = 0,
     cut_flash_on_first: bool = False,
+    scene: Optional[NetflixDocScene] = None,
+    title_tf: Optional[skia.Typeface] = None,
 ) -> None:
     """Step strictly 1-to-1 across `layers` with ZERO modulo wrap-around (`min(n-1, ...)`),
     adding a crisp 0.11s film-cut flash right on each internal visual switch!
@@ -3566,7 +3862,18 @@ def _draw_unique_shot_slice(
     pan_dir = 1.0 if (shot_idx + s_idx) % 2 == 0 else -1.0
 
     _draw_single_unique_shot_layer(
-        canvas, w, h, layers[shot_idx], shot_prog, t, primary_frame, pip_frame, pan_dir=pan_dir
+        canvas,
+        w,
+        h,
+        layers[shot_idx],
+        shot_prog,
+        t,
+        primary_frame,
+        pip_frame,
+        pan_dir=pan_dir,
+        scene=scene,
+        title_tf=title_tf,
+        shot_local_t=shot_local_t,
     )
 
     if (shot_idx > 0 or cut_flash_on_first) and shot_local_t < 0.11:
@@ -3592,8 +3899,9 @@ def _draw_mode_cinema_multishot(
     media: LoadedSceneSkiaMedia,
     cut_cadence_s: float = 2.6,
     s_idx: int = 0,
+    title_tf: Optional[skia.Typeface] = None,
 ) -> None:
-    """Cinema v4 Primary Visual Mode: clean, unobstructed FULL-SCREEN ZERO-REPETITION multi-shot storytelling!
+    """Cinema v6 Primary Visual Mode: clean, unobstructed FULL-SCREEN ZERO-REPETITION multi-shot storytelling!
     Every ~`cut_cadence_s` (2.2-3.0s) cuts to a BRAND-NEW unique asset in `media.shot_layers` (NEVER wraps around!).
     """
     layers = list(media.shot_layers or [])
@@ -3619,6 +3927,8 @@ def _draw_mode_cinema_multishot(
         pip_frame=pip_frame,
         s_idx=s_idx,
         cut_flash_on_first=False,
+        scene=scene,
+        title_tf=title_tf,
     )
 
 
@@ -3638,9 +3948,9 @@ def _draw_mode_parallax_25d_photo(
     body_dur: float = 10.0,
     s_idx: int = 0,
 ) -> None:
-    """Mode 4 (Cinema v5): Multi-shot 2.5D u2netp Parallax & Bespoke Cinema cuts across BOTH 16:9 and 9:16!
+    """Mode 4 (Cinema v6): Multi-shot 2.5D u2netp Parallax & Bespoke Cinema cuts across BOTH 16:9 and 9:16!
     NEVER freezes 18s on a single photo and NEVER stretches into a mismatched matte — cuts smoothly across
-    all unique shots in `media.shot_layers`!
+    all unique shots in `media.shot_layers` with 3D Depth Titles behind 2.5D subjects!
     """
     is_wide = w >= h
     if media.shot_layers:
@@ -3656,6 +3966,8 @@ def _draw_mode_parallax_25d_photo(
             pip_frame=None,
             s_idx=s_idx,
             cut_flash_on_first=False,
+            scene=scene,
+            title_tf=title_tf,
         )
         return
 
@@ -3669,6 +3981,9 @@ def _draw_mode_parallax_25d_photo(
             prog,
             t,
             pan_dir=1.0,
+            scene=scene,
+            title_tf=title_tf,
+            shot_local_t=body_t,
         )
         return
 
@@ -3847,7 +4162,13 @@ def _draw_mode_newspaper_highlighter(
     media: LoadedSceneSkiaMedia,
     is_en: bool = False,
 ) -> None:
-    """Mode 2: Moving real HD B-roll video backdrop + archival broadsheet with REAL monochrome/sepia editorial photograph & animated Multiply highlighter sweep."""
+    """Mode 2: Delegate to Pro Motion Graphics `draw_pro_archival_newspaper` (with built-in fallback)."""
+    if draw_pro_archival_newspaper is not None:
+        photo_img = media.primary_photo if media is not None else None
+        draw_pro_archival_newspaper(
+            canvas, w, h, scene, prog, body_t, t, title_tf, ui_tf, primary_frame, photo_img, is_en=is_en
+        )
+        return
     # Real moving HD B-roll video visibly playing behind the tilted editorial broadsheet!
     _draw_video_backdrop_layer(
         canvas,
@@ -4086,7 +4407,12 @@ def _draw_mode_dark_map_route(
     pip_frame: Optional[skia.Image],
     is_en: bool = False,
 ) -> None:
-    """Mode 3: Moving HD B-roll backdrop + translucent tactical world/city route map + live Video-over-Video PiP forensic monitor!"""
+    """Mode 3: Delegate to Pro Motion Graphics `draw_pro_cartographic_map` (with built-in fallback)."""
+    if draw_pro_cartographic_map is not None:
+        draw_pro_cartographic_map(
+            canvas, w, h, scene, prog, body_t, t, title_tf, ui_tf, primary_frame, pip_frame, is_en=is_en
+        )
+        return
     # Real moving HD B-roll video continuously playing behind and through the translucent tactical glass map!
     _draw_video_backdrop_layer(
         canvas,
@@ -4297,7 +4623,17 @@ def _draw_mode_sliding_timeline(
     media: LoadedSceneSkiaMedia,
     is_en: bool = False,
 ) -> None:
-    """Mode 6: Real moving HD B-roll video backdrop + sliding timeline with REAL photo inset header inside highlighted active card!"""
+    """Mode 6: Delegate to Pro Motion Graphics `draw_pro_odometer_timeline` (with built-in fallback)."""
+    photo_pool = (
+        (media.extra_photos if media.extra_photos else ([media.primary_photo] if media.primary_photo is not None else []))
+        if media is not None
+        else []
+    )
+    if draw_pro_odometer_timeline is not None:
+        draw_pro_odometer_timeline(
+            canvas, w, h, scene, prog, body_t, t, title_tf, ui_tf, primary_frame, photo_pool, is_en=is_en
+        )
+        return
     _draw_video_backdrop_layer(
         canvas,
         w,
@@ -4474,7 +4810,17 @@ def _draw_mode_red_string_board(
     media: LoadedSceneSkiaMedia,
     is_en: bool = False,
 ) -> None:
-    """Mode 5: Moving HD B-roll backdrop + 3-4 distinct REAL photographs mounted inside Polaroid evidence frames pinned to obsidian nodes with glowing #FF2E93 strings!"""
+    """Mode 5: Delegate to Pro Motion Graphics `draw_pro_forensic_string_board` (with built-in fallback)."""
+    photo_pool = (
+        (media.extra_photos if media.extra_photos else ([media.primary_photo] if media.primary_photo is not None else []))
+        if media is not None
+        else []
+    )
+    if draw_pro_forensic_string_board is not None:
+        draw_pro_forensic_string_board(
+            canvas, w, h, scene, prog, body_t, t, title_tf, ui_tf, primary_frame, photo_pool, is_en=is_en
+        )
+        return
     # Subtle moving real HD B-roll video behind the investigative board (NEVER flat void!)
     _draw_video_backdrop_layer(
         canvas,
@@ -4734,44 +5080,65 @@ def _draw_sleek_lower_third(
     scene_dur: float,
     title_tf: skia.Typeface,
     ui_tf: skia.Typeface,
-    max_display_s: float = 3.2,
+    max_display_s: float = 3.8,
 ) -> None:
-    """Draw sleek investigative documentary Lower Third that enters cleanly and fades out after `max_display_s`
-    so the cinema footage remains unobstructed.
+    """Draw sleek investigative documentary Lower Third in mobile safe-zone (`y=192px`, `+38%` larger text,
+    tight auto-fitted pill width) by delegating to `draw_pro_safezone_lower_third` (with safe-zone fallback).
     """
+    if draw_pro_safezone_lower_third is not None:
+        draw_pro_safezone_lower_third(
+            canvas,
+            w,
+            h,
+            scene.lower_third_title,
+            scene.lower_third_subtitle,
+            local_t,
+            scene_dur,
+            title_tf,
+            ui_tf,
+            max_display_s=max_display_s,
+        )
+        return
+
     vis_dur = min(scene_dur, max_display_s)
     if local_t >= vis_dur:
         return
     enter = _ease_out_cubic(local_t / 0.35)
     exit_a = _ease_out_cubic((vis_dur - local_t) / 0.35) if (vis_dur - local_t) < 0.35 else 1.0
-    alpha = int(235 * min(enter, exit_a))
+    alpha = int(242 * min(enter, exit_a))
     if alpha <= 10:
         return
 
     is_wide = w >= h
-    box_w = min(w - 140.0, 640.0 if is_wide else 860.0)
-    box_h = 90.0
-    bx = 72.0 + (1.0 - enter) * -32.0
-    by = h * 0.728 if is_wide else 74.0
+    max_avail_w = (w * 0.62) if is_wide else (w - 92.0)
+    lt_title_clean = _sanitize_glyphs(_normalize_upper(scene.lower_third_title), typeface=title_tf)
+    t_font, t_lns = _wrap_text_to_width(lt_title_clean, title_tf, 35.0, 22.0, max_avail_w - 56.0, 1)
+    t_str = t_lns[0] if t_lns else ""
+    t_w = float(t_font.measureText(t_str)) if t_str else 0.0
+
+    lt_sub_clean = _sanitize_glyphs(_normalize_upper(scene.lower_third_subtitle), typeface=ui_tf)
+    s_font, s_lns = _wrap_text_to_width(lt_sub_clean, ui_tf, 25.0, 16.0, max_avail_w - 56.0, 1)
+    s_str = s_lns[0] if s_lns else ""
+    s_w = float(s_font.measureText(s_str)) if s_str else 0.0
+
+    box_w = max(240.0, min(max_avail_w, max(t_w, s_w) + 56.0))
+    box_h = 104.0
+    bx = (68.0 if is_wide else 46.0) + (1.0 - enter) * -32.0
+    by = (h * 0.728) if is_wide else 192.0
 
     r = skia.Rect.MakeXYWH(bx, by, box_w, box_h)
-    bg = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(int(alpha * 0.88), 12, 9, 22))
-    bg.setImageFilter(skia.ImageFilters.DropShadow(0, 10, 20, 20, skia.ColorSetARGB(int(alpha * 0.7), 0, 0, 0)))
+    bg = skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(int(alpha * 0.90), 12, 9, 22))
+    bg.setImageFilter(skia.ImageFilters.DropShadow(0, 10, 20, 20, skia.ColorSetARGB(int(alpha * 0.75), 0, 0, 0)))
     canvas.drawRoundRect(r, 14.0, 14.0, bg)
 
     # Vertical glowing accent bar on left edge
     bar_r = skia.Rect.MakeXYWH(bx, by + 10.0, 8.0, box_h - 20.0)
     canvas.drawRoundRect(bar_r, 4.0, 4.0, skia.Paint(AntiAlias=True, Color=hex_to_skia(scene.highlight_color, alpha)))
 
-    lt_title_clean = _sanitize_glyphs(_normalize_upper(scene.lower_third_title), typeface=title_tf)
-    t_font, t_lns = _wrap_text_to_width(lt_title_clean, title_tf, 26.0, 16.0, box_w - 44.0, 1)
-    if t_lns:
-        _draw_safe_string(canvas, t_lns[0], bx + 26.0, by + 39.0, t_font, skia.Paint(AntiAlias=True, Color=hex_to_skia("#FFD166", alpha)))
-
-    lt_sub_clean = _sanitize_glyphs(_normalize_upper(scene.lower_third_subtitle), typeface=ui_tf)
-    s_font, s_lns = _wrap_text_to_width(lt_sub_clean, ui_tf, 19.0, 13.5, box_w - 44.0, 1)
-    if s_lns:
-        _draw_safe_string(canvas, s_lns[0], bx + 26.0, by + 71.0, s_font, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(alpha, 218, 212, 238)))
+    if t_str:
+        _draw_safe_string(canvas, t_str, bx + 26.0, by + 44.0, t_font, skia.Paint(AntiAlias=True, Color=hex_to_skia("#FFD166", alpha)))
+    if s_str:
+        _draw_safe_string(canvas, s_str, bx + 26.0, by + 81.0, s_font, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(alpha, 244, 239, 230)))
 
 
 def _draw_doc_subtitles(
@@ -4782,10 +5149,11 @@ def _draw_doc_subtitles(
     t: float,
     caption_tf: skia.Typeface,
     caption_style: str = "cinema_minimal",
+    mood: str = "dark_horror",
 ) -> None:
     """Render studio-grade kinetic documentary subtitles via `engine.kinetic_captions.draw_kinetic_captions`
-    (supporting all 6 presets: `hormozi_neon`, `karaoke_glow`, `word_slam`, `cinema_minimal`,
-    `typewriter_highlight`, `none`) with guaranteed zero edge clipping and built-in fallback.
+    using `DARK_CINEMA_PILL_PALETTE` (`#9E1B24` crimson, `#FFD166` gold, `#D97706` amber) when
+    `mood in ('dark_horror', 'epic_history', 'investigative_crime')`.
     """
     resolved_style = (
         resolve_caption_style(caption_style)
@@ -4796,6 +5164,13 @@ def _draw_doc_subtitles(
         return
 
     is_wide = w >= h
+    norm_mood = str(mood or "dark_horror").strip().lower()
+    active_palette = (
+        DARK_CINEMA_PILL_PALETTE
+        if norm_mood in ("dark_horror", "epic_history", "investigative_crime")
+        else ACTIVE_PILL_PALETTE
+    )
+
     # Contrast lower-third cinema scrim so kinetic captions stay razor-sharp over moving footage
     scrim = skia.Paint()
     scrim.setShader(
@@ -4817,7 +5192,7 @@ def _draw_doc_subtitles(
             style=resolved_style,
             y_ratio=0.905 if is_wide else 0.84,
             font_size=58.0 if is_wide else 72.0,
-            palette=ACTIVE_PILL_PALETTE,
+            palette=active_palette,
         )
         return
 
@@ -4864,7 +5239,7 @@ def _draw_doc_subtitles(
                     canvas.translate(pos_map[id(tk)], 0.0)
                     if tk["act"]:
                         canvas.scale(tk["sc"], tk["sc"])
-                        pbg, ptx, (gr, gg, gb, ga) = ACTIVE_PILL_PALETTE[tk["pidx"] % len(ACTIVE_PILL_PALETTE)]
+                        pbg, ptx, (gr, gg, gb, ga) = active_palette[tk["pidx"] % len(active_palette)]
                         pr = skia.Rect.MakeXYWH(-tk["w"] * 0.5 - pad_x, -ascent - pad_y, tk["w"] + pad_x * 2.0, ascent + descent + pad_y * 2.0)
                         pp = skia.Paint(AntiAlias=True, Color=hex_to_skia(pbg))
                         pp.setImageFilter(skia.ImageFilters.DropShadow(0, 6, 16, 16, skia.ColorSetARGB(ga, gr, gg, gb)))
@@ -4921,6 +5296,21 @@ def _active_slice_layer(
     shot_dur = max(0.8, slice_dur / float(n_shots))
     shot_idx = min(n_shots - 1, max(0, int(slice_t / shot_dur)))
     return layers[shot_idx]
+
+
+def _extract_skia_image_from_shot_layer(
+    layer: Optional[Tuple[str, Any]],
+    primary_frame: Optional[skia.Image],
+) -> Optional[skia.Image]:
+    """Return a static or decoded Skia Image from a shot_layers entry."""
+    if layer is None:
+        return primary_frame
+    kind, payload = layer
+    if kind == "photo_25d" and isinstance(payload, tuple) and len(payload) >= 1 and payload[0] is not None:
+        return payload[0]
+    if kind == "photo_still" and payload is not None:
+        return payload
+    return primary_frame
 
 
 def _layer_needs_primary_video(layer: Optional[Tuple[str, Any]]) -> bool:
@@ -5114,6 +5504,13 @@ def _render_single_doc_scene_to_disk(
     g_end = 0.0
     pre_layers: List[Tuple[str, Any]] = []
     post_layers: List[Tuple[str, Any]] = []
+    chapter_backdrop_layer: Optional[Tuple[str, Any]] = None
+    graphic_backdrop_layer: Optional[Tuple[str, Any]] = None
+    if chapter_intro_s > 0.0 and len(loaded_media.shot_layers) >= 2:
+        # Fix #98 Finding #2: Use shot_layers[-1] (or parallax_bg) for the Chapter Card backdrop
+        # so it is 100% distinct from the pre-graphic beat (shot_layers[0]) and graphic backdrop!
+        chapter_backdrop_layer = loaded_media.shot_layers[-1]
+
     if bookend_win is not None:
         g_start, g_end, pre_count = bookend_win
         card_photo_idx = loaded_media.primary_photo_layer_idx
@@ -5141,6 +5538,21 @@ def _render_single_doc_scene_to_disk(
         else:
             pre_layers = loaded_media.shot_layers[:pre_count]
             post_layers = loaded_media.shot_layers[pre_count:] or loaded_media.shot_layers[-1:]
+
+        # Guarantee pre_layers[0] is distinct from chapter_backdrop_layer and graphic_backdrop_layer is distinct from both!
+        if len(loaded_media.shot_layers) >= 2:
+            if chapter_intro_s > 0.0 and not pre_layers:
+                pre_layers = [loaded_media.shot_layers[0]]
+            pre_first = pre_layers[0] if pre_layers else loaded_media.shot_layers[0]
+            for cand_lyr in loaded_media.shot_layers:
+                if cand_lyr is not pre_first and cand_lyr is not chapter_backdrop_layer:
+                    graphic_backdrop_layer = cand_lyr
+                    break
+            if graphic_backdrop_layer is None:
+                for cand_lyr in loaded_media.shot_layers:
+                    if cand_lyr is not pre_first:
+                        graphic_backdrop_layer = cand_lyr
+                        break
 
     # Show sleek Lower-Third on Scene 0, Chapter Starts, ANY Location/Era Change, or every 4th scene
     cur_lt_norm = _normalize_upper(_clean_doc_text(scene.lower_third_title))
@@ -5219,7 +5631,7 @@ def _render_single_doc_scene_to_disk(
             need_primary_video = False
             need_pip_video = False
             if in_chapter_intro:
-                need_primary_video = True
+                need_primary_video = _layer_needs_primary_video(chapter_backdrop_layer) if chapter_backdrop_layer is not None else True
             elif use_bookended_graphic:
                 if body_t < g_start:
                     active_lyr = _active_slice_layer(pre_layers, body_t, g_start)
@@ -5230,7 +5642,7 @@ def _render_single_doc_scene_to_disk(
                     need_primary_video = _layer_needs_primary_video(active_lyr)
                     need_pip_video = (active_lyr is not None and active_lyr[0] == "video_secondary")
                 else:
-                    need_primary_video = True
+                    need_primary_video = _layer_needs_primary_video(graphic_backdrop_layer) if graphic_backdrop_layer is not None else True
                     need_pip_video = (scene.visual_mode == "dark_map_route")
             elif scene.visual_mode in ("cinema_multishot", "parallax_25d_photo"):
                 if loaded_media.shot_layers:
@@ -5255,13 +5667,22 @@ def _render_single_doc_scene_to_disk(
             )
             # If Vision rejected stock B-roll video for this scene, cleanly use our hero Nano Banana 2.1 plate as backdrop!
             fallback_backdrop = primary_frame or loaded_media.parallax_bg or loaded_media.primary_photo
+            chapter_backdrop = (
+                _extract_skia_image_from_shot_layer(chapter_backdrop_layer, primary_frame)
+                or loaded_media.parallax_bg
+                or fallback_backdrop
+            )
+            graphic_backdrop = (
+                _extract_skia_image_from_shot_layer(graphic_backdrop_layer, primary_frame)
+                or fallback_backdrop
+            )
 
             if in_chapter_intro:
                 _draw_video_backdrop_layer(
                     c,
                     w,
                     h,
-                    fallback_backdrop,
+                    chapter_backdrop,
                     global_t,
                     local_t / max(0.1, chapter_intro_s),
                     scrim_alpha=155,
@@ -5291,44 +5712,46 @@ def _render_single_doc_scene_to_disk(
                 if use_bookended_graphic:
                     if body_t < g_start:
                         _draw_unique_shot_slice(
-                            c, w, h, pre_layers, body_t, g_start, global_t, primary_frame, pip_frame, s_idx=s_idx
+                            c, w, h, pre_layers, body_t, g_start, global_t, primary_frame, pip_frame,
+                            s_idx=s_idx, scene=scene, title_tf=title_tf,
                         )
                     elif body_t >= g_end:
                         _draw_unique_shot_slice(
                             c, w, h, post_layers, body_t - g_end, max(0.4, body_dur - g_end), global_t,
                             primary_frame, pip_frame, s_idx=s_idx + 1, cut_flash_on_first=True,
+                            scene=scene, title_tf=title_tf,
                         )
                     else:
                         g_t = body_t - g_start
                         g_prog = min(1.0, g_t / max(0.3, g_end - g_start))
                         if scene.visual_mode == "newspaper_highlighter":
-                            _draw_mode_newspaper_highlighter(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
+                            _draw_mode_newspaper_highlighter(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
                         elif scene.visual_mode == "dark_map_route":
-                            _draw_mode_dark_map_route(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, fallback_backdrop, pip_frame or fallback_backdrop, is_en=is_en)
+                            _draw_mode_dark_map_route(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, graphic_backdrop, pip_frame or graphic_backdrop, is_en=is_en)
                         elif scene.visual_mode == "sliding_timeline":
-                            _draw_mode_sliding_timeline(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
+                            _draw_mode_sliding_timeline(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
                         else:
-                            _draw_mode_red_string_board(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
+                            _draw_mode_red_string_board(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
                         if g_t < 0.11:
                             ck = 1.0 - (g_t / 0.11)
                             c.drawRect(skia.Rect.MakeXYWH(0, 0, w, h), skia.Paint(Color=skia.ColorSetARGB(int(95 * (ck ** 1.6)), 255, 224, 175)))
                 elif scene.visual_mode == "cinema_multishot":
                     _draw_mode_cinema_multishot(
                         c, w, h, scene, prog, body_t, body_dur, global_t, primary_frame, pip_frame, loaded_media,
-                        cut_cadence_s=cut_cadence_s, s_idx=s_idx,
+                        cut_cadence_s=cut_cadence_s, s_idx=s_idx, title_tf=title_tf,
                     )
                 elif scene.visual_mode == "broll_video_pip":
                     _draw_mode_broll_video_pip(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, pip_frame, loaded_media, is_en=is_en)
                 elif scene.visual_mode == "video_pip_evidence":
                     _draw_mode_video_pip_evidence(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, pip_frame, loaded_media, is_en=is_en)
                 elif scene.visual_mode == "newspaper_highlighter":
-                    _draw_mode_newspaper_highlighter(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
+                    _draw_mode_newspaper_highlighter(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
                 elif scene.visual_mode == "dark_map_route":
-                    _draw_mode_dark_map_route(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, pip_frame or fallback_backdrop, is_en=is_en)
+                    _draw_mode_dark_map_route(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, graphic_backdrop, pip_frame or graphic_backdrop, is_en=is_en)
                 elif scene.visual_mode == "sliding_timeline":
-                    _draw_mode_sliding_timeline(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
+                    _draw_mode_sliding_timeline(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
                 elif scene.visual_mode == "red_string_board":
-                    _draw_mode_red_string_board(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
+                    _draw_mode_red_string_board(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, graphic_backdrop, loaded_media, is_en=is_en)
                 else:
                     _draw_mode_parallax_25d_photo(
                         c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media,
@@ -5336,8 +5759,8 @@ def _render_single_doc_scene_to_disk(
                     )
 
                 if show_lower_third:
-                    _draw_sleek_lower_third(c, w, h, scene, body_t, body_dur, title_tf, ui_tf, max_display_s=3.2)
-                _draw_doc_subtitles(c, w, h, chunks, local_t, caption_tf, caption_style=caption_style)
+                    _draw_sleek_lower_third(c, w, h, scene, body_t, body_dur, title_tf, ui_tf, max_display_s=3.8)
+                _draw_doc_subtitles(c, w, h, chunks, local_t, caption_tf, caption_style=caption_style, mood=scene.mood)
 
             # Top slim cinema progress bar
             bar_w = max(8.0, w * min(1.0, global_t / max(0.1, total_est_dur)))
@@ -5716,15 +6139,25 @@ def _select_doc_music_bed(
     """Select the mood-matched cinema atmosphere music bed unless the caller explicitly forces a file or 'none'."""
     if isinstance(music_mp3, str) and music_mp3.strip().lower() == "none":
         return None
-    if music_mp3 is not None and str(music_mp3).strip().lower() not in ("", "auto"):
-        p_forced = Path(music_mp3)
-        if p_forced.exists():
-            return p_forced
 
     music_dir = ASSETS_DIR / "music"
     mood = str(plan_obj.mood or _classify_topic_mood(plan_obj.title)).strip().lower()
 
     if mood in ("dark_horror", "investigative_crime"):
+        upgraded_path: Optional[Path] = None
+        if ensure_upgraded_dark_horror_music is not None:
+            try:
+                got = ensure_upgraded_dark_horror_music(force_regen=False)
+                if got is not None and Path(got).exists():
+                    upgraded_path = Path(got)
+            except Exception as exc:
+                print(f"[NetflixDoc] ensure_upgraded_dark_horror_music fallback: {exc}", flush=True)
+        if music_mp3 is not None and str(music_mp3).strip().lower() not in ("", "auto"):
+            p_forced = Path(music_mp3)
+            if p_forced.exists() and p_forced.name not in ("epic_doc.mp3", "dark_pulse.mp3", "dark_mystery_horror.mp3"):
+                return p_forced
+        if upgraded_path is not None:
+            return upgraded_path
         cand = music_dir / "dark_mystery_horror.mp3"
         if cand.exists():
             return cand
@@ -5734,6 +6167,11 @@ def _select_doc_music_bed(
             except Exception:
                 pass
         return music_dir / "dark_pulse.mp3"
+
+    if music_mp3 is not None and str(music_mp3).strip().lower() not in ("", "auto"):
+        p_forced = Path(music_mp3)
+        if p_forced.exists():
+            return p_forced
 
     if mood == "corporate_thriller":
         cand = music_dir / "dark_pulse.mp3"
@@ -5933,7 +6371,7 @@ async def render_netflix_documentary(
     thermal_limit_c: float = 85.0,
     progress_cb=None,
     caption_style: Optional[str] = None,
-    music_volume: float = 0.17,
+    music_volume: float = 0.34,
     voice_rate: str = "+0%",
     voice_pitch: str = "-4Hz",
     resume: bool = False,
@@ -5976,7 +6414,7 @@ async def render_netflix_documentary(
             pass
 
     resolved_music_mp3 = _select_doc_music_bed(plan_obj, music_mp3=music_mp3, thermal_limit_c=thermal_limit_c)
-    eff_music_vol = max(0.0, min(0.45, float(music_volume if music_volume is not None else 0.17)))
+    eff_music_vol = max(0.33, min(0.50, float(music_volume if music_volume is not None else 0.34)))
 
     title_tf, font_info = _load_verified_typeface("Montserrat-Black.ttf", role="doc_title")
     ui_tf, _ = _load_verified_typeface("PlusJakartaSans-ExtraBold.ttf", role="doc_ui")
@@ -5998,8 +6436,8 @@ async def render_netflix_documentary(
             sfx_events.append((p_sfx, round(t_s, 3), float(vol)))
 
     cursor_t = 0.0
-    pause_gap_s = 0.24
-    tail_pad_s = 0.40
+    pause_gap_s = 0.42
+    tail_pad_s = 1.25
     xfade_dur = CINEMA_XFADE_DURATION_S
     gap_wav = work_dir / "_doc_gap.wav"
     run_ffmpeg_safe(
@@ -6396,3 +6834,6 @@ async def render_netflix_documentary(
         "u2netp_25d_active": u2netp_25d_used,
         **media_telemetry,
     }
+
+
+render_netflix_doc_video = render_netflix_documentary
