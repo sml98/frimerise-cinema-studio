@@ -195,6 +195,27 @@ OFFTOPIC_MEDIA_TAGS = (
     "coin",
     "postage",
     "stamp",
+    "paraglider",
+    "paragliding",
+    "hang glider",
+    "skydiving",
+    "skiing",
+    "snowboard",
+    "snowboarding",
+    "steampunk",
+    "ai generated",
+    "3d render",
+    "cgi",
+    "waterfront",
+    "resort",
+    "vacation",
+    "tourism",
+    "cruise",
+    "yacht",
+    "speedboat",
+    "ferry",
+    "canal boat",
+    "gondola",
 )
 
 DARK_HISTORY_EXTRA_BAD_TAGS = (
@@ -214,6 +235,25 @@ DARK_HISTORY_EXTRA_BAD_TAGS = (
     "happy family",
     "gift box",
     "shopping mall",
+    "bus",
+    "car",
+    "automobile",
+    "truck",
+    "motorcycle",
+    "airplane",
+    "aircraft",
+    "helicopter",
+    "train",
+    "subway",
+    "modern city",
+    "downtown",
+    "apartment",
+    "hotel",
+    "swimming",
+    "sunbathing",
+    "palm",
+    "island",
+    "colorful houses",
 )
 
 
@@ -583,6 +623,255 @@ def _save_photo_query_index(q_hash: str, entries: List[Dict[str, Any]]) -> None:
         pass
 
 
+def compute_image_dhash(bgr: np.ndarray, hash_size: int = 8) -> Optional[int]:
+    """Compute a fast 64-bit perceptual difference hash (dhash) to catch duplicate/near-duplicate media."""
+    try:
+        if bgr is None or bgr.size == 0:
+            return None
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+        resized = cv2.resize(gray, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
+        diff = resized[:, 1:] > resized[:, :-1]
+        bits = 0
+        for val in diff.flatten():
+            bits = (bits << 1) | int(bool(val))
+        return bits
+    except Exception:
+        return None
+
+
+def compute_file_dhash(img_path: Path) -> Optional[int]:
+    try:
+        bgr = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+        return compute_image_dhash(bgr)
+    except Exception:
+        return None
+
+
+def compute_video_dhash(video_path: Path) -> Optional[int]:
+    """Extract the middle frame of a video clip and compute its 64-bit perceptual hash."""
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return None
+        try:
+            n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if n_frames > 4:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, n_frames // 2)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                return None
+            return compute_image_dhash(frame)
+        finally:
+            cap.release()
+    except Exception:
+        return None
+
+
+def is_perceptual_duplicate(
+    cand_hash: Optional[int],
+    used_dhashes: Optional[Set[int]],
+    max_hamming: int = 8,
+) -> bool:
+    """Return True if `cand_hash` is visually identical or near-duplicate to any hash in `used_dhashes`."""
+    if cand_hash is None or not used_dhashes:
+        return False
+    for existing in used_dhashes:
+        if (cand_hash ^ existing).bit_count() <= max_hamming:
+            return True
+    return False
+
+
+def _search_openverse_photos(
+    client: httpx.Client,
+    query: str,
+    min_width: int = 640,
+    mood: str = "",
+) -> List[Dict[str, str]]:
+    """Query Openverse (Smithsonian, Wikimedia, Flickr CC, Museum archives — 100% commercial CC licenses, zero API key)."""
+    results: List[Dict[str, str]] = []
+    seen_urls: Set[str] = set()
+    try:
+        r = client.get(
+            "https://api.openverse.org/v1/images/",
+            params={
+                "q": query,
+                "page_size": 10,
+                "license_type": "commercial",
+            },
+            headers={"User-Agent": WIKIMEDIA_USER_AGENT},
+            timeout=9.0,
+        )
+        if r.status_code != 200:
+            return []
+        for item in r.json().get("results", []):
+            title_tags = " ".join([
+                str(item.get("title") or ""),
+                " ".join(str(t.get("name") or "") for t in (item.get("tags") or []) if isinstance(t, dict)),
+            ]).lower()
+            if any(bad in title_tags for bad in PHOTO_BAD_WORDS):
+                continue
+            if _is_offtopic_media_tags(title_tags, query=query, mood=mood):
+                continue
+            w = int(item.get("width") or 0)
+            h = int(item.get("height") or 0)
+            if w and w < max(320, min_width):
+                continue
+            if h and h < 200:
+                continue
+            url = str(item.get("url") or "").strip()
+            thumb = str(item.get("thumbnail") or url).strip()
+            if not url or url in seen_urls or url.lower().endswith(".svg"):
+                continue
+            seen_urls.add(url)
+            results.append({
+                "source": "openverse_photo",
+                "url": url,
+                "thumb": thumb,
+                "tags": title_tags[:120],
+            })
+    except Exception:
+        pass
+    return results
+
+
+def _download_thumb_bgr(client: httpx.Client, url: str, timeout: float = 6.5) -> Optional[np.ndarray]:
+    if not url:
+        return None
+    headers = {"User-Agent": WIKIMEDIA_USER_AGENT} if ("wikimedia" in url.lower() or "openverse" in url.lower()) else {}
+    try:
+        r = client.get(url, headers=headers, timeout=timeout)
+        if r.status_code != 200 or len(r.content) < 1500:
+            return None
+        arr = np.frombuffer(r.content, dtype=np.uint8)
+        bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if bgr is None or bgr.size == 0 or bgr.shape[0] < 64 or bgr.shape[1] < 64:
+            return None
+        return bgr
+    except Exception:
+        return None
+
+
+def vision_select_best_candidate(
+    thumb_bgrs: List[np.ndarray],
+    query: str,
+    scene_context: str = "",
+    mood: str = "dark_horror",
+    min_score: int = 7,
+) -> Tuple[int, int, str]:
+    """Multimodal Gemini Flash Lite Vision Critic: inspects up to 4 candidate thumbnails in ONE
+    ~1s API call via a labeled 2x2 grid (`1`, `2`, `3`, `4`) and returns `(best_idx_0based, score, reason)`.
+    Returns `(-1, 0, reason)` if NONE of the candidates truly fit the historical/documentary scene!
+    """
+    if not thumb_bgrs:
+        return -1, 0, "no_candidates"
+    gkey = _read_gemini_api_key()
+    if not gkey:
+        return 0, 7, "no_vision_key"
+
+    n_c = min(4, len(thumb_bgrs))
+    cell_w, cell_h = 320, 220
+    cols = 2 if n_c > 1 else 1
+    rows = 2 if n_c > 2 else 1
+    grid = np.zeros((rows * cell_h, cols * cell_w, 3), dtype=np.uint8)
+
+    for idx in range(n_c):
+        bgr = thumb_bgrs[idx]
+        tile = _center_crop_resize_bgr(bgr, cell_w, cell_h, high_quality=False)
+        # Draw high-contrast label badge ("1", "2", "3", "4") in top-left corner
+        cv2.rectangle(tile, (4, 4), (48, 44), (0, 0, 0), -1)
+        cv2.putText(tile, str(idx + 1), (14, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.05, (0, 255, 255), 3, cv2.LINE_AA)
+        r_i, c_i = divmod(idx, cols)
+        grid[r_i * cell_h : (r_i + 1) * cell_h, c_i * cell_w : (c_i + 1) * cell_w] = tile
+
+    ok_enc, buf = cv2.imencode(".jpg", grid, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    if not ok_enc:
+        return 0, 7, "encode_skip"
+    b64_img = base64.b64encode(buf.tobytes()).decode("ascii")
+
+    mood_desc = {
+        "dark_horror": "dark gothic historical horror documentary (strictly NO sunny beaches, paragliders, modern cars/buses, steampunk vehicles, tropical resorts, cosplayers, or cheerful stock photos)",
+        "epic_history": "authentic historical cinema documentary (strictly NO modern vehicles, sports, tourists, neon, or anachronistic modern objects)",
+        "investigative_crime": "gritty noir investigative true-crime documentary (strictly NO cartoons, bright vacation scenes, or stock clip-art)",
+        "corporate_thriller": "prestige financial/corporate documentary thriller",
+    }.get(mood, "prestige cinematic documentary")
+
+    prompt_txt = (
+        f"You are the strict Visual Director for a {mood_desc}.\n"
+        f"Target shot prompt: {query}\n"
+        f"Scene narration context: {(scene_context or query)[:260]}\n"
+        f"Look at the {n_c} candidate images labeled 1..{n_c} in the grid.\n"
+        f"Pick the SINGLE best image that genuinely depicts the target subject and period/mood with ZERO modern anachronisms, "
+        f"ZERO watermarks/text overlays, ZERO off-topic scenery (e.g. paragliders, steampunk buses, tropical resorts, tile floors, butterflies, modern tourists).\n"
+        f"If NONE of the images score at least {min_score}/10 for this exact scene, set best=0.\n"
+        'Reply STRICT JSON ONLY: {"best": 0, "score": 0, "reason": "short"}'
+    )
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inlineData": {"mimeType": "image/jpeg", "data": b64_img}},
+                {"text": prompt_txt},
+            ]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 120,
+            "temperature": 0.1,
+        },
+    }
+    try:
+        resp = httpx.post(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
+            json=payload,
+            headers={"Content-Type": "application/json", "x-goog-api-key": gkey},
+            timeout=12.0,
+        )
+        if resp.status_code != 200:
+            return 0, 7, f"http_{resp.status_code}"
+        raw_txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(raw_txt)
+        best_1 = int(parsed.get("best") or 0)
+        score = int(parsed.get("score") or 0)
+        reason = str(parsed.get("reason") or "")[:90]
+        if 1 <= best_1 <= n_c and score >= min_score:
+            return best_1 - 1, score, reason
+        return -1, score, reason
+    except Exception as exc:
+        return 0, 7, f"vision_err:{str(exc)[:40]}"
+
+
+def verify_video_frame_vision(
+    video_path: Path,
+    query: str,
+    scene_context: str = "",
+    mood: str = "dark_horror",
+    min_score: int = 7,
+) -> Tuple[bool, int, str]:
+    """Extract a representative frame from a downloaded video and verify semantic relevance via Gemini Vision."""
+    try:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return False, 0, "cannot_open"
+        try:
+            n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if n_frames > 6:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, n_frames // 3)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                return False, 0, "empty_frame"
+        finally:
+            cap.release()
+        idx, score, reason = vision_select_best_candidate(
+            [frame],
+            query=query,
+            scene_context=scene_context,
+            mood=mood,
+            min_score=min_score,
+        )
+        return (idx == 0), score, reason
+    except Exception:
+        return True, 7, "verify_skip"
+
+
 def _search_pixabay_photos(
     client: httpx.Client,
     query: str,
@@ -629,9 +918,10 @@ def _search_pixabay_photos(
                 if img_h and img_h < 200:
                     continue
                 url = str(hit.get("largeImageURL") or hit.get("webformatURL") or "").strip()
+                thumb = str(hit.get("previewURL") or hit.get("webformatURL") or url).strip()
                 if url and url not in seen_urls:
                     seen_urls.add(url)
-                    scored_results.append((rel_score, {"source": "pixabay_photo", "url": url}))
+                    scored_results.append((rel_score, {"source": "pixabay_photo", "url": url, "thumb": thumb}))
             if scored_results:
                 break
         except Exception:
@@ -978,17 +1268,12 @@ def fetch_doc_hero_or_archival_photo(
     prefer_gemini: bool = False,
     aspect_ratio: str = "16:9",
     bespoke_prompt_en: str = "",
+    scene_context: str = "",
+    used_dhashes: Optional[Set[int]] = None,
+    strict_vision: bool = True,
+    allow_duplicate: bool = False,
 ) -> Optional[Path]:
-    """Fetch a bespoke Gemini dark-cinema hero photo OR real archival Pixabay / Wikimedia photograph.
-
-    Designed for open-topic documentaries (macabre folklore, ancient history, true crime, finance):
-      - When `prefer_gemini=True` or historical/folklore/macabre cues are present (e.g. Krampus,
-        Saturnalia, ancient winter rituals), tries the LIVE Gemini Native Image API first (cached in
-        `data/doc_photo_cache/`), then seamlessly blends real Wikimedia Commons archival artworks/photos
-        and Pixabay HD photography!
-      - Never falls back to unrelated financial stock photos when mood is `dark_horror`, `epic_history`,
-        or `investigative_crime`.
-    """
+    """Fetch a bespoke hero photo OR Vision-verified real archival Openverse / Wikimedia / Pixabay photograph."""
     return fetch_doc_real_photo(
         query=query,
         work_dir=work_dir,
@@ -999,6 +1284,10 @@ def fetch_doc_hero_or_archival_photo(
         prefer_gemini=prefer_gemini,
         aspect_ratio=aspect_ratio,
         bespoke_prompt_en=bespoke_prompt_en,
+        scene_context=scene_context,
+        used_dhashes=used_dhashes,
+        strict_vision=strict_vision,
+        allow_duplicate=allow_duplicate,
     )
 
 
@@ -1012,33 +1301,37 @@ def fetch_doc_real_photo(
     prefer_gemini: bool = False,
     aspect_ratio: str = "16:9",
     bespoke_prompt_en: str = "",
+    scene_context: str = "",
+    used_dhashes: Optional[Set[int]] = None,
+    strict_vision: bool = True,
+    allow_duplicate: bool = False,
 ) -> Optional[Path]:
-    """Fetch a REAL documentary / editorial photograph (or bespoke Gemini dark-cinema plate) with disk caching.
-
-    Priority order:
-      - If `prefer_gemini` or folklore/macabre/ancient-ritual cues detected:
-          Gemini Native Image (`gemini-2.5-flash-image` / `gemini-3.1-flash-image`) ->
-          Wikimedia Commons Archival / Pixabay HD Photo -> Pollinations Flux -> Mood-curated stock
-      - Standard real-world photography:
-          Pixabay Photo API -> Wikimedia Commons Search API -> Gemini Native Image (on stock miss) ->
-          Pollinations Flux -> Mood-curated real documentary query fallback + validated local cache
-
-    Every image is validated via `cv2.imread` (non-None, width >= 320, height >= 200,
-    not chroma-key green) and cached in `data/doc_photo_cache/`.
+    """Fetch a Vision-verified documentary photograph (Openverse / Wikimedia / Pixabay) OR bespoke
+    Google Flow Pro (`Nano Banana 2.1`) / Gemini / Pollinations dark-cinema plate, enforcing:
+      1. Multimodal Gemini Vision Critic (score >= 7/10; rejects paragliders, modern buses, tropical
+         resorts, cosplayers, watermarks, anachronisms BEFORE accepting!).
+      2. 64-bit Perceptual dhash deduplication across the entire video (zero visual repetition!).
     """
     resolved_mood = _infer_media_mood(f"{query} {bespoke_prompt_en}", mood)
     mood_defaults = MOOD_DOC_PHOTO_QUERIES.get(resolved_mood, CURATED_DOC_PHOTO_QUERIES)
     norm_q = _normalize_query(query, mood_defaults[0])
     used = used_urls if used_urls is not None else set()
+    dhashes = used_dhashes if used_dhashes is not None else set()
     q_hash = hashlib.sha256(norm_q.lower().encode("utf-8")).hexdigest()[:16]
     eff_min_w = max(320, int(min_width))
-    is_bespoke_folklore = bool(
-        prefer_gemini
-        or _BESPOKE_HISTORY_FOLKLORE_RE.search(norm_q)
-        or (bespoke_prompt_en and _BESPOKE_HISTORY_FOLKLORE_RE.search(bespoke_prompt_en))
-    )
+    ctx_text = (scene_context or bespoke_prompt_en or norm_q).strip()
 
-    # 0. Fast persistent cache lookup by query hash (respecting used_urls uniqueness)
+    def _check_dhash_ok(img_path: Path) -> bool:
+        if allow_duplicate:
+            return True
+        dh = compute_file_dhash(img_path)
+        if is_perceptual_duplicate(dh, dhashes, max_hamming=8):
+            return False
+        if dh is not None:
+            dhashes.add(dh)
+        return True
+
+    # 0. Fast persistent cache lookup by query hash (respecting used_urls, dhash AND Vision check)
     cached_entries = _load_photo_query_index(q_hash)
     for entry in cached_entries:
         c_url = str(entry.get("url") or "")
@@ -1046,31 +1339,26 @@ def fetch_doc_real_photo(
         if not c_url or c_url in used:
             continue
         ok, _, _ = _validate_photo_file(c_file, min_width=min(eff_min_w, 320))
-        if ok:
-            used.add(c_url)
-            url_hash = hashlib.sha256(c_url.encode("utf-8")).hexdigest()[:16]
-            return _materialize_photo_in_work_dir(c_file, work_dir, tag, url_hash)
-
-    # 1. Bespoke Gemini Native Image Generation for folklore / ancient / macabre hero plates
-    gemini_tried = False
-    if is_bespoke_folklore:
-        gemini_tried = True
-        gem_prompt = bespoke_prompt_en.strip() if bespoke_prompt_en.strip() else norm_q
-        gem_path = generate_doc_gemini_image(
-            prompt_en=gem_prompt,
-            work_dir=work_dir,
-            tag=tag,
-            mood=resolved_mood,
-            aspect_ratio=aspect_ratio,
-            min_width=eff_min_w,
-            used_urls=used,
-        )
-        if gem_path is not None:
-            return gem_path
+        if not ok:
+            continue
+        if strict_vision and str(entry.get("source") or "") not in ("google_flow_bespoke", "google_flow_pro_nano_banana_2"):
+            bgr_c = cv2.imread(str(c_file), cv2.IMREAD_COLOR)
+            if bgr_c is not None:
+                v_idx, v_sc, v_why = vision_select_best_candidate([bgr_c], query=norm_q, scene_context=ctx_text, mood=resolved_mood, min_score=7)
+                if v_idx != 0:
+                    print(f"[DocMedia] Vision rejected cached photo ({v_sc}/10: {v_why}) -> {c_file.name}", flush=True)
+                    continue
+        if not _check_dhash_ok(c_file):
+            continue
+        used.add(c_url)
+        url_hash = hashlib.sha256(c_url.encode("utf-8")).hexdigest()[:16]
+        return _materialize_photo_in_work_dir(c_file, work_dir, tag, url_hash)
 
     pixabay_key, _ = _read_api_keys()
 
-    def _record_and_return(cached_path: Path, src_url: str, src_name: str, w: int, h: int) -> Path:
+    def _record_and_return(cached_path: Path, src_url: str, src_name: str, w: int, h: int) -> Optional[Path]:
+        if not _check_dhash_ok(cached_path):
+            return None
         used.add(src_url)
         entries = _load_photo_query_index(q_hash)
         if not any(e.get("url") == src_url for e in entries):
@@ -1091,38 +1379,89 @@ def fetch_doc_real_photo(
         )
         return _materialize_photo_in_work_dir(cached_path, work_dir, tag, url_hash)
 
-    # For specific museum/historical terms (e.g. Saturnalia, medieval engraving), prefer Wikimedia archival plates first
-    prefer_wiki_first = bool(
-        re.search(r"\b(saturnalia|painting|engraving|manuscript|roman|medieval|victorian|historical|museum|myth|pagan|ritual|folklore)\b", norm_q, re.IGNORECASE)
-    )
-
     with httpx.Client(follow_redirects=True, timeout=16.0) as client:
-        def _try_pixabay() -> Optional[Path]:
-            if not pixabay_key:
-                return None
-            for item in _search_pixabay_photos(client, norm_q, pixabay_key, min_width=eff_min_w, mood=resolved_mood):
-                url = item["url"]
-                if url in used:
-                    continue
-                dl = _download_and_validate_photo(client, url, item["source"], q_hash, min_width=eff_min_w)
-                if dl is not None:
-                    p, w, h = dl
-                    return _record_and_return(p, url, item["source"], w, h)
-            return None
+        def _try_vision_verified_stock(search_q: str) -> Optional[Path]:
+            """Collect up to 4 candidate thumbnails across Wikimedia + Openverse + Pixabay,
+            evaluate ALL 4 simultaneously in ONE 1-second Gemini Vision Critic call, and ONLY
+            download full-res of the winning candidate if score >= 7/10!
+            """
+            pool: List[Dict[str, str]] = []
+            # Historical / museum subjects prioritize Wikimedia + Openverse ahead of generic Pixabay
+            if resolved_mood in ("dark_horror", "epic_history"):
+                pool.extend(_search_wikimedia_photos(client, search_q, min_width=eff_min_w, mood=resolved_mood)[:4])
+                pool.extend(_search_openverse_photos(client, search_q, min_width=eff_min_w, mood=resolved_mood)[:4])
+                if pixabay_key:
+                    pool.extend(_search_pixabay_photos(client, search_q, pixabay_key, min_width=eff_min_w, mood=resolved_mood)[:4])
+            else:
+                if pixabay_key:
+                    pool.extend(_search_pixabay_photos(client, search_q, pixabay_key, min_width=eff_min_w, mood=resolved_mood)[:4])
+                pool.extend(_search_openverse_photos(client, search_q, min_width=eff_min_w, mood=resolved_mood)[:4])
+                pool.extend(_search_wikimedia_photos(client, search_q, min_width=eff_min_w, mood=resolved_mood)[:4])
 
-        def _try_wikimedia() -> Optional[Path]:
-            wiki_candidates = _search_wikimedia_photos(client, norm_q, min_width=eff_min_w, mood=resolved_mood)
-            for req_w in (eff_min_w, 320):
-                for item in wiki_candidates:
-                    url = item["url"]
-                    if url in used:
-                        continue
-                    dl = _download_and_validate_photo(client, url, item["source"], q_hash, min_width=req_w)
+            fresh: List[Dict[str, str]] = []
+            seen_u: Set[str] = set()
+            for item in pool:
+                u = str(item.get("url") or "")
+                if not u or u in used or u in seen_u:
+                    continue
+                seen_u.add(u)
+                fresh.append(item)
+
+            if not fresh:
+                return None
+
+            if not strict_vision:
+                for item in fresh[:6]:
+                    dl = _download_and_validate_photo(client, item["url"], item["source"], q_hash, min_width=min(eff_min_w, 320))
                     if dl is not None:
                         p, w, h = dl
-                        return _record_and_return(p, url, item["source"], w, h)
-                if req_w == 320:
+                        res = _record_and_return(p, item["url"], item["source"], w, h)
+                        if res is not None:
+                            return res
+                return None
+
+            # Download up to 4 small thumbnails (fast, ~30KB each) and run Batch-4 Gemini Vision selection!
+            cand_items: List[Dict[str, str]] = []
+            cand_bgrs: List[np.ndarray] = []
+            for item in fresh[:8]:
+                if len(cand_items) >= 4:
                     break
+                t_url = str(item.get("thumb") or item["url"])
+                tbgr = _download_thumb_bgr(client, t_url)
+                if tbgr is None:
+                    continue
+                dh = compute_image_dhash(tbgr)
+                if not allow_duplicate and is_perceptual_duplicate(dh, dhashes, max_hamming=8):
+                    continue
+                cand_items.append(item)
+                cand_bgrs.append(tbgr)
+
+            if not cand_items:
+                return None
+
+            best_i, v_score, v_reason = vision_select_best_candidate(
+                cand_bgrs,
+                query=search_q,
+                scene_context=ctx_text,
+                mood=resolved_mood,
+                min_score=7,
+            )
+            if best_i < 0:
+                print(
+                    f"[DocMedia] Vision rejected all {len(cand_items)} stock hits for '{search_q}' ({v_score}/10: {v_reason})",
+                    flush=True,
+                )
+                return None
+
+            winner = cand_items[best_i]
+            dl = _download_and_validate_photo(client, winner["url"], winner["source"], q_hash, min_width=min(eff_min_w, 320))
+            if dl is not None:
+                p, w, h = dl
+                print(
+                    f"[DocMedia] Vision APPROVED {winner['source']} ({v_score}/10: {v_reason}) | q='{search_q}'",
+                    flush=True,
+                )
+                return _record_and_return(p, winner["url"], winner["source"], w, h)
             return None
 
         def _try_google_flow_bespoke() -> Optional[Path]:
@@ -1136,7 +1475,7 @@ def fetch_doc_real_photo(
                     out_path=flow_target,
                     aspect_ratio=aspect_ratio,
                     mood=resolved_mood,
-                    try_browser=bool(prefer_gemini or _BESPOKE_HISTORY_FOLKLORE_RE.search(flow_prompt)),
+                    try_browser=True,
                 )
                 if flow_path is not None and flow_path.exists():
                     ok_v, fw, fh = _validate_photo_file(flow_path, min_width=320, min_height=200)
@@ -1146,95 +1485,35 @@ def fetch_doc_real_photo(
                 pass
             return None
 
-        # a/b) For vivid folklore/macabre subjects (Krampus, demons, pagan rituals), prefer dark-cinema bespoke art
-        # (Google Flow / Pollinations Flux) ahead of random street-parade/cosplay Wikimedia uploads!
-        is_folklore_bespoke = bool(_BESPOKE_HISTORY_FOLKLORE_RE.search(f"{norm_q} {bespoke_prompt_en}"))
-        if is_folklore_bespoke and (prefer_gemini or bespoke_prompt_en.strip()):
-            hit = _try_google_flow_bespoke() or _try_wikimedia() or _try_pixabay()
-        elif prefer_wiki_first:
-            hit = _try_wikimedia() or _try_google_flow_bespoke() or _try_pixabay()
-        else:
-            hit = _try_pixabay() or _try_wikimedia()
+        # 1. Try Vision-verified archival/stock photography FIRST (fast, ~1.5s, 0% junk)
+        hit = _try_vision_verified_stock(norm_q)
         if hit is not None:
             return hit
 
-        # c) Bespoke Gemini Native Image -> Google Flow (Nano Banana 2 / Pollinations Flux) when stock misses!
-        if not gemini_tried:
-            gem_prompt = bespoke_prompt_en.strip() if bespoke_prompt_en.strip() else norm_q
-            gem_path = generate_doc_gemini_image(
-                prompt_en=gem_prompt,
-                work_dir=work_dir,
-                tag=tag,
-                mood=resolved_mood,
-                aspect_ratio=aspect_ratio,
-                min_width=eff_min_w,
-                used_urls=used,
-            )
-            if gem_path is not None:
-                return gem_path
-
+        # 2. If Vision rejected stock (or no stock found), generate bespoke cinema art via Google Flow Pro / Pollinations!
         flow_hit = _try_google_flow_bespoke()
         if flow_hit is not None:
             return flow_hit
 
-        # d) Mood-curated real documentary photo queries fallback (NEVER financial banks for dark_horror/history!)
+        # 3. Last resort: try mood-matched curated queries ONLY if they ALSO pass Gemini Vision >= 7/10!
         fb_pool = list(mood_defaults)
         start_idx = int(q_hash[:4], 16) % len(fb_pool)
-        for offset in range(len(fb_pool)):
+        for offset in range(min(3, len(fb_pool))):
             fb_q = fb_pool[(start_idx + offset) % len(fb_pool)]
-            fb_candidates: List[Dict[str, str]] = []
-            if pixabay_key:
-                fb_candidates.extend(_search_pixabay_photos(client, fb_q, pixabay_key, min_width=eff_min_w, mood=resolved_mood))
-            if not fb_candidates:
-                fb_candidates.extend(_search_wikimedia_photos(client, fb_q, min_width=320, mood=resolved_mood))
-            for item in fb_candidates:
-                url = item["url"]
-                if url in used:
-                    continue
-                dl = _download_and_validate_photo(client, url, item["source"], q_hash, min_width=320)
-                if dl is not None:
-                    p, w, h = dl
-                    return _record_and_return(p, url, f"{item['source']}_fallback", w, h)
+            fb_hit = _try_vision_verified_stock(fb_q)
+            if fb_hit is not None:
+                return fb_hit
 
-        # e) Pollinations Flux fallback (only if Pixabay, Wikimedia & Gemini all missed)
-        pol = _fetch_pollinations_photo(client, norm_q, q_hash, used, min_width=eff_min_w, mood=resolved_mood)
-        if pol is not None:
-            p, url, w, h = pol
-            return _record_and_return(p, url, "pollinations_flux", w, h)
-
-    # f) Offline safety net: prefer cached photos matching the same mood first!
-    mood_matched_files: List[Path] = []
-    for idx_file in DOC_PHOTO_CACHE_DIR.glob("idx_*.json"):
-        try:
-            items = json.loads(idx_file.read_text(encoding="utf-8"))
-            if isinstance(items, list):
-                for it in items:
-                    if str(it.get("mood") or "") == resolved_mood and it.get("file"):
-                        cp = DOC_PHOTO_CACHE_DIR / str(it["file"])
-                        if cp.exists() and cp not in mood_matched_files:
-                            mood_matched_files.append(cp)
-        except Exception:
-            continue
-
-    all_cached = sorted(
-        [p for p in DOC_PHOTO_CACHE_DIR.glob("*.jpg") if p.is_file() and (p.name.startswith("photo_") or p.name.startswith("gemini_"))],
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    ordered_cache = mood_matched_files + [p for p in all_cached if p not in mood_matched_files]
-
-    for p in ordered_cache:
-        key = f"cache://{p.name}"
-        if key in used:
-            continue
-        ok, _, _ = _validate_photo_file(p, min_width=320)
-        if ok:
-            used.add(key)
-            return _materialize_photo_in_work_dir(p, work_dir, tag, p.stem[-8:])
-    for p in ordered_cache:
-        ok, _, _ = _validate_photo_file(p, min_width=320)
-        if ok:
-            return _materialize_photo_in_work_dir(p, work_dir, tag, p.stem[-8:])
+    if allow_duplicate:
+        all_cached = sorted(
+            [p for p in DOC_PHOTO_CACHE_DIR.glob("*.jpg") if p.is_file() and (p.name.startswith("flow_") or p.name.startswith("photo_"))],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for p in all_cached:
+            ok, _, _ = _validate_photo_file(p, min_width=320)
+            if ok:
+                return _materialize_photo_in_work_dir(p, work_dir, tag, p.stem[-8:])
     return None
 
 
@@ -1448,10 +1727,16 @@ def _fetch_pixabay_doc_broll(
     used_hashes: Set[str],
     want_landscape: bool = True,
     mood: str = "",
+    scene_context: str = "",
+    used_dhashes: Optional[Set[int]] = None,
+    strict_vision: bool = True,
 ) -> Optional[Tuple[Path, str]]:
-    """Fast Pixabay HD B-roll search preferring 1080p/720p MP4s with strict anti-junk semantic filtering."""
+    """Fast Pixabay HD B-roll search preferring 1080p/720p MP4s with strict anti-junk filtering
+    AND Multimodal Gemini Vision thumbnail pre-screening BEFORE downloading full MP4s!
+    """
     if not api_key:
         return None
+    dhashes = used_dhashes if used_dhashes is not None else set()
     queries_to_try = [query]
     short_q = _shorten_query(query, max_words=3)
     if short_q and short_q.lower() != query.lower():
@@ -1476,8 +1761,8 @@ def _fetch_pixabay_doc_broll(
         except Exception:
             continue
 
-        # Rank hits strictly by semantic relevance & filter out butterflies/floor tiles/abstract junk!
-        ranked_hits: List[Tuple[int, Dict[str, Any]]] = []
+        # Rank hits strictly by semantic relevance & filter out butterflies/steampunk/paraglider/bus junk!
+        ranked_hits: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
         for hit in hits:
             tags = str(hit.get("tags") or "").lower()
             if any(bad in tags for bad in BAD_TAG_WORDS):
@@ -1485,16 +1770,66 @@ def _fetch_pixabay_doc_broll(
             rel_score = _score_media_relevance(q, tags, mood=mood)
             if rel_score <= 0:
                 continue
-            ranked_hits.append((rel_score, hit))
-        ranked_hits.sort(key=lambda x: x[0], reverse=True)
-
-        for _, hit in ranked_hits:
             picked = _pick_cpu_friendly_pixabay_video_variant(
                 hit.get("videos") or {},
                 want_landscape=want_landscape,
             )
             if not picked:
                 continue
+            hsh = hashlib.sha256(picked["url"].encode("utf-8")).hexdigest()[:16]
+            if hsh in used_hashes:
+                continue
+            ranked_hits.append((rel_score, hit, picked))
+        ranked_hits.sort(key=lambda x: x[0], reverse=True)
+        if not ranked_hits:
+            continue
+
+        # Pre-screen top 4 candidate video thumbnails in ONE 1-second Gemini Vision call BEFORE downloading!
+        ordered_candidates = ranked_hits[:6]
+        if strict_vision and _read_gemini_api_key():
+            v_items: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+            v_bgrs: List[np.ndarray] = []
+            for _, hit, picked in ordered_candidates:
+                if len(v_items) >= 4:
+                    break
+                vids = hit.get("videos") or {}
+                t_url = str(
+                    (vids.get("tiny") or {}).get("thumbnail")
+                    or (vids.get("small") or {}).get("thumbnail")
+                    or (vids.get("medium") or {}).get("thumbnail")
+                    or ""
+                ).strip()
+                tbgr = _download_thumb_bgr(client, t_url) if t_url else None
+                if tbgr is None:
+                    continue
+                dh = compute_image_dhash(tbgr)
+                if is_perceptual_duplicate(dh, dhashes, max_hamming=8):
+                    continue
+                v_items.append((hit, picked))
+                v_bgrs.append(tbgr)
+
+            if v_items:
+                best_i, v_score, v_reason = vision_select_best_candidate(
+                    v_bgrs,
+                    query=q,
+                    scene_context=scene_context or q,
+                    mood=mood or "dark_horror",
+                    min_score=7,
+                )
+                if best_i < 0:
+                    print(
+                        f"[DocMedia] Vision rejected all {len(v_items)} Pixabay video hits for '{q}' ({v_score}/10: {v_reason})",
+                        flush=True,
+                    )
+                    continue
+                win_hit, win_picked = v_items[best_i]
+                print(
+                    f"[DocMedia] Vision APPROVED Pixabay video ({v_score}/10: {v_reason}) | q='{q}'",
+                    flush=True,
+                )
+                ordered_candidates = [(99, win_hit, win_picked)]
+
+        for _, hit, picked in ordered_candidates:
             url = picked["url"]
             hsh = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
             if hsh in used_hashes:
@@ -1510,6 +1845,11 @@ def _fetch_pixabay_doc_broll(
                 if not qrep["passed"] or not _validate_video_file(local_path):
                     local_path.unlink(missing_ok=True)
                     continue
+                vdh = compute_video_dhash(local_path)
+                if is_perceptual_duplicate(vdh, dhashes, max_hamming=8):
+                    continue
+                if vdh is not None:
+                    dhashes.add(vdh)
                 used_hashes.add(hsh)
                 print(
                     f"[DocMedia] Real HD B-roll ready (pixabay {picked['width']}x{picked['height']}): "
@@ -1530,22 +1870,23 @@ def fetch_doc_broll_clip(
     used_hashes: Set[str],
     aspect_ratio: str = "16:9",
     mood: str = "",
+    scene_context: str = "",
+    used_dhashes: Optional[Set[int]] = None,
+    strict_vision: bool = True,
 ) -> Optional[Path]:
-    """Fetch a REAL, valid, non-chroma-key HD `.mp4` B-roll clip for documentary compositing.
-
-    Uses fast HD-optimized Pixabay search + `engine.smart_vision.fetch_unique_real_clip`
-    (Pixabay -> Pexels -> yt-dlp -> Wikimedia -> Internet Archive + >30% chroma-key green filter).
-    Automatically retries mood-matched cinematic documentary queries on miss so EVERY scene
-    receives genuine moving HD video footage matching the documentary's atmosphere!
+    """Fetch a REAL, valid, Vision-verified, non-duplicate HD `.mp4` B-roll clip.
+    When `strict_vision=True` and NO stock video truly matches the scene (>=7/10), returns None cleanly
+    so the caller upgrades the shot to bespoke Google Flow Pro (`Nano Banana 2.1`) 2.5D cinema art
+    instead of injecting off-topic stock footage!
     """
     resolved_mood = _infer_media_mood(query, mood)
     curated_pool = MOOD_DOC_BROLL_QUERIES.get(resolved_mood, CURATED_DOC_BROLL_QUERIES)
     norm_q = _normalize_query(query, curated_pool[0])
     used = used_hashes if used_hashes is not None else set()
+    dhashes = used_dhashes if used_dhashes is not None else set()
     pixabay_key, pexels_key = _read_api_keys()
     want_landscape = str(aspect_ratio or "16:9").strip() != "9:16"
 
-    # Build ordered query cascade: specific query -> shortened 3-word core -> mood-matched curated queries
     tag_seed = int(hashlib.sha256(f"{tag}:{norm_q}".encode("utf-8")).hexdigest()[:6], 16)
     rotated_curated = [
         curated_pool[(tag_seed + i) % len(curated_pool)]
@@ -1559,10 +1900,10 @@ def fetch_doc_broll_clip(
         if q.lower() not in {x.lower() for x in all_queries}:
             all_queries.append(q)
 
-    # 1. Fast HD 1080p/720p Pixabay B-roll pass (avoids downloading 100MB 4K clips on Core i5)
+    # 1. Fast HD 1080p/720p Pixabay B-roll pass with Gemini Vision thumbnail pre-screening
     if pixabay_key:
         with httpx.Client(follow_redirects=True, timeout=22.0) as client:
-            for q in all_queries[:6]:
+            for q in all_queries[:4]:
                 res = _fetch_pixabay_doc_broll(
                     client,
                     q,
@@ -1570,14 +1911,16 @@ def fetch_doc_broll_clip(
                     used_hashes=used,
                     want_landscape=want_landscape,
                     mood=resolved_mood,
+                    scene_context=scene_context or norm_q,
+                    used_dhashes=dhashes,
+                    strict_vision=strict_vision,
                 )
                 if res is not None:
                     clip_path, hsh = res
                     return _materialize_video_in_work_dir(clip_path, work_dir, tag, hsh)
 
-    # 2. Multi-source fallback via engine.smart_vision.fetch_unique_real_clip
-    #    (Pixabay Video -> Pexels -> yt-dlp -> Wikimedia Commons -> Internet Archive -> cache)
-    for idx, q in enumerate(all_queries):
+    # 2. Multi-source fallback via smart_vision ONLY if Vision approves the downloaded frame!
+    for idx, q in enumerate(all_queries[:2]):
         try:
             clip = fetch_unique_real_clip(
                 q,
@@ -1587,8 +1930,20 @@ def fetch_doc_broll_clip(
                 scene_index=(tag_seed + idx) % len(curated_pool),
             )
             if clip and _validate_video_file(clip):
+                vdh = compute_video_dhash(clip)
+                if is_perceptual_duplicate(vdh, dhashes, max_hamming=8):
+                    continue
+                if strict_vision:
+                    ok_v, v_sc, v_why = verify_video_frame_vision(
+                        clip, query=q, scene_context=scene_context or norm_q, mood=resolved_mood, min_score=7
+                    )
+                    if not ok_v:
+                        print(f"[DocMedia] Vision rejected smart_vision clip ({v_sc}/10: {v_why}) -> {clip.name}", flush=True)
+                        continue
                 hsh = clip.stem.split("_")[-1][:16]
                 used.add(hsh)
+                if vdh is not None:
+                    dhashes.add(vdh)
                 print(
                     f"[DocMedia] Real HD B-roll ready (smart_vision): {clip.name} | q='{q}'",
                     flush=True,
@@ -1596,6 +1951,10 @@ def fetch_doc_broll_clip(
                 return _materialize_video_in_work_dir(clip, work_dir, tag, hsh)
         except Exception:
             continue
+
+    # When strict_vision=True, NEVER silently recycle random off-topic cached MP4s!
+    if strict_vision:
+        return None
 
     # 3. Last-resort reuse of any validated cached real MP4 clip on disk (doc_broll_cache or media_cache)
     cached_clips = []

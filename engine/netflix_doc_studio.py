@@ -59,12 +59,15 @@ from engine.gemini_tts import (
 )
 from engine.doc_media_engine import (
     VideoLayerReader,
+    compute_file_dhash,
     fetch_doc_broll_clip,
     fetch_doc_hero_or_archival_photo,
     fetch_doc_real_photo,
+    is_perceptual_duplicate,
     load_skia_image_cover,
     separate_photo_25d_u2netp,
 )
+from engine.google_flow_bridge import generate_flow_batch_images_sync
 from engine.intel_vaapi import (
     build_video_encode_args,
     get_vaapi_env,
@@ -286,6 +289,7 @@ class NetflixDocScene(BaseModel):
     pip_broll_query_en: str = "historic architecture night fog"
     photo_query_en: str = "historic archive candle dark"
     extra_photo_queries_en: List[str] = Field(default_factory=list)
+    shot_prompts_en: List[str] = Field(default_factory=list)
     transition_type: Optional[str] = None
 
 
@@ -1349,7 +1353,8 @@ def _call_open_topic_director_llm(
         "6. VISUAL PRECISION (ZERO OFF-TOPIC STOCK!): Every scene needs concrete, atmospheric English visual queries:\n"
         "   - `broll_query_en` and `pip_broll_query_en` (MUST differ from each other): concrete, real atmospheric stock video phrases that exist on Pixabay (e.g., 'snow pine forest night', 'burning candle dark shadow', 'medieval stone castle fog', 'gothic cathedral interior', 'crackling fireplace dark', 'winter snow village night', 'old leather book candle', 'ancient roman stone ruins'). NEVER use abstract words like 'floor', 'butterfly', 'background', 'texture', or 'darkness' alone.\n"
         "   - `photo_query_en` and `extra_photo_queries_en` (3-4 distinct concrete English museum/historical/photographic subjects matching THAT exact scene — e.g., 'Krampus Austrian folklore mask', 'Roman Saturnalia festival painting', 'Saint Nicholas Byzantine icon', 'Puritan Oliver Cromwell 17th century engraving', 'Victorian gothic winter postcard').\n"
-        "   - `bespoke_image_prompt_en`: vivid 16-26 word English dark-cinema photographic still prompt depicting THAT scene's exact historical moment, dramatic candlelight/chiaroscuro, 35mm film grain, ZERO text/words/letters.\n"
+        "   - `bespoke_image_prompt_en`: vivid 16-26 word English dark-cinema photographic still prompt depicting THAT scene's opening historical moment, dramatic candlelight/chiaroscuro, 35mm film grain, ZERO text/words/letters.\n"
+        "   - `shot_prompts_en`: array of 4 to 5 DISTINCT chronological English 35mm cinema still prompts (14-24 words EACH) — ONE bespoke shot for EACH phrase/beat of that scene's narration! Every single prompt MUST depict a DIFFERENT camera angle/subject matching that exact moment of the story (e.g., wide establishing shot -> tense close-up object -> dramatic character/silhouettes -> eerie symbolic detail), ZERO text/words/letters, ZERO modern anachronisms!\n"
         "   - `prefer_gemini_photo`: true for vivid historical/macabre/folklore scenes where custom AI cinema art beats generic stock.\n"
         "7. UNIQUE PER-SCENE UI METADATA: Give every scene its OWN specific `evidence_headline` (<= 48 chars, punchy newspaper headline), `evidence_quote` (1 gripping historical fact for THAT scene), and `lower_third_title` (`LOCATION • ERA`).\n"
         "8. Classify `mood` strictly as ONE of: \"dark_horror\", \"investigative_crime\", \"epic_history\", \"corporate_thriller\".\n"
@@ -1387,6 +1392,7 @@ def _call_open_topic_director_llm(
         '      "photo_query_en": "2-4 word concrete English photo query",\n'
         '      "extra_photo_queries_en": ["photo q1", "photo q2", "photo q3", "photo q4"],\n'
         '      "bespoke_image_prompt_en": "dark cinema photorealistic scene description, no text",\n'
+        '      "shot_prompts_en": ["chronological shot 1 matching phrase 1, 35mm cinema, no text", "shot 2 matching phrase 2, close-up detail, no text", "shot 3 matching phrase 3, dramatic wide angle, no text", "shot 4 matching phrase 4, moody atmospheric still, no text"],\n'
         '      "prefer_gemini_photo": true\n'
         "    }\n"
         "  ],\n"
@@ -1698,8 +1704,9 @@ def generate_netflix_doc_plan(
     is_en = clean_lang == "en_us"
     t_min = max(0.35, min(15.0, float(target_minutes or 0.5)))
     target_seconds = max(25.0, t_min * 60.0)
-    # Each narrated cinema beat (~16-24 words with natural breathing) lasts ~7.8s and cuts visually every 2.5-3.2s
-    n_scenes = max(5, min(60, int(round(target_seconds / 7.8))))
+    # Each narrated cinema beat (~20-26 words with natural human breathing at ~2.1 w/s + pauses) lasts ~11.5s
+    # and cuts visually every ~2.5s across 4-5 UNIQUE non-repeating bespoke shots!
+    n_scenes = max(4, min(60, int(round(target_seconds / 11.5))))
     voice_id = "en-US-AndrewMultilingualNeural" if is_en else "pt-BR-AntonioNeural"
     resolved_cap_style = (
         resolve_caption_style(caption_style)
@@ -2042,6 +2049,32 @@ def generate_netflix_doc_plan(
                 rs.get("bespoke_image_prompt_en"),
                 f"cinematic 35mm dark documentary still of {photo_q}, dramatic chiaroscuro lighting, no text",
             )
+            raw_shots = rs.get("shot_prompts_en")
+            shot_prompts: List[str] = []
+            if isinstance(raw_shots, list):
+                for sp in raw_shots:
+                    sp_c = _safe_field(sp, "")
+                    if sp_c and sp_c.lower() not in {x.lower() for x in shot_prompts}:
+                        shot_prompts.append(sp_c)
+            if bespoke_p and bespoke_p.lower() not in {x.lower() for x in shot_prompts}:
+                shot_prompts.insert(0, bespoke_p)
+            # Ensure at least 5 distinct chronological bespoke shot prompts per scene (zero repetition!)
+            angle_cues = (
+                "dramatic wide establishing 35mm cinema still of",
+                "tense atmospheric close-up detail shot of",
+                "moody chiaroscuro candlelight documentary frame of",
+                "shadowy nocturnal cinema still of",
+                "haunting historic archival 35mm film still of",
+            )
+            for eq_i, eq in enumerate([photo_q, *extra_photos]):
+                if len(shot_prompts) >= 6:
+                    break
+                eq_clean = str(eq or "").strip()
+                if not eq_clean:
+                    continue
+                cand_sp = f"{angle_cues[eq_i % len(angle_cues)]} {eq_clean} ({lt_title}), 35mm film grain, no text"
+                if cand_sp.lower() not in {x.lower() for x in shot_prompts}:
+                    shot_prompts.append(cand_sp)
             pref_gem = bool(rs.get("prefer_gemini_photo", mood == "dark_horror" and idx in (0, 3)))
 
             scenes.append(
@@ -2070,6 +2103,7 @@ def generate_netflix_doc_plan(
                     pip_broll_query_en=pip_q,
                     photo_query_en=photo_q,
                     extra_photo_queries_en=extra_photos[:4],
+                    shot_prompts_en=shot_prompts[:6],
                     transition_type=_select_transition_for_scene(idx, vmode, chap_card is not None),
                 )
             )
@@ -2491,6 +2525,7 @@ class SceneMediaAssets:
     pip_broll_mp4: Optional[Path] = None
     primary_photo_path: Optional[Path] = None
     extra_photo_paths: List[Path] = field(default_factory=list)
+    shot_sequence: List[Tuple[str, Path]] = field(default_factory=list)  # Ordered UNIQUE shots: [("photo"|"video", path), ...]
 
 
 @dataclass
@@ -2499,6 +2534,9 @@ class LoadedSceneSkiaMedia:
     parallax_bg: Optional[skia.Image] = None
     parallax_fg: Optional[skia.Image] = None
     extra_photos: List[skia.Image] = field(default_factory=list)
+    # Ordered UNIQUE visual layers matching assets.shot_sequence (ZERO modulo repetition!):
+    # Each tuple is ("video_primary", None) | ("photo_25d", (bg_img, fg_img)) | ("photo_still", skia_img)
+    shot_layers: List[Tuple[str, Any]] = field(default_factory=list)
     u2netp_separated: bool = False
 
 
@@ -3222,6 +3260,125 @@ def _draw_fullbleed_parallax_shot(
     canvas.drawRect(full_r, vig)
 
 
+def _draw_single_unique_shot_layer(
+    canvas: skia.Canvas,
+    w: int,
+    h: int,
+    layer: Tuple[str, Any],
+    shot_prog: float,
+    t: float,
+    primary_frame: Optional[skia.Image],
+    pip_frame: Optional[skia.Image],
+    pan_dir: float = 1.0,
+) -> None:
+    """Render one single unique visual shot (moving B-roll, 2.5D u2netp parallax, or Ken Burns bespoke still)."""
+    kind, payload = layer
+    if kind == "video_primary" and primary_frame is not None:
+        _draw_video_backdrop_layer(
+            canvas,
+            w,
+            h,
+            primary_frame,
+            t,
+            shot_prog,
+            scrim_alpha=34,
+            ken_burns_zoom=0.09,
+            show_grid=False,
+            show_dust=True,
+        )
+    elif kind == "video_secondary" and (pip_frame is not None or primary_frame is not None):
+        _draw_video_backdrop_layer(
+            canvas,
+            w,
+            h,
+            pip_frame or primary_frame,
+            t,
+            shot_prog,
+            scrim_alpha=32,
+            ken_burns_zoom=0.11,
+            show_grid=False,
+            show_dust=True,
+        )
+    elif kind == "photo_25d" and isinstance(payload, tuple) and len(payload) == 2:
+        bg_img, fg_img = payload
+        _draw_fullbleed_parallax_shot(
+            canvas,
+            w,
+            h,
+            bg_img or primary_frame,
+            fg_img,
+            shot_prog,
+            t,
+            pan_dir=pan_dir,
+        )
+    elif kind == "photo_still" and payload is not None:
+        _draw_fullbleed_parallax_shot(
+            canvas,
+            w,
+            h,
+            payload,
+            None,
+            shot_prog,
+            t,
+            pan_dir=pan_dir,
+        )
+    else:
+        _draw_video_backdrop_layer(
+            canvas,
+            w,
+            h,
+            primary_frame,
+            t,
+            shot_prog,
+            scrim_alpha=38,
+            ken_burns_zoom=0.08,
+            show_grid=False,
+            show_dust=True,
+        )
+
+
+def _draw_unique_shot_slice(
+    canvas: skia.Canvas,
+    w: int,
+    h: int,
+    layers: List[Tuple[str, Any]],
+    slice_t: float,
+    slice_dur: float,
+    t: float,
+    primary_frame: Optional[skia.Image],
+    pip_frame: Optional[skia.Image],
+    s_idx: int = 0,
+    cut_flash_on_first: bool = False,
+) -> None:
+    """Step strictly 1-to-1 across `layers` with ZERO modulo wrap-around (`min(n-1, ...)`),
+    adding a crisp 0.11s film-cut flash right on each internal visual switch!
+    """
+    if not layers:
+        _draw_video_backdrop_layer(
+            canvas, w, h, primary_frame, t, min(1.0, slice_t / max(0.2, slice_dur)),
+            scrim_alpha=36, ken_burns_zoom=0.09, show_grid=False, show_dust=True,
+        )
+        return
+    n_shots = len(layers)
+    shot_dur = max(0.8, slice_dur / float(n_shots))
+    shot_idx = min(n_shots - 1, max(0, int(slice_t / shot_dur)))
+    shot_local_t = max(0.0, slice_t - shot_idx * shot_dur)
+    shot_prog = min(1.0, shot_local_t / shot_dur)
+    pan_dir = 1.0 if (shot_idx + s_idx) % 2 == 0 else -1.0
+
+    _draw_single_unique_shot_layer(
+        canvas, w, h, layers[shot_idx], shot_prog, t, primary_frame, pip_frame, pan_dir=pan_dir
+    )
+
+    if (shot_idx > 0 or cut_flash_on_first) and shot_local_t < 0.11:
+        cut_k = 1.0 - (shot_local_t / 0.11)
+        flash_alpha = int(105 * (cut_k ** 1.6))
+        canvas.drawRect(
+            skia.Rect.MakeXYWH(0, 0, w, h),
+            skia.Paint(Color=skia.ColorSetARGB(flash_alpha, 255, 224, 175)),
+        )
+
+
 def _draw_mode_cinema_multishot(
     canvas: skia.Canvas,
     w: int,
@@ -3237,105 +3394,33 @@ def _draw_mode_cinema_multishot(
     cut_cadence_s: float = 2.6,
     s_idx: int = 0,
 ) -> None:
-    """Cinema v3 Primary Visual Mode: clean, unobstructed FULL-SCREEN multi-shot storytelling!
-    Automatically cuts visually every ~`cut_cadence_s` (2.0-3.5s) across distinct visual beats:
-      Shot 0: Full-screen HD Atmospheric B-Roll #1 with smooth dynamic push-in
-      Shot 1: Full-bleed Archival / Google Flow Art in 2.5D u2netp Parallax with drifting embers
-      Shot 2: Full-screen Secondary HD B-Roll #2 (or Archival Photo #2) with dramatic camera punch-in
-      Shot 3: Archival / Google Flow Art #2 (on longer beats)
-    Includes a crisp 0.13s dark-cinema flash/cut transition right on every internal visual cut!
+    """Cinema v4 Primary Visual Mode: clean, unobstructed FULL-SCREEN ZERO-REPETITION multi-shot storytelling!
+    Every ~`cut_cadence_s` (2.2-3.0s) cuts to a BRAND-NEW unique asset in `media.shot_layers` (NEVER wraps around!).
     """
-    eff_cadence = max(1.8, min(4.0, float(cut_cadence_s or 2.5)))
-    n_shots = max(2, min(10, int(round(body_dur / eff_cadence))))
-    shot_dur = max(1.2, body_dur / float(n_shots))
-    shot_idx = min(n_shots - 1, int(body_t / shot_dur))
-    shot_local_t = max(0.0, body_t - shot_idx * shot_dur)
-    shot_prog = min(1.0, shot_local_t / shot_dur)
-
-    # Build ordered sequence of distinct full-screen visual layers for this scene
-    shot_slots: List[str] = []
-    if s_idx % 2 == 0:
+    layers = list(media.shot_layers or [])
+    if not layers:
         if primary_frame is not None:
-            shot_slots.append("video_primary")
+            layers.append(("video_primary", None))
         if (media.parallax_bg or media.primary_photo) is not None:
-            shot_slots.append("photo_25d_primary")
+            layers.append(("photo_25d", (media.parallax_bg or media.primary_photo, media.parallax_fg)))
+        for ep in (media.extra_photos or []):
+            layers.append(("photo_still", ep))
         if pip_frame is not None:
-            shot_slots.append("video_secondary")
-        if media.extra_photos:
-            shot_slots.append("photo_extra_0")
-    else:
-        if (media.parallax_bg or media.primary_photo) is not None:
-            shot_slots.append("photo_25d_primary")
-        if primary_frame is not None:
-            shot_slots.append("video_primary")
-        if media.extra_photos:
-            shot_slots.append("photo_extra_0")
-        if pip_frame is not None:
-            shot_slots.append("video_secondary")
-    if not shot_slots:
-        shot_slots = ["video_primary"]
+            layers.append(("video_secondary", None))
 
-    kind = shot_slots[shot_idx % len(shot_slots)]
-    pan_dir = 1.0 if (shot_idx + s_idx) % 2 == 0 else -1.0
-
-    if kind == "video_primary":
-        _draw_video_backdrop_layer(
-            canvas,
-            w,
-            h,
-            primary_frame,
-            t,
-            shot_prog,
-            scrim_alpha=36,
-            ken_burns_zoom=0.09,
-            show_grid=False,
-            show_dust=True,
-        )
-    elif kind == "video_secondary":
-        _draw_video_backdrop_layer(
-            canvas,
-            w,
-            h,
-            pip_frame or primary_frame,
-            t,
-            shot_prog,
-            scrim_alpha=34,
-            ken_burns_zoom=0.11,
-            show_grid=False,
-            show_dust=True,
-        )
-    elif kind == "photo_25d_primary":
-        _draw_fullbleed_parallax_shot(
-            canvas,
-            w,
-            h,
-            media.parallax_bg or media.primary_photo,
-            media.parallax_fg,
-            shot_prog,
-            t,
-            pan_dir=pan_dir,
-        )
-    else:
-        extra_img = media.extra_photos[0] if media.extra_photos else (media.parallax_bg or media.primary_photo)
-        _draw_fullbleed_parallax_shot(
-            canvas,
-            w,
-            h,
-            extra_img,
-            None,
-            shot_prog,
-            t,
-            pan_dir=-pan_dir,
-        )
-
-    # Crisp 0.13s cinema cut flash / micro-dip right on each internal shot switch
-    if shot_idx > 0 and shot_local_t < 0.13:
-        cut_k = 1.0 - (shot_local_t / 0.13)
-        flash_alpha = int(115 * (cut_k ** 1.6))
-        canvas.drawRect(
-            skia.Rect.MakeXYWH(0, 0, w, h),
-            skia.Paint(Color=skia.ColorSetARGB(flash_alpha, 255, 224, 175)),
-        )
+    _draw_unique_shot_slice(
+        canvas,
+        w,
+        h,
+        layers,
+        slice_t=body_t,
+        slice_dur=max(0.5, body_dur),
+        t=t,
+        primary_frame=primary_frame,
+        pip_frame=pip_frame,
+        s_idx=s_idx,
+        cut_flash_on_first=False,
+    )
 
 
 def _draw_mode_parallax_25d_photo(
@@ -3351,12 +3436,29 @@ def _draw_mode_parallax_25d_photo(
     primary_frame: Optional[skia.Image],
     media: LoadedSceneSkiaMedia,
     is_en: bool = False,
+    body_dur: float = 10.0,
+    s_idx: int = 0,
 ) -> None:
-    """Mode 4: Real high-res photo separated via `separate_photo_25d_u2netp` (foreground moves 2.2x faster than background!).
-    In 9:16 vertical mobile cinema, renders FULL-BLEED edge-to-edge without heavy dashboard boxes!
+    """Mode 4 (Cinema v4): Multi-shot 2.5D u2netp Parallax & Bespoke Cinema cuts!
+    NEVER freezes 18s on a single photo — cuts smoothly across all unique shots in `media.shot_layers`!
     """
     is_wide = w >= h
     if not is_wide:
+        if media.shot_layers:
+            _draw_unique_shot_slice(
+                canvas,
+                w,
+                h,
+                media.shot_layers,
+                slice_t=body_t,
+                slice_dur=max(0.5, body_dur),
+                t=t,
+                primary_frame=primary_frame,
+                pip_frame=None,
+                s_idx=s_idx,
+                cut_flash_on_first=False,
+            )
+            return
         _draw_fullbleed_parallax_shot(
             canvas,
             w,
@@ -4549,24 +4651,49 @@ def _load_scene_skia_photos(
     w: int,
     h: int,
 ) -> LoadedSceneSkiaMedia:
-    """Pre-load real photographs into Skia Images once before the 30fps loop (zero per-frame I/O)."""
+    """Pre-load real & bespoke Google Flow photographs into Skia Images once before the 30fps loop (zero per-frame I/O)."""
     loaded = LoadedSceneSkiaMedia()
     is_wide = w >= h
 
+    # 1. Load every UNIQUE shot in assets.shot_sequence (ZERO modulo wrap-around!)
+    # Apply genuine u2netp 2.5D foreground/background separation to up to 2 hero photo shots per scene!
+    parallax_budget = 2 if scene.visual_mode in ("cinema_multishot", "parallax_25d_photo") else 1
+    used_parallax = 0
+    for kind, media_path in (assets.shot_sequence or []):
+        if kind == "video":
+            loaded.shot_layers.append(("video_primary", None))
+        elif kind == "photo" and media_path is not None and Path(media_path).exists():
+            if used_parallax < parallax_budget:
+                bg_img, fg_img = separate_photo_25d_u2netp(media_path, w, h)
+                if bg_img is not None:
+                    loaded.shot_layers.append(("photo_25d", (bg_img, fg_img)))
+                    if loaded.parallax_bg is None:
+                        loaded.parallax_bg = bg_img
+                        loaded.parallax_fg = fg_img
+                    if fg_img is not None:
+                        loaded.u2netp_separated = True
+                    used_parallax += 1
+                    continue
+            still_img = load_skia_image_cover(media_path, w, h)
+            if still_img is not None:
+                loaded.shot_layers.append(("photo_still", still_img))
+                if loaded.parallax_bg is None:
+                    loaded.parallax_bg = still_img
+
+    # 2. Load mode-specific graphic card photos (newspaper inset, evidence board cards, timeline cards)
     if scene.visual_mode in ("parallax_25d_photo", "cinema_multishot") and assets.primary_photo_path is not None:
-        if scene.visual_mode == "cinema_multishot" or not is_wide:
-            matte_w, matte_h = w, h
+        if loaded.parallax_bg is not None:
+            loaded.primary_photo = loaded.parallax_bg
         else:
-            matte_w = int(round(w * 0.76))
-            matte_h = int(round(h * 0.61))
-        bg_img, fg_img = separate_photo_25d_u2netp(assets.primary_photo_path, matte_w, matte_h)
-        if bg_img is not None:
-            loaded.parallax_bg = bg_img
-            loaded.parallax_fg = fg_img
-            loaded.primary_photo = bg_img
-            loaded.u2netp_separated = fg_img is not None
-        else:
-            loaded.primary_photo = load_skia_image_cover(assets.primary_photo_path, matte_w, matte_h)
+            matte_w, matte_h = (w, h) if (scene.visual_mode == "cinema_multishot" or not is_wide) else (int(round(w * 0.76)), int(round(h * 0.61)))
+            bg_img, fg_img = separate_photo_25d_u2netp(assets.primary_photo_path, matte_w, matte_h)
+            if bg_img is not None:
+                loaded.parallax_bg = bg_img
+                loaded.parallax_fg = fg_img
+                loaded.primary_photo = bg_img
+                loaded.u2netp_separated = fg_img is not None
+            else:
+                loaded.primary_photo = load_skia_image_cover(assets.primary_photo_path, matte_w, matte_h)
     elif assets.primary_photo_path is not None:
         if scene.visual_mode == "newspaper_highlighter":
             pw, ph = (620, 420) if is_wide else (840, 360)
@@ -4716,13 +4843,15 @@ def _render_single_doc_scene_to_disk(
             c = surface.getCanvas()
 
             primary_frame = primary_reader.read_skia_frame(darken_alpha=primary_darken) if primary_reader is not None else None
+            # If Vision rejected stock B-roll video for this scene, cleanly use our hero Nano Banana 2.1 plate as backdrop!
+            fallback_backdrop = primary_frame or loaded_media.parallax_bg or loaded_media.primary_photo
 
             if chapter_intro_s > 0.0 and local_t < chapter_intro_s:
                 _draw_video_backdrop_layer(
                     c,
                     w,
                     h,
-                    primary_frame,
+                    fallback_backdrop,
                     global_t,
                     local_t / max(0.1, chapter_intro_s),
                     scrim_alpha=155,
@@ -4747,25 +4876,68 @@ def _render_single_doc_scene_to_disk(
                 prog = min(1.0, body_t / body_dur)
                 pip_frame = pip_reader.read_skia_frame(darken_alpha=0.0) if pip_reader is not None else None
 
-                if scene.visual_mode == "cinema_multishot":
+                # Cinema v4: Graphic modes NEVER stay frozen 15-20s! Bookend graphic centerpiece (4.8-5.4s)
+                # with fresh full-screen UNIQUE cinema shots before and after!
+                graphic_modes = ("newspaper_highlighter", "dark_map_route", "sliding_timeline", "red_string_board")
+                use_bookended_graphic = (
+                    scene.visual_mode in graphic_modes
+                    and body_dur > 7.2
+                    and len(loaded_media.shot_layers) >= 2
+                )
+                if use_bookended_graphic:
+                    g_dur = min(5.4, max(4.4, body_dur * 0.42))
+                    pre_dur = max(2.2, min(3.2, (body_dur - g_dur) * 0.48))
+                    g_start = pre_dur
+                    g_end = min(body_dur - 1.8, g_start + g_dur)
+                    n_layers = len(loaded_media.shot_layers)
+                    pre_count = max(1, min(n_layers - 1, int(round(pre_dur / max(2.0, cut_cadence_s)))))
+                    pre_layers = loaded_media.shot_layers[:pre_count]
+                    post_layers = loaded_media.shot_layers[pre_count:] or loaded_media.shot_layers[-1:]
+                    if body_t < g_start:
+                        _draw_unique_shot_slice(
+                            c, w, h, pre_layers, body_t, g_start, global_t, primary_frame, pip_frame, s_idx=s_idx
+                        )
+                    elif body_t >= g_end:
+                        _draw_unique_shot_slice(
+                            c, w, h, post_layers, body_t - g_end, max(0.4, body_dur - g_end), global_t,
+                            primary_frame, pip_frame, s_idx=s_idx + 1, cut_flash_on_first=True,
+                        )
+                    else:
+                        g_t = body_t - g_start
+                        g_prog = min(1.0, g_t / max(0.3, g_end - g_start))
+                        if scene.visual_mode == "newspaper_highlighter":
+                            _draw_mode_newspaper_highlighter(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
+                        elif scene.visual_mode == "dark_map_route":
+                            _draw_mode_dark_map_route(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, fallback_backdrop, pip_frame or fallback_backdrop, is_en=is_en)
+                        elif scene.visual_mode == "sliding_timeline":
+                            _draw_mode_sliding_timeline(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
+                        else:
+                            _draw_mode_red_string_board(c, w, h, scene, g_prog, g_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
+                        if g_t < 0.11:
+                            ck = 1.0 - (g_t / 0.11)
+                            c.drawRect(skia.Rect.MakeXYWH(0, 0, w, h), skia.Paint(Color=skia.ColorSetARGB(int(95 * (ck ** 1.6)), 255, 224, 175)))
+                elif scene.visual_mode == "cinema_multishot":
                     _draw_mode_cinema_multishot(
                         c, w, h, scene, prog, body_t, body_dur, global_t, primary_frame, pip_frame, loaded_media,
                         cut_cadence_s=cut_cadence_s, s_idx=s_idx,
                     )
                 elif scene.visual_mode == "broll_video_pip":
-                    _draw_mode_broll_video_pip(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, pip_frame, loaded_media, is_en=is_en)
+                    _draw_mode_broll_video_pip(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, pip_frame, loaded_media, is_en=is_en)
                 elif scene.visual_mode == "video_pip_evidence":
-                    _draw_mode_video_pip_evidence(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, pip_frame, loaded_media, is_en=is_en)
+                    _draw_mode_video_pip_evidence(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, pip_frame, loaded_media, is_en=is_en)
                 elif scene.visual_mode == "newspaper_highlighter":
-                    _draw_mode_newspaper_highlighter(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, loaded_media, is_en=is_en)
+                    _draw_mode_newspaper_highlighter(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
                 elif scene.visual_mode == "dark_map_route":
-                    _draw_mode_dark_map_route(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, pip_frame, is_en=is_en)
+                    _draw_mode_dark_map_route(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, pip_frame or fallback_backdrop, is_en=is_en)
                 elif scene.visual_mode == "sliding_timeline":
-                    _draw_mode_sliding_timeline(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, loaded_media, is_en=is_en)
+                    _draw_mode_sliding_timeline(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
                 elif scene.visual_mode == "red_string_board":
-                    _draw_mode_red_string_board(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, loaded_media, is_en=is_en)
+                    _draw_mode_red_string_board(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media, is_en=is_en)
                 else:
-                    _draw_mode_parallax_25d_photo(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, primary_frame, loaded_media, is_en=is_en)
+                    _draw_mode_parallax_25d_photo(
+                        c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media,
+                        is_en=is_en, body_dur=body_dur, s_idx=s_idx,
+                    )
 
                 # Show sleek Lower-Third ONLY on Act/Location shifts (prevents repetitive dashboard clutter!)
                 if s_idx == 0 or scene.chapter_card is not None or (s_idx % 4 == 0):
@@ -4819,24 +4991,43 @@ def _prefetch_scene_media_sync(
     aspect_ratio: str,
     mood: str = "corporate_thriller",
     resume: bool = False,
+    scene_shot_counts: Optional[List[int]] = None,
 ) -> Tuple[List[SceneMediaAssets], Dict[str, Any]]:
-    """Fetch unique real HD B-roll videos, secondary PiP videos, and real/bespoke Gemini archival photographs."""
+    """Cinema v4 Zero-Repetition + 100% Context-Verified Media Orchestrator:
+      1. Pre-screens atmospheric B-roll videos via Multimodal Gemini Vision Critic (score >= 7/10)
+         BEFORE downloading (zero steampunk buses / caves / off-topic stock!).
+      2. Batches ALL chronological per-phrase bespoke stills across ALL scenes into ONE SINGLE
+         logged-in Google Flow Pro (`Nano Banana 2.1`) session (native 9:16 / 16:9, parallel waves of 3),
+         generating exact `scene_shot_counts[s_idx]` UNIQUE visuals per scene!
+      3. Enforces global SHA256 + 64-bit perceptual `dhash` deduplication across the ENTIRE video
+         so ZERO images or videos EVER repeat inside a scene or across scenes!
+    """
     used_video_hashes: Set[str] = set()
     used_photo_urls: Set[str] = set()
+    used_dhashes: Set[int] = set()
 
-    assets_list: List[SceneMediaAssets] = []
+    assets_list: List[SceneMediaAssets] = [SceneMediaAssets() for _ in scenes]
     broll_clips_used: List[str] = []
     pip_clips_used: List[str] = []
     photos_used: List[str] = []
-    fallback_video_pool: List[Path] = []
-    fallback_photo_pool: List[Path] = []
 
+    def _register_dhash(path: Path) -> bool:
+        dh = compute_file_dhash(path)
+        if is_perceptual_duplicate(dh, used_dhashes, max_hamming=8):
+            return False
+        if dh is not None:
+            used_dhashes.add(dh)
+        return True
+
+    # -------------------------------------------------------------------------
+    # PHASE A: Vision-Verified Atmospheric Moving HD B-Roll (at most 1 per scene;
+    # if stock doesn't truly match >= 7/10, leave None -> upgraded to bespoke Flow art!)
+    # -------------------------------------------------------------------------
     for s_idx, sc in enumerate(scenes):
-        item = SceneMediaAssets()
+        item = assets_list[s_idx]
         sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
         mood_defaults = _OPEN_TOPIC_FALLBACK_MEDIA.get(sc_mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
 
-        # 1. Primary HD B-Roll Video (EVERY SINGLE SCENE — mood-aware, never finance stocks for horror/history!)
         main_mp4 = _find_cached_work_asset(work_dir, f"broll_sc{s_idx:02d}_main", min_bytes=32_768) if resume else None
         if main_mp4 is None:
             broll_q = sc.broll_query_en or mood_defaults["broll"][s_idx % len(mood_defaults["broll"])]
@@ -4847,17 +5038,16 @@ def _prefetch_scene_media_sync(
                 used_video_hashes,
                 aspect_ratio=aspect_ratio,
                 mood=sc_mood,
+                scene_context=sc.narration,
+                used_dhashes=used_dhashes,
+                strict_vision=True,
             )
-        if main_mp4 is None and fallback_video_pool:
-            main_mp4 = fallback_video_pool[s_idx % len(fallback_video_pool)]
         if main_mp4 is not None:
             item.primary_broll_mp4 = main_mp4
             broll_clips_used.append(str(main_mp4))
-            if main_mp4 not in fallback_video_pool:
-                fallback_video_pool.append(main_mp4)
 
-        # 2. Secondary Video-over-Video (PiP) B-Roll Video
-        if sc.visual_mode in PIP_ENABLED_MODES:
+        # Secondary PiP video ONLY for genuine PiP monitor modes (dark_map_route, broll_video_pip, video_pip_evidence)
+        if sc.visual_mode in ("dark_map_route", "broll_video_pip", "video_pip_evidence"):
             pip_mp4 = _find_cached_work_asset(work_dir, f"broll_sc{s_idx:02d}_pip", min_bytes=32_768) if resume else None
             if pip_mp4 is None:
                 pip_q = sc.pip_broll_query_en or mood_defaults["pip"][s_idx % len(mood_defaults["pip"])]
@@ -4868,139 +5058,190 @@ def _prefetch_scene_media_sync(
                     used_video_hashes,
                     aspect_ratio="16:9",
                     mood=sc_mood,
+                    scene_context=sc.narration,
+                    used_dhashes=used_dhashes,
+                    strict_vision=True,
                 )
-            if pip_mp4 is None and fallback_video_pool:
-                alt = next((p for p in fallback_video_pool if p != main_mp4), fallback_video_pool[0])
-                pip_mp4 = alt
             if pip_mp4 is not None:
                 item.pip_broll_mp4 = pip_mp4
                 pip_clips_used.append(str(pip_mp4))
-                if pip_mp4 not in fallback_video_pool:
-                    fallback_video_pool.append(pip_mp4)
 
-        # 3. Real / Bespoke Archival Photographs (Gemini Native Image + Pixabay + Wikimedia seamless blend!)
-        if sc.visual_mode == "red_string_board":
-            q_list = list(sc.extra_photo_queries_en or [])
-            if not q_list:
-                q_list = [sc.photo_query_en or mood_defaults["photos"][0], *mood_defaults["photos"][:3]]
-            for pi in range(4):
-                ppath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_board_{pi + 1}") if resume else None
-                if ppath is None:
-                    pq = q_list[pi % len(q_list)]
-                    ppath = fetch_doc_hero_or_archival_photo(
-                        pq,
-                        work_dir,
-                        f"sc{s_idx:02d}_board_{pi + 1}",
-                        min_width=640,
-                        used_urls=used_photo_urls,
-                        mood=sc_mood,
-                        prefer_gemini=(bool(sc.prefer_gemini_photo) and pi == 0),
-                        aspect_ratio="16:9",
-                        bespoke_prompt_en=sc.bespoke_image_prompt_en if pi == 0 else "",
-                    )
-                if ppath is None and fallback_photo_pool:
-                    ppath = fallback_photo_pool[pi % len(fallback_photo_pool)]
-                if ppath is not None:
-                    item.extra_photo_paths.append(ppath)
+    # -------------------------------------------------------------------------
+    # PHASE B: Plan exact UNIQUE bespoke visual slots across ALL scenes & batch-generate
+    # them in ONE SINGLE logged-in Google Flow Pro (`Nano Banana 2.1`) session!
+    # -------------------------------------------------------------------------
+    batch_items: List[Dict[str, Any]] = []
+    # Track per-scene planned slots: list of (slot_key, role, prompt_en, fallback_query, out_path)
+    scene_slot_specs: List[List[Dict[str, Any]]] = []
+    global_used_prompts: Set[str] = set()
+
+    for s_idx, sc in enumerate(scenes):
+        item = assets_list[s_idx]
+        sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
+        mood_defaults = _OPEN_TOPIC_FALLBACK_MEDIA.get(sc_mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
+        target_shots = (
+            max(3, min(8, int(scene_shot_counts[s_idx])))
+            if (scene_shot_counts and s_idx < len(scene_shot_counts))
+            else 4
+        )
+        # Graphic modes bookend a 5s centerpiece graphic with unique shots before & after
+        if sc.visual_mode in ("newspaper_highlighter", "dark_map_route", "sliding_timeline", "red_string_board"):
+            n_seq_photos = max(3, target_shots - (1 if item.primary_broll_mp4 else 0))
+        else:
+            n_seq_photos = max(3, target_shots - (1 if item.primary_broll_mp4 else 0))
+
+        # Build an ordered list of rich, chronological, scene-specific English visual prompts
+        prompt_candidates: List[str] = []
+        for sp in list(getattr(sc, "shot_prompts_en", None) or []):
+            sp_c = str(sp or "").strip()
+            if sp_c and sp_c.lower() not in {x.lower() for x in prompt_candidates}:
+                prompt_candidates.append(sp_c)
+        if sc.bespoke_image_prompt_en and sc.bespoke_image_prompt_en.strip().lower() not in {x.lower() for x in prompt_candidates}:
+            prompt_candidates.insert(0, sc.bespoke_image_prompt_en.strip())
+
+        fallback_queries = [q for q in [sc.photo_query_en, *(sc.extra_photo_queries_en or [])] if str(q or "").strip()]
+        if not fallback_queries:
+            fallback_queries = list(mood_defaults["photos"])
+
+        camera_angles = (
+            "dramatic wide establishing 35mm cinema still showing",
+            "tense intimate close-up detail shot focusing on",
+            "moody nocturnal chiaroscuro candlelight scene depicting",
+            "haunting low-angle dark historical documentary frame of",
+            "atmospheric silhouette in mist and shadow showing",
+            "cinematic overhead archival mystery frame of",
+        )
+        for fq_i, fq in enumerate(fallback_queries):
+            if len(prompt_candidates) >= n_seq_photos + 2:
+                break
+            p_gen = f"{camera_angles[(s_idx + fq_i) % len(camera_angles)]} {fq} ({sc.lower_third_title}), dark 35mm film grain, no text"
+            if p_gen.lower() not in {x.lower() for x in prompt_candidates}:
+                prompt_candidates.append(p_gen)
+
+        while len(prompt_candidates) < n_seq_photos:
+            k_extra = len(prompt_candidates)
+            p_gen = (
+                f"{camera_angles[(s_idx + k_extra) % len(camera_angles)]} "
+                f"{sc.lower_third_title} — {sc.evidence_headline}, dark atmospheric period detail #{k_extra + 1}, 35mm cinema still, no text"
+            )
+            prompt_candidates.append(p_gen)
+
+        specs_for_scene: List[Dict[str, Any]] = []
+        for sh_i in range(n_seq_photos):
+            p_txt = prompt_candidates[sh_i]
+            if p_txt.lower() in global_used_prompts:
+                p_txt = f"{p_txt} — alternate angle #{s_idx + 1}-{sh_i + 1}"
+            global_used_prompts.add(p_txt.lower())
+
+            slot_key = f"sc{s_idx:02d}_shot{sh_i:02d}"
+            out_p = work_dir / f"flow_{slot_key}.jpg"
+            fb_q = fallback_queries[sh_i % len(fallback_queries)]
+            cached_p = _find_cached_work_asset(work_dir, f"flow_{slot_key}", min_bytes=12_000) if resume else None
+            if cached_p is None and out_p.exists() and out_p.stat().st_size >= 12_000 and resume:
+                cached_p = out_p
+            spec = {
+                "key": slot_key,
+                "role": "shot",
+                "prompt_en": p_txt,
+                "fallback_query": fb_q,
+                "out_path": out_p,
+                "cached": cached_p,
+            }
+            specs_for_scene.append(spec)
+            if cached_p is None:
+                batch_items.append({"key": slot_key, "prompt_en": p_txt, "out_path": out_p})
+
+        scene_slot_specs.append(specs_for_scene)
+
+    # Execute ONE single Google Flow Pro (`Nano Banana 2.1`) batch session for ALL bespoke shots!
+    flow_results: Dict[str, Path] = {}
+    if batch_items:
+        print(
+            f"[NetflixDoc] Generating {len(batch_items)} unique bespoke {aspect_ratio} cinema stills via Google Flow Pro (Nano Banana 2.1)...",
+            flush=True,
+        )
+        flow_results = generate_flow_batch_images_sync(
+            batch_items,
+            aspect_ratio=aspect_ratio,
+            mood=mood,
+        )
+        print(
+            f"[NetflixDoc] Google Flow Pro batch delivered {len(flow_results)}/{len(batch_items)} bespoke cinema stills!",
+            flush=True,
+        )
+
+    # -------------------------------------------------------------------------
+    # PHASE C: Assemble strictly UNIQUE, NON-REPEATING `shot_sequence` per scene
+    # (Fall back to Vision-verified Openverse/Wikimedia/Pixabay ONLY if Flow missed a slot!)
+    # -------------------------------------------------------------------------
+    for s_idx, sc in enumerate(scenes):
+        item = assets_list[s_idx]
+        sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
+        scene_photos: List[Path] = []
+
+        for spec in scene_slot_specs[s_idx]:
+            key = spec["key"]
+            ppath: Optional[Path] = spec["cached"] or flow_results.get(key)
+            if ppath is not None and Path(ppath).exists():
+                if _register_dhash(Path(ppath)):
+                    scene_photos.append(Path(ppath))
                     photos_used.append(str(ppath))
-                    if ppath not in fallback_photo_pool:
-                        fallback_photo_pool.append(ppath)
-            if item.extra_photo_paths:
-                item.primary_photo_path = item.extra_photo_paths[0]
-        elif sc.visual_mode == "sliding_timeline":
-            q_list = list(sc.extra_photo_queries_en or [sc.photo_query_en or mood_defaults["photos"][0]])
-            for pi in range(min(3, max(2, len(sc.timeline_points)))):
-                ppath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_tl_{pi + 1}") if resume else None
-                if ppath is None:
-                    pq = q_list[pi % len(q_list)]
-                    ppath = fetch_doc_hero_or_archival_photo(
-                        pq,
-                        work_dir,
-                        f"sc{s_idx:02d}_tl_{pi + 1}",
-                        min_width=640,
-                        used_urls=used_photo_urls,
-                        mood=sc_mood,
-                        prefer_gemini=(bool(sc.prefer_gemini_photo) and pi == 0),
-                        aspect_ratio="16:9",
-                    )
-                if ppath is None and fallback_photo_pool:
-                    ppath = fallback_photo_pool[pi % len(fallback_photo_pool)]
-                if ppath is not None:
-                    item.extra_photo_paths.append(ppath)
-                    photos_used.append(str(ppath))
-                    if ppath not in fallback_photo_pool:
-                        fallback_photo_pool.append(ppath)
-            if item.extra_photo_paths:
-                item.primary_photo_path = item.extra_photo_paths[0]
-        elif sc.visual_mode == "cinema_multishot":
-            # Fetch primary high-res archival / Google Flow bespoke plate + 1 extra distinct photo for multi-shot cuts!
-            ppath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_photo") if resume else None
-            if ppath is None:
-                pq = sc.photo_query_en or sc.image_prompt_en or mood_defaults["photos"][s_idx % len(mood_defaults["photos"])]
-                ppath = fetch_doc_hero_or_archival_photo(
-                    pq,
-                    work_dir,
-                    f"sc{s_idx:02d}_photo",
-                    min_width=760,
-                    used_urls=used_photo_urls,
-                    mood=sc_mood,
-                    prefer_gemini=bool(sc.prefer_gemini_photo),
-                    aspect_ratio=aspect_ratio,
-                    bespoke_prompt_en=sc.bespoke_image_prompt_en or "",
-                )
-            if ppath is None and fallback_photo_pool:
-                ppath = fallback_photo_pool[s_idx % len(fallback_photo_pool)]
-            if ppath is not None:
-                item.primary_photo_path = ppath
-                photos_used.append(str(ppath))
-                if ppath not in fallback_photo_pool:
-                    fallback_photo_pool.append(ppath)
+                    continue
 
-            # Secondary distinct archival/Flow photo for Shot 3
-            extra_q_list = list(sc.extra_photo_queries_en or [])
-            extra_q = next((q for q in extra_q_list if q.lower() != (sc.photo_query_en or "").lower()), "") or mood_defaults["photos"][(s_idx + 2) % len(mood_defaults["photos"])]
-            epath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_ms2") if resume else None
-            if epath is None:
-                epath = fetch_doc_hero_or_archival_photo(
-                    extra_q,
-                    work_dir,
-                    f"sc{s_idx:02d}_ms2",
-                    min_width=720,
-                    used_urls=used_photo_urls,
-                    mood=sc_mood,
-                    prefer_gemini=False,
-                    aspect_ratio=aspect_ratio,
-                )
-            if epath is not None:
-                item.extra_photo_paths.append(epath)
-                photos_used.append(str(epath))
-                if epath not in fallback_photo_pool:
-                    fallback_photo_pool.append(epath)
-        elif sc.visual_mode in ("parallax_25d_photo", "newspaper_highlighter", "broll_video_pip", "video_pip_evidence"):
-            min_w = 800 if sc.visual_mode == "parallax_25d_photo" else 640
-            ppath = _find_cached_work_asset(work_dir, f"photo_sc{s_idx:02d}_photo") if resume else None
-            if ppath is None:
-                pq = sc.photo_query_en or sc.image_prompt_en or mood_defaults["photos"][s_idx % len(mood_defaults["photos"])]
-                ppath = fetch_doc_hero_or_archival_photo(
-                    pq,
-                    work_dir,
-                    f"sc{s_idx:02d}_photo",
-                    min_width=min_w,
-                    used_urls=used_photo_urls,
-                    mood=sc_mood,
-                    prefer_gemini=bool(sc.prefer_gemini_photo),
-                    aspect_ratio=aspect_ratio,
-                    bespoke_prompt_en=sc.bespoke_image_prompt_en or "",
-                )
-            if ppath is None and fallback_photo_pool:
-                ppath = fallback_photo_pool[s_idx % len(fallback_photo_pool)]
-            if ppath is not None:
-                item.primary_photo_path = ppath
-                photos_used.append(str(ppath))
-                if ppath not in fallback_photo_pool:
-                    fallback_photo_pool.append(ppath)
+            # Clean Vision-verified archival stock fallback (score >= 7/10, dhash-unique, zero duplicates!)
+            fb_path = fetch_doc_hero_or_archival_photo(
+                spec["fallback_query"],
+                work_dir,
+                key,
+                min_width=640,
+                used_urls=used_photo_urls,
+                mood=sc_mood,
+                prefer_gemini=False,
+                aspect_ratio=aspect_ratio,
+                bespoke_prompt_en=spec["prompt_en"],
+                scene_context=sc.narration,
+                used_dhashes=used_dhashes,
+                strict_vision=True,
+                allow_duplicate=False,
+            )
+            if fb_path is not None and fb_path.exists():
+                scene_photos.append(fb_path)
+                photos_used.append(str(fb_path))
 
-        assets_list.append(item)
+        # Populate primary_photo_path & extra_photo_paths (for newspaper / board / timeline cards)
+        if scene_photos:
+            item.primary_photo_path = scene_photos[0]
+            if sc.visual_mode in ("red_string_board", "sliding_timeline"):
+                # Feed evidence board / timeline cards with distinct bespoke scene photos (zero random Pixabay!)
+                item.extra_photo_paths = list(scene_photos[:4])
+            else:
+                item.extra_photo_paths = list(scene_photos[1:])
+
+        # Build chronological `item.shot_sequence`: interleave Vision-verified moving video cleanly among unique photos!
+        seq: List[Tuple[str, Path]] = []
+        if item.primary_broll_mp4 is not None and scene_photos:
+            # Put bespoke hero Nano Banana 2.1 plate first on odd scenes, Vision-verified B-roll first on even scenes
+            if s_idx % 2 == 0:
+                seq.append(("photo", scene_photos[0]))
+                seq.append(("video", item.primary_broll_mp4))
+                for p_rem in scene_photos[1:]:
+                    seq.append(("photo", p_rem))
+            else:
+                seq.append(("video", item.primary_broll_mp4))
+                for p_rem in scene_photos:
+                    seq.append(("photo", p_rem))
+        elif scene_photos:
+            for p_rem in scene_photos:
+                seq.append(("photo", p_rem))
+        elif item.primary_broll_mp4 is not None:
+            seq.append(("video", item.primary_broll_mp4))
+
+        item.shot_sequence = seq
+        print(
+            f"[NetflixDoc] Scene {s_idx + 1}/{len(scenes)} ({sc.visual_mode}) assembled {len(seq)} UNIQUE non-repeating shots "
+            f"(video={1 if item.primary_broll_mp4 else 0}, bespoke/verified_photos={len(scene_photos)})",
+            flush=True,
+        )
 
     telemetry = {
         "broll_clips_used": broll_clips_used,
@@ -5009,6 +5250,8 @@ def _prefetch_scene_media_sync(
         "pip_clips_count": len(pip_clips_used),
         "photos_used": photos_used,
         "photos_count": len(photos_used),
+        "unique_dhashes_count": len(used_dhashes),
+        "google_flow_bespoke_count": len(flow_results),
         "video_over_video_active": len(pip_clips_used) > 0,
     }
     return assets_list, telemetry
@@ -5263,25 +5506,10 @@ async def render_netflix_documentary(
     ui_tf, _ = _load_verified_typeface("PlusJakartaSans-ExtraBold.ttf", role="doc_ui")
     caption_tf, _ = _load_verified_typeface("Montserrat-Black.ttf", role="doc_caption")
 
-    # 1. Pre-fetch real HD B-roll videos, secondary PiP videos, and real/bespoke archival photographs for all scenes
-    if progress_cb:
-        progress_cb(
-            10,
-            "♻️ Reaproveitando mídias B-roll HD e fotos em cache do ponto de parada..."
-            if resume
-            else "Capturando vídeos B-roll HD, feeds PiP e fotografias/artes cinematográficas de arquivo...",
-        )
-    scene_media_list, media_telemetry = await asyncio.to_thread(
-        _prefetch_scene_media_sync,
-        plan_obj.scenes,
-        work_dir,
-        plan_obj.aspect_ratio,
-        doc_mood,
-        resume,
-    )
-
-    # 2. Synthesize narration per scene & compute exact timeline with Chapter Cards + Hollywood SFX
+    # 1. AUDIO-FIRST: Synthesize narration + real Whisper word timestamps FIRST so we know each scene's
+    # exact `body_dur` and exact number of UNIQUE non-repeating visual shots needed (`body_dur / cut_cadence_s`)!
     scene_records: List[Dict[str, Any]] = []
+    scene_shot_counts: List[int] = []
     all_words: List[Dict[str, Any]] = []
     audio_parts: List[Path] = []
     sfx_events: List[Tuple[Path, float, float]] = []
@@ -5303,10 +5531,11 @@ async def render_netflix_documentary(
 
     n_scenes = len(plan_obj.scenes)
     is_dark_mood = doc_mood in ("dark_horror", "investigative_crime")
+    eff_cad = max(1.8, min(3.8, float(cut_cadence_s or 2.5)))
 
     for s_idx, sc in enumerate(plan_obj.scenes):
         if progress_cb:
-            pct = 18 + int(24 * ((s_idx + 1) / float(max(1, n_scenes))))
+            pct = 10 + int(18 * ((s_idx + 1) / float(max(1, n_scenes))))
             progress_cb(pct, f"Sintetizando narração cinema cena {s_idx + 1}/{n_scenes} ({sc.visual_mode})...")
 
         tr_name = sc.transition_type or _select_transition_for_scene(s_idx, sc.visual_mode, sc.chapter_card is not None)
@@ -5314,7 +5543,6 @@ async def render_netflix_documentary(
             transitions_plan.append(tr_name)
             # Sync Hollywood transition SFX RIGHT on the 0.35s xfade cut!
             if sc.chapter_card:
-                # Rising thriller tension leading straight into the black dip + Chapter Card braam/boom!
                 if cursor_t >= 1.4:
                     _add_sfx(cursor_t - 1.25, 0.26, "riser_tension.wav")
             elif tr_name in ("smoothleft", "wiperight"):
@@ -5338,7 +5566,6 @@ async def render_netflix_documentary(
                 thermal_limit_c=thermal_limit_c,
             )
             audio_parts.append(chap_gap_wav)
-            # Signature Chapter Card impact: chilling horror_braam for dark_horror, massive sub_boom for all others!
             if doc_mood == "dark_horror":
                 _add_sfx(cursor_t + 0.04, 0.56, "horror_braam.wav", "sub_boom.wav")
             else:
@@ -5385,19 +5612,20 @@ async def render_netflix_documentary(
                 }
             )
 
-        # Hollywood mood-matched foley & scene-entrance SFX
+        body_est = max(1.0, speech_dur + pause_gap_s)
+        n_shots_for_scene = max(3, min(7, int(round(body_est / eff_cad))))
+        scene_shot_counts.append(n_shots_for_scene)
+
+        # Hollywood mood-matched foley & internal visual-cut SFX across ALL dynamic modes!
         body_start_t = cursor_t + chapter_intro_s
         if s_idx == 0:
             if is_dark_mood:
                 _add_sfx(0.04, 0.56, "horror_braam.wav", "sub_boom.wav")
             else:
                 _add_sfx(0.04, 0.50, "cinematic_hit.wav", "sub_boom.wav")
-        if sc.visual_mode == "cinema_multishot":
-            eff_cad = max(1.8, min(4.0, float(cut_cadence_s or 2.5)))
-            body_est = max(1.0, speech_dur + pause_gap_s)
-            n_sub = max(2, min(10, int(round(body_est / eff_cad))))
-            sub_dur = body_est / float(n_sub)
-            for si_cut in range(1, n_sub):
+        if sc.visual_mode in ("cinema_multishot", "parallax_25d_photo"):
+            sub_dur = body_est / float(n_shots_for_scene)
+            for si_cut in range(1, n_shots_for_scene):
                 cut_t = body_start_t + si_cut * sub_dur
                 if si_cut % 2 == 1:
                     _add_sfx(cut_t - 0.04, 0.24, "whoosh_fast.wav", "camera_shutter.wav")
@@ -5407,8 +5635,6 @@ async def render_netflix_documentary(
             _add_sfx(body_start_t + 0.14, 0.34, "whoosh_fast.wav", "whoosh_deep.wav")
         elif sc.visual_mode == "video_pip_evidence":
             _add_sfx(body_start_t + 0.12, 0.36, "flash_impact.wav", "ui_click.wav")
-        elif sc.visual_mode == "parallax_25d_photo":
-            _add_sfx(body_start_t + 0.12, 0.40, "flash_impact.wav", "camera_shutter.wav")
         elif sc.visual_mode == "newspaper_highlighter":
             _add_sfx(body_start_t + 0.10, 0.44, "paper_flip.wav", "whoosh_deep.wav")
         elif sc.visual_mode == "dark_map_route":
@@ -5432,12 +5658,35 @@ async def render_netflix_documentary(
                 "scene_dur": audio_scene_dur,
                 "chapter_intro_s": chapter_intro_s,
                 "local_words": local_words,
-                "media_assets": scene_media_list[s_idx],
+                "media_assets": SceneMediaAssets(),
             }
         )
         audio_parts.append(wav_p)
         audio_parts.append(gap_wav)
         cursor_t = round(cursor_t + audio_scene_dur, 3)
+
+    # 2. ZERO-REPETITION MEDIA ORCHESTRATOR: Now that exact shot counts are known, pre-screen B-roll via
+    # Gemini Vision Critic AND batch-generate exact unique bespoke stills via Google Flow Pro (Nano Banana 2.1)!
+    total_planned_shots = sum(scene_shot_counts)
+    if progress_cb:
+        progress_cb(
+            30,
+            "♻️ Reaproveitando mídias exclusivas em cache do ponto de parada..."
+            if resume
+            else f"Gerando {total_planned_shots} planos exclusivos sem repetição (Google Flow Pro Nano Banana 2.1 + Auditoria Visual Gemini)...",
+        )
+    scene_media_list, media_telemetry = await asyncio.to_thread(
+        _prefetch_scene_media_sync,
+        plan_obj.scenes,
+        work_dir,
+        plan_obj.aspect_ratio,
+        doc_mood,
+        resume,
+        scene_shot_counts,
+    )
+    for idx_m, rec in enumerate(scene_records):
+        if idx_m < len(scene_media_list):
+            rec["media_assets"] = scene_media_list[idx_m]
 
     # Concatenate full narration WAV and master Broadcast Audio (-14 LUFS + 0.40s clean tail)
     concat_audio_txt = work_dir / "doc_audio_concat.txt"

@@ -980,85 +980,357 @@ def _validate_real_photo_image(img_path: Path, min_w: int = 384, min_h: int = 32
         return False
 
 
+def _style_flow_cinema_prompt(prompt_en: str, mood: str = "dark_horror") -> str:
+    clean_p = re.sub(r"\s+", " ", (prompt_en or "").strip())
+    if not clean_p:
+        return ""
+    mood_style = {
+        "dark_horror": "dark gothic 35mm cinema still, eerie chiaroscuro candlelight, mist, deep shadows, film grain, photorealistic, no text, no watermark",
+        "investigative_crime": "gritty neo-noir documentary photograph, tungsten night lighting, 35mm film grain, photorealistic, no text, no watermark",
+        "epic_history": "cinematic museum-grade historical film still, dramatic Rembrandt lighting, 35mm photography, no text, no watermark",
+        "corporate_thriller": "sleek moody prestige cinema photograph, dark glass reflections, 35mm anamorphic lens, no text, no watermark",
+    }.get(mood, "cinematic 35mm documentary photograph, dramatic lighting, no text, no watermark")
+    if "no text" in clean_p.lower():
+        return clean_p[:420]
+    return f"{clean_p}, {mood_style}"[:420]
+
+
+def _is_flow_generated_img_url(src: str) -> bool:
+    s = (src or "").lower()
+    if not s.startswith("https://"):
+        return False
+    return (
+        "flow.google.com/asb/" in s
+        or "googleusercontent.com" in s
+        or "storage.googleapis.com" in s
+    )
+
+
+async def _run_google_flow_camoufox_batch_async(
+    pending_items: List[Dict[str, Any]],
+    aspect_ratio: str = "9:16",
+    per_image_timeout_s: float = 65.0,
+    wave_size: int = 3,
+) -> Dict[str, Path]:
+    """Generate multiple bespoke Nano Banana 2.1 images in ONE single logged-in Google Flow Pro session.
+    Submits prompts in pipelined waves of `wave_size` (Google Flow renders them concurrently server-side!)
+    and matches each finished `https://flow.google.com/asb/...` image back to its exact prompt card.
+    """
+    results: Dict[str, Path] = {}
+    if not pending_items or not _has_profile_cookies():
+        return results
+
+    try:
+        from camoufox.async_api import AsyncCamoufox
+    except Exception:
+        return results
+
+    ar_target = "9:16" if str(aspect_ratio or "9:16").strip() == "9:16" else "16:9"
+
+    async with FLOW_LOCK:
+        try:
+            async with AsyncCamoufox(
+                headless=True,
+                persistent_context=True,
+                user_data_dir=str(FLOW_PROFILE_DIR),
+            ) as browser:
+                page = browser.pages[0] if browser.pages else await browser.new_page()
+                await page.goto("https://flow.google.com/", wait_until="domcontentloaded", timeout=24_000)
+                await asyncio.sleep(3.0)
+                url_now = (page.url or "").lower()
+                if "accounts.google.com" in url_now or "signin" in url_now:
+                    print("[GoogleFlow] Session expired — please reconnect Google Flow Pro profile.", flush=True)
+                    return results
+
+                # Click "Novo projeto" / "New project" to open a clean Nano Banana 2.1 project workspace
+                new_btn = page.locator(
+                    'button:has-text("Novo projeto"), button:has-text("New project")'
+                ).first
+                if await new_btn.count() == 0:
+                    return results
+                await new_btn.click(timeout=8_000)
+                try:
+                    await page.wait_for_url("**/project/**", timeout=16_000)
+                except Exception:
+                    return results
+                await asyncio.sleep(2.8)
+
+                # Configure Nano Banana 2.1: Image mode + target aspect ratio (9:16 or 16:9) + Médio/Alto + x1
+                try:
+                    cfg_btn = page.locator(
+                        'button[aria-label="Gatilho de configurações"], button[aria-label*="Settings"], button:has-text("Nano Banana")'
+                    ).first
+                    if await cfg_btn.count() > 0:
+                        await cfg_btn.click(timeout=5_000)
+                        await asyncio.sleep(0.9)
+                        for sel in (
+                            '[role="radio"]:has-text("Imagem"), [role="radio"]:has-text("Image")',
+                            f'[role="radio"]:has-text("{ar_target}")',
+                            '[role="radio"]:has-text("x1")',
+                        ):
+                            loc = page.locator(sel).first
+                            try:
+                                if await loc.count() > 0 and await loc.is_visible():
+                                    await loc.click(timeout=2_500)
+                                    await asyncio.sleep(0.3)
+                            except Exception:
+                                pass
+                        await page.keyboard.press("Escape")
+                        await asyncio.sleep(0.5)
+                except Exception as cfg_exc:
+                    print(f"[GoogleFlow] Composer settings warning: {cfg_exc}", flush=True)
+
+                seen_srcs: set[str] = set(
+                    await page.eval_on_selector_all(
+                        "img",
+                        "els => els.map(e => e.currentSrc || e.src || '').filter(Boolean)",
+                    )
+                )
+
+                tb = page.locator('[role="textbox"]').first
+                gen_btn = page.locator(
+                    'button[aria-label*="Iniciar gera"], button[aria-label*="Generate"], button:has-text("arrow_forward")'
+                ).first
+
+                eff_wave = max(1, min(4, int(wave_size)))
+                total_items = len(pending_items)
+                done_count = 0
+
+                for w_start in range(0, total_items, eff_wave):
+                    wave = pending_items[w_start : w_start + eff_wave]
+                    submitted: List[Dict[str, Any]] = []
+                    for item in wave:
+                        prompt_txt = str(item["styled_prompt"])[:420]
+                        try:
+                            await tb.click(timeout=5_000)
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Backspace")
+                            await asyncio.sleep(0.15)
+                            await page.keyboard.type(prompt_txt, delay=1)
+                            await asyncio.sleep(0.35)
+                            if not await gen_btn.is_disabled():
+                                await gen_btn.click(timeout=5_000)
+                                submitted.append(item)
+                                await asyncio.sleep(1.8)
+                        except Exception as sub_exc:
+                            print(f"[GoogleFlow] Submit error ({item['key']}): {sub_exc}", flush=True)
+
+                    if not submitted:
+                        continue
+
+                    unmatched = list(submitted)
+                    deadline = asyncio.get_running_loop().time() + max(per_image_timeout_s, 45.0 + 10.0 * len(submitted))
+
+                    while unmatched and asyncio.get_running_loop().time() < deadline:
+                        await asyncio.sleep(1.4)
+                        cards = await page.eval_on_selector_all(
+                            "img",
+                            """els => els
+                                .filter(e => e.complete && Math.max(e.naturalWidth, e.naturalHeight) >= 400 && Math.min(e.naturalWidth, e.naturalHeight) >= 220)
+                                .map(e => {
+                                    let node = e;
+                                    let ctx = '';
+                                    for (let i = 0; i < 8 && node; i++) {
+                                        const txt = (node.innerText || '').trim();
+                                        if (txt.length >= 25 && txt.length <= 900) { ctx = txt; break; }
+                                        node = node.parentElement;
+                                    }
+                                    return {
+                                        src: e.currentSrc || e.src || '',
+                                        w: e.naturalWidth,
+                                        h: e.naturalHeight,
+                                        ctx: ctx
+                                    };
+                                })""",
+                        )
+                        new_cards = [
+                            c for c in cards
+                            if c.get("src") and c["src"] not in seen_srcs and _is_flow_generated_img_url(str(c["src"]))
+                        ]
+                        for card in new_cards:
+                            src = str(card["src"])
+                            hi_src = re.sub(r"=s\d+[^/]*$", "=s0", src)
+                            ctx_low = re.sub(r"\s+", " ", str(card.get("ctx") or "").lower())
+                            # Match to exact prompt by checking first 36 chars of prompt inside card text
+                            matched_item = None
+                            for cand_it in unmatched:
+                                p_sig = re.sub(r"\s+", " ", str(cand_it["styled_prompt"]).lower())[:36]
+                                if p_sig and p_sig in ctx_low:
+                                    matched_item = cand_it
+                                    break
+                            if matched_item is None and unmatched:
+                                matched_item = unmatched[0]
+                            if matched_item is None:
+                                continue
+
+                            seen_srcs.add(src)
+                            vault_jpg = Path(matched_item["vault_jpg"])
+                            try:
+                                resp = await page.request.get(hi_src, timeout=18_000)
+                                if not resp.ok:
+                                    resp = await page.request.get(src, timeout=18_000)
+                                if resp.ok:
+                                    import cv2 as _cv2
+                                    import numpy as _np
+
+                                    raw_b = await resp.body()
+                                    bgr_im = _cv2.imdecode(_np.frombuffer(raw_b, _np.uint8), _cv2.IMREAD_COLOR)
+                                    if bgr_im is not None and bgr_im.size > 0:
+                                        vault_jpg.parent.mkdir(parents=True, exist_ok=True)
+                                        _cv2.imwrite(str(vault_jpg), bgr_im, [int(_cv2.IMWRITE_JPEG_QUALITY), 93])
+                                        if _validate_real_photo_image(vault_jpg):
+                                            results[str(matched_item["key"])] = vault_jpg
+                                            unmatched.remove(matched_item)
+                                            done_count += 1
+                                            print(
+                                                f"[GoogleFlow] Nano Banana 2.1 ({done_count}/{total_items}) ready [{ar_target} {bgr_im.shape[1]}x{bgr_im.shape[0]}]: {vault_jpg.name}",
+                                                flush=True,
+                                            )
+                                        else:
+                                            vault_jpg.unlink(missing_ok=True)
+                            except Exception:
+                                continue
+
+                    if unmatched:
+                        print(
+                            f"[GoogleFlow] Wave partial timeout ({len(unmatched)} remaining: {[u['key'] for u in unmatched]})",
+                            flush=True,
+                        )
+        except Exception as exc:
+            print(f"[GoogleFlow] Batch session error: {exc}", flush=True)
+    return results
+
+
+def generate_flow_batch_images_sync(
+    items: List[Dict[str, Any]],
+    aspect_ratio: str = "9:16",
+    mood: str = "dark_horror",
+) -> Dict[str, Path]:
+    """Batch-generate bespoke photorealistic dark-cinema images via FlowVault + ONE single
+    authenticated Google Flow Pro (`Nano Banana 2.1`) session (0 credits, native 9:16/16:9).
+
+    `items`: list of `{"key": str, "prompt_en": str, "out_path": Path}`
+    Returns `{key: out_path}` for every cached or freshly generated image.
+    """
+    vault = get_flow_vault()
+    ready: Dict[str, Path] = {}
+    pending: List[Dict[str, Any]] = []
+
+    for it in items:
+        key = str(it["key"])
+        out_path = Path(it["out_path"])
+        styled = _style_flow_cinema_prompt(str(it.get("prompt_en") or ""), mood=mood)
+        if not styled:
+            continue
+        hit = vault.lookup_asset(
+            kind="image",
+            prompt_or_mood=styled,
+            aspect_ratio=aspect_ratio,
+            record_reuse=True,
+        )
+        if hit and Path(hit["abs_path"]).exists() and str(hit.get("provider_source") or "") != "nano_banana_2_skia_studio":
+            src = Path(hit["abs_path"])
+            if _validate_real_photo_image(src):
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                if src.resolve() != out_path.resolve():
+                    shutil.copy2(src, out_path)
+                ready[key] = out_path
+                continue
+        img_hash = compute_vault_hash(styled, kind="images", aspect_ratio=aspect_ratio)
+        vault_jpg = vault.images_dir / f"flow_nb2_{img_hash}.jpg"
+        pending.append({
+            "key": key,
+            "styled_prompt": styled,
+            "vault_jpg": vault_jpg,
+            "out_path": out_path,
+        })
+
+    if not pending or not _has_profile_cookies():
+        return ready
+
+    total_timeout = max(120.0, len(pending) * 32.0 + 60.0)
+    try:
+        asyncio.get_running_loop()
+        # Running inside an active loop — execute on a clean worker thread
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            gen_map = ex.submit(
+                lambda: asyncio.run(
+                    asyncio.wait_for(
+                        _run_google_flow_camoufox_batch_async(pending, aspect_ratio=aspect_ratio),
+                        timeout=total_timeout,
+                    )
+                )
+            ).result()
+    except RuntimeError:
+        try:
+            gen_map = asyncio.run(
+                asyncio.wait_for(
+                    _run_google_flow_camoufox_batch_async(pending, aspect_ratio=aspect_ratio),
+                    timeout=total_timeout,
+                )
+            )
+        except Exception as exc:
+            print(f"[GoogleFlow] Batch runner error: {exc}", flush=True)
+            gen_map = {}
+
+    for it in pending:
+        key = str(it["key"])
+        vpath = gen_map.get(key)
+        if vpath is not None and vpath.exists():
+            vault.store_asset(
+                kind="image",
+                prompt_or_mood=str(it["styled_prompt"]),
+                file_path=vpath,
+                aspect_ratio=aspect_ratio,
+                credits_cost=0,
+                copy_into_vault=False,
+                metadata={
+                    "model": "nano_banana_2.1",
+                    "provider_source": "google_flow_pro_nano_banana_2",
+                    "mood": mood,
+                },
+            )
+            out_path = Path(it["out_path"])
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            if vpath.resolve() != out_path.resolve():
+                shutil.copy2(vpath, out_path)
+            ready[key] = out_path
+    return ready
+
+
 def _try_google_flow_camoufox_image_sync(
     prompt: str,
     out_path: Path,
-    timeout_s: float = 35.0,
+    timeout_s: float = 38.0,
+    aspect_ratio: str = "9:16",
 ) -> bool:
-    """Attempt real image generation on Google Flow (`flow.google` / `labs.google/fx/tools/flow`)
-    using the user's logged-in persistent Camoufox profile (`data/profiles/google_flow_pro/`).
-    Strictly guarded by a short timeout so any UI change or re-login need falls back cleanly.
-    """
+    """Single-image wrapper over the authenticated Google Flow Pro Nano Banana 2.1 generator."""
     if not _has_profile_cookies():
         return False
-
-    async def _run() -> bool:
-        try:
-            from camoufox.async_api import AsyncCamoufox
-        except Exception:
-            return False
-
-        async with FLOW_LOCK:
-            try:
-                async with AsyncCamoufox(
-                    headless=True,
-                    persistent_context=True,
-                    user_data_dir=str(FLOW_PROFILE_DIR),
-                ) as browser:
-                    page = browser.pages[0] if browser.pages else await browser.new_page()
-                    await page.goto(FLOW_LABS_URL, wait_until="domcontentloaded", timeout=20_000)
-                    await asyncio.sleep(2.5)
-                    url_now = (page.url or "").lower()
-                    if "accounts.google.com" in url_now or "signin" in url_now:
-                        return False
-
-                    # Locate prompt textarea / contenteditable input
-                    prompt_box = page.locator("textarea, [contenteditable='true']").first
-                    if await prompt_box.count() == 0:
-                        return False
-                    await prompt_box.click(timeout=4_000)
-                    await prompt_box.fill(prompt[:420], timeout=4_000)
-                    await prompt_box.press("Enter")
-
-                    # Poll briefly for newly rendered generated <img> blob/https URL
-                    deadline = asyncio.get_running_loop().time() + max(10.0, timeout_s - 8.0)
-                    seen_srcs = set(
-                        await page.eval_on_selector_all(
-                            "img",
-                            "els => els.map(e => e.currentSrc || e.src || '').filter(Boolean)",
-                        )
-                    )
-                    while asyncio.get_running_loop().time() < deadline:
-                        await asyncio.sleep(2.0)
-                        candidates = await page.eval_on_selector_all(
-                            "img",
-                            """els => els
-                                .filter(e => e.complete && e.naturalWidth >= 512 && e.naturalHeight >= 384)
-                                .map(e => ({src: e.currentSrc || e.src || '', w: e.naturalWidth, h: e.naturalHeight}))""",
-                        )
-                        for cand in candidates:
-                            src = str(cand.get("src") or "")
-                            if not src or src in seen_srcs:
-                                continue
-                            if src.startswith("https://") and ("googleusercontent" in src or "storage.googleapis" in src):
-                                resp = await page.request.get(src, timeout=15_000)
-                                if resp.ok:
-                                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                                    out_path.write_bytes(await resp.body())
-                                    if _validate_real_photo_image(out_path):
-                                        return True
-                                    out_path.unlink(missing_ok=True)
-                    return False
-            except Exception:
-                return False
-
+    pending = [{
+        "key": "single",
+        "styled_prompt": prompt[:420],
+        "vault_jpg": Path(out_path),
+        "out_path": Path(out_path),
+    }]
     try:
         asyncio.get_running_loop()
-        # Running inside an active loop (should be called from worker thread via asyncio.to_thread)
         return False
     except RuntimeError:
         try:
-            return asyncio.run(asyncio.wait_for(_run(), timeout=timeout_s + 5.0))
+            res = asyncio.run(
+                asyncio.wait_for(
+                    _run_google_flow_camoufox_batch_async(
+                        pending,
+                        aspect_ratio=aspect_ratio,
+                        per_image_timeout_s=timeout_s,
+                    ),
+                    timeout=timeout_s + 22.0,
+                )
+            )
+            return "single" in res and Path(out_path).exists()
         except Exception:
             return False
 
@@ -1113,7 +1385,7 @@ def generate_flow_bespoke_photo_sync(
 
     # 1. Try authenticated Google Flow browser session (if cookies present & enabled)
     if try_browser and _has_profile_cookies():
-        if _try_google_flow_camoufox_image_sync(styled_prompt, vault_jpg, timeout_s=32.0):
+        if _try_google_flow_camoufox_image_sync(styled_prompt, vault_jpg, timeout_s=36.0, aspect_ratio=aspect_ratio):
             used_source = "google_flow_pro_nano_banana_2"
 
     # 2. Fallback to Pollinations Flux photorealistic cinema generator
