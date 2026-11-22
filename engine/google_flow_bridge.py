@@ -877,7 +877,7 @@ async def _try_pollinations_flux_image(
     """Zero-credit fallback to Pollinations Flux when browser session is not yet logged in."""
     if os.environ.get("FRIMERISE_OFFLINE_FAST") == "1":
         return False
-    clean_p = re.sub(r"\s+", " ", prompt.strip())[:340]
+    clean_p = _finalize_flow_prompt(prompt, max_chars=FLOW_PROMPT_MAX_CHARS)
     url = (
         f"https://image.pollinations.ai/prompt/{quote(clean_p)}"
         f"?width={width}&height={height}&seed={seed}&nologo=true&model=flux"
@@ -1058,6 +1058,8 @@ def generate_flow_scene_image_sync(
 
 
 FLOW_PROJECT_ROTATE_INTERVAL = 18
+FLOW_PROMPT_MAX_CHARS = 750
+FLOW_NO_TEXT_SUFFIX = ", no text, no letters, no watermark"
 
 _WIDE_916_PHRASES_RE = re.compile(
     r"\b(?:ultra[- ]?wide|wide\s+establishing(?:\s+shot)?|wide[- ]?angle|widescreen|"
@@ -1067,7 +1069,7 @@ _WIDE_916_PHRASES_RE = re.compile(
 
 _FLOW_MATCH_BOILERPLATE_WORDS: Set[str] = {
     "dark", "gothic", "cinema", "still", "eerie", "chiaroscuro", "candlelight",
-    "shadows", "grain", "photorealistic", "watermark", "gritty", "documentary",
+    "shadows", "grain", "photorealistic", "watermark", "letters", "gritty", "documentary",
     "photograph", "tungsten", "night", "lighting", "cinematic", "museum", "grade",
     "historical", "dramatic", "rembrandt", "photography", "sleek", "moody",
     "prestige", "glass", "reflections", "anamorphic", "photo", "image", "scene",
@@ -1086,6 +1088,54 @@ def _strip_wide_phrases_for_vertical(prompt_text: str, aspect_ratio: Optional[st
         clean = _WIDE_916_PHRASES_RE.sub("", clean)
         clean = re.sub(r"\s+", " ", clean).strip(" ,;:-")
     return clean
+
+
+def _finalize_flow_prompt(prompt_text: str, max_chars: int = FLOW_PROMPT_MAX_CHARS) -> str:
+    """Deduplicate era-lock prefixes/clauses, enforce `max_chars` (750 default), and ALWAYS
+    preserve `, no text, no letters, no watermark` at the very end even if truncation occurs.
+    """
+    cleaned = re.sub(r"\s+", " ", (prompt_text or "").strip())
+    if not cleaned:
+        return ""
+
+    # 1. Collapse stacked duplicate '<era> historical scene:' prefixes (keep first canonical prefix)
+    hs_parts = re.split(r"\bhistorical scene:\s*", cleaned, flags=re.IGNORECASE)
+    if len(hs_parts) > 2:
+        cleaned = f"{hs_parts[0].strip()} historical scene: {hs_parts[-1].strip()}"
+
+    # 2. Deduplicate comma-separated clauses (e.g. duplicate negative era-lock blocks) and
+    #    strip scattered 'no text' / 'no letters' / 'no watermark' fragments so one canonical
+    #    directive is always anchored cleanly at the end.
+    raw_clauses = [c.strip() for c in cleaned.split(",") if c.strip()]
+    deduped_clauses: List[str] = []
+    seen_clauses: Set[str] = set()
+    _tail_neg_re = re.compile(r"^(?:no\s+text|no\s+letters|no\s+watermarks?)$", re.IGNORECASE)
+    for clause in raw_clauses:
+        norm_c = re.sub(r"\s+", " ", clause).strip()
+        if not norm_c or _tail_neg_re.match(norm_c):
+            continue
+        key_c = norm_c.lower()
+        if key_c in seen_clauses:
+            continue
+        seen_clauses.add(key_c)
+        deduped_clauses.append(norm_c)
+
+    body = ", ".join(deduped_clauses).rstrip(" ,;:-")
+    if not body:
+        return ""
+
+    limit = max(len(FLOW_NO_TEXT_SUFFIX) + 16, int(max_chars))
+    if len(body) + len(FLOW_NO_TEXT_SUFFIX) <= limit:
+        return f"{body}{FLOW_NO_TEXT_SUFFIX}"
+
+    budget = limit - len(FLOW_NO_TEXT_SUFFIX)
+    trimmed = body[:budget]
+    if len(body) > budget and body[budget : budget + 1] not in ("", " ", ",", ";"):
+        sp = trimmed.rfind(" ")
+        if sp >= int(budget * 0.65):
+            trimmed = trimmed[:sp]
+    trimmed = trimmed.rstrip(" ,;:-")
+    return f"{trimmed}{FLOW_NO_TEXT_SUFFIX}"
 
 
 def _extract_distinctive_prompt_tokens(text: str) -> Set[str]:
@@ -1204,17 +1254,17 @@ def _style_flow_cinema_prompt(
     if not clean_p:
         return ""
     mood_style = {
-        "dark_horror": "dark gothic 35mm cinema still, eerie chiaroscuro candlelight, mist, deep shadows, film grain, photorealistic, no text, no watermark",
-        "investigative_crime": "gritty neo-noir documentary photograph, tungsten night lighting, 35mm film grain, photorealistic, no text, no watermark",
-        "epic_history": "cinematic museum-grade historical film still, dramatic Rembrandt lighting, 35mm photography, no text, no watermark",
-        "corporate_thriller": "sleek moody prestige cinema photograph, dark glass reflections, 35mm anamorphic lens, no text, no watermark",
-    }.get(mood, "cinematic 35mm documentary photograph, dramatic lighting, no text, no watermark")
+        "dark_horror": "dark gothic 35mm cinema still, eerie chiaroscuro candlelight, mist, deep shadows, film grain, photorealistic",
+        "investigative_crime": "gritty neo-noir documentary photograph, tungsten night lighting, 35mm film grain, photorealistic",
+        "epic_history": "cinematic archival historical film still, dramatic Rembrandt lighting, 35mm photography",
+        "corporate_thriller": "sleek moody prestige cinema photograph, dark glass reflections, 35mm anamorphic lens",
+    }.get(mood, "cinematic 35mm documentary photograph, dramatic lighting")
     if "no text" in clean_p.lower():
         styled = clean_p
     else:
         styled = f"{clean_p}, {mood_style}"
     styled = _strip_wide_phrases_for_vertical(styled, aspect_ratio)
-    return styled[:420]
+    return _finalize_flow_prompt(styled, max_chars=FLOW_PROMPT_MAX_CHARS)
 
 
 def _is_flow_generated_img_url(src: str) -> bool:
@@ -1341,13 +1391,14 @@ async def _run_google_flow_camoufox_batch_async(
     total_items = len(pending_items)
     done_count = 0
 
-    # Normalize & sanitize prompts defensively (strips "Wide " phrases in 9:16)
+    # Normalize & sanitize prompts defensively (strips "Wide " phrases in 9:16; preserves no-text tail <= 750 chars)
     sanitized_items: List[Dict[str, Any]] = []
     for raw_it in pending_items:
         it_copy = dict(raw_it)
-        it_copy["styled_prompt"] = _strip_wide_phrases_for_vertical(
-            str(it_copy.get("styled_prompt") or ""), ar_target
-        )[:420]
+        it_copy["styled_prompt"] = _finalize_flow_prompt(
+            _strip_wide_phrases_for_vertical(str(it_copy.get("styled_prompt") or ""), ar_target),
+            max_chars=FLOW_PROMPT_MAX_CHARS,
+        )
         if it_copy.get("raw_prompt"):
             it_copy["raw_prompt"] = _strip_wide_phrases_for_vertical(
                 str(it_copy.get("raw_prompt") or ""), ar_target
@@ -1476,7 +1527,10 @@ async def _run_google_flow_camoufox_batch_async(
                         wave = project_chunk[w_start : w_start + eff_wave]
                         submitted: List[Dict[str, Any]] = []
                         for item in wave:
-                            prompt_txt = str(item["styled_prompt"])[:420]
+                            prompt_txt = _finalize_flow_prompt(
+                                str(item["styled_prompt"]),
+                                max_chars=FLOW_PROMPT_MAX_CHARS,
+                            )
                             try:
                                 await tb.click(timeout=5_000)
                                 await page.keyboard.press("Control+A")
@@ -1654,7 +1708,10 @@ def _try_google_flow_camoufox_image_sync(
         return False
     if not _has_profile_cookies():
         return False
-    clean_prompt = _strip_wide_phrases_for_vertical(prompt, aspect_ratio)[:420]
+    clean_prompt = _finalize_flow_prompt(
+        _strip_wide_phrases_for_vertical(prompt, aspect_ratio),
+        max_chars=FLOW_PROMPT_MAX_CHARS,
+    )
     if not clean_prompt:
         return False
     pending = [{
@@ -1754,7 +1811,7 @@ def generate_flow_bespoke_photo_sync(
     # 2. Fallback to Pollinations Flux photorealistic cinema generator
     if not used_source:
         seed = int(img_hash[:6], 16)
-        encoded = quote(styled_prompt[:380])
+        encoded = quote(_finalize_flow_prompt(styled_prompt, max_chars=FLOW_PROMPT_MAX_CHARS))
         poll_urls = [
             f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&seed={seed}&nologo=true&model=flux",
             f"https://image.pollinations.ai/prompt/{encoded}?width={w}&height={h}&seed={seed}&nologo=true",

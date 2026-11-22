@@ -251,7 +251,10 @@ DARK_HISTORY_EXTRA_BAD_TAGS = (
     "car",
     "automobile",
     "truck",
-    "van",
+    "police van",
+    "cargo van",
+    "delivery van",
+    "camper van",
     "minivan",
     "motorcycle",
     "airplane",
@@ -296,23 +299,138 @@ _HISTORICAL_ERA_NEGATIVE_LOCK = (
     "NO electric LED lights, NO modern hoodies or jeans"
 )
 
-_HISTORICAL_ERA_RULES: Tuple[Tuple[re.Pattern[str], str, bool], ...] = (
-    (re.compile(r"\b217\s*(?:a\.?c\.?|bc)\b|saturn[aá]lia|templo\s+de\s+saturno", re.IGNORECASE), "Ancient Rome 217 BC, Roman Republic", True),
-    (re.compile(r"\b274\s*(?:d\.?c\.?|ad)\b|aurelian", re.IGNORECASE), "Late Roman Empire 274 AD, Emperor Aurelian era", True),
-    (re.compile(r"\b336\s*(?:d\.?c\.?|ad)\b|\b354\b|\b325\b|constantin|sol\s+invictus", re.IGNORECASE), "Late Roman Empire 336 AD, Constantinian Rome", True),
-    (re.compile(r"s[eé]c(?:ulo|\.)\s*(?:iv|4|quarto)\b|\bmira\b|\bmyra\b|nicolau\s+de\s+mira", re.IGNORECASE), "4th century AD Byzantine Anatolia, Ancient Myra Lycia", True),
-    (re.compile(r"\byule\b|\bodin\b|escandin[aá]v|ca[cç]ada\s+selvagem|s[eé]c(?:ulo|\.)\s*(?:viii|ix|8|9)\b", re.IGNORECASE), "9th century Early Medieval Scandinavian and Germanic winter", True),
-    (re.compile(r"s[eé]c(?:ulo|\.)\s*(?:xi|11|onze)\b|krampus|alpes\s+austr", re.IGNORECASE), "11th century Medieval Austrian Alps", True),
-    (re.compile(r"s[eé]c(?:ulo|\.)\s*(?:xiv|xv|xvi|14|15|16)\b|tudor|abade\s+da\s+desordem|twelfth\s+night", re.IGNORECASE), "15th-century Late Medieval and Tudor Europe", True),
-    (re.compile(r"\b164[4-9]\b|canterbury|plum\s+pudding|pudim\s+de\s+ameixa|puritan", re.IGNORECASE), "1647 17th-century English Civil War Puritan England", True),
-    (re.compile(r"\b165[0-9]\b|massachusetts|boston\s*•?\s*165", re.IGNORECASE), "1659 17th-century Colonial Puritan Massachusetts and Cromwellian England", True),
-    (re.compile(r"\b1660\b|carlos\s+ii|charles\s+ii|restaura[cç][aã]o", re.IGNORECASE), "1660 Restoration England King Charles II", True),
-    (re.compile(r"\b182[23]\b|clement\s+clarke\s+moore|nova\s+york\s*•?\s*182", re.IGNORECASE), "1820s Early 19th-century Regency New York", True),
-    (re.compile(r"\b184[38]\b|dickens|scrooge|vit[oó]ria|victoria|windsor|s[eé]c(?:ulo|\.)\s*(?:xix|19)\b", re.IGNORECASE), "1840s Victorian London 19th century", True),
-    (re.compile(r"\b18(?:6[3-9]|7[0-9]|8[01])\b|thomas\s+nast|harper'?s\s+weekly", re.IGNORECASE), "1870s Late 19th-century Victorian New York wood engraving era", True),
-    (re.compile(r"\b1931\b|sundblom|coca[\s-]*cola", re.IGNORECASE), "1931 Great Depression era early 20th-century America", True),
-    (re.compile(r"solst[ií]cio|mediterr[aâ]neo|antiguidade|ancient\s+winter", re.IGNORECASE), "Pre-Christian Ancient Mediterranean and Northern Europe winter solstice", True),
+# Explicit modern / contemporary / Act-4 epilogue indicators that must NEVER be falsely
+# era-locked to Ancient Rome or Pre-Christian Solstice (e.g. S25 'O ETERNO SOLSTÍCIO').
+_MODERN_META_ERA_RE = re.compile(
+    r"\b(?:"
+    r"act_4(?:_abrupt_ending)?|"
+    r"ep[ií]logo|epilogue|"
+    r"hoje|today|presente|present[\s-]day|"
+    r"modern[ao]s?|modern[\s-]day|"
+    r"contempor[aâ]ne[ao]s?|contemporary|"
+    r"s[eé]c(?:ulo|\.)\s*(?:xxi|21)|21st[\s-]+century|"
+    r"o\s+eterno\s+solst[ií]cio|eternal\s+solstice|"
+    r"sala\s+escura|sala\s+de\s+estar|"
+    r"20(?:0\d|1\d|2\d)"
+    r")\b",
+    re.IGNORECASE,
 )
+
+_MODERN_PROMPT_ERA_RE = re.compile(
+    r"\b(?:"
+    r"act_4(?:_abrupt_ending)?|"
+    r"ep[ií]logo|epilogue|"
+    r"s[eé]c(?:ulo|\.)\s*(?:xxi|21)|21st[\s-]+century|"
+    r"modern\s+living\s+room|dark\s+living\s+room|living\s+room|"
+    r"modern[\s-]day|contemporary|contempor[aâ]ne[ao]s?|"
+    r"festa\s+moderna|seres\s+humanos\s+modernos|natal\s+moderno|hoje\s+em\s+dia|"
+    r"sala\s+escura|sala\s+de\s+estar|"
+    r"20(?:0\d|1\d|2\d)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Multi-millennium forensic synthesis spans (e.g. '217 A.C. A 1931', '2.000 ANOS') should NOT
+# blindly lock an overview / epilogue scene to the earliest year in the span.
+_MULTI_ERA_SPAN_RE = re.compile(
+    r"(?:\b\d{1,4}\s*(?:a\.?c\.?|bc)\s*(?:a|to|[-–—])\s*(?:19\d\d|20\d\d|hoje|presente)\b|"
+    r"s[ií]ntese\s+forense|dossi[eê]\s+forense|2\.?000\s+anos)",
+    re.IGNORECASE,
+)
+
+# High-specificity era rules checked with destination / later-century priority BEFORE secondary words
+_HISTORICAL_ERA_RULES: Tuple[Tuple[re.Pattern[str], str, bool], ...] = (
+    # Destination / century-range priority: S09 'MIRA A AMSTERDÃ • SÉC. XI–XVII' MUST beat '\bmira\b'!
+    (
+        re.compile(
+            r"s[eé]c(?:ulo|\.)\s*xi\s*[-–—]\s*xvii\b|"
+            r"17th[\s-]+century\s+dutch|dutch\s+golden\s+age|amsterd[aã]|new\s+amsterdam|"
+            r"sinterklaas|holand[aê]|pa[ií]ses\s+baixos|\b1600s\b",
+            re.IGNORECASE,
+        ),
+        "17th-century Dutch Golden Age Amsterdam and Northern Europe",
+        True,
+    ),
+    (re.compile(r"\b1931\b|sundblom|coca[\s-]*cola", re.IGNORECASE), "1931 Great Depression era early 20th-century America", True),
+    (re.compile(r"\b18(?:6[3-9]|7[0-9]|8[01])\b|thomas\s+nast|harper'?s\s+weekly", re.IGNORECASE), "1870s Late 19th-century Victorian New York wood engraving era", True),
+    (re.compile(r"\b182[23]\b|clement\s+clarke\s+moore|nova\s+york\s*•?\s*182", re.IGNORECASE), "1820s Early 19th-century Regency New York", True),
+    (re.compile(r"\b184[38]\b|dickens|scrooge|vit[oó]ria|victoria|windsor|victorian|s[eé]c(?:ulo|\.)\s*(?:xix|19)\b", re.IGNORECASE), "1840s Victorian London 19th century", True),
+    (re.compile(r"\b1660\b|carlos\s+ii|charles\s+ii|restaura[cç][aã]o", re.IGNORECASE), "1660 Restoration England King Charles II", True),
+    (re.compile(r"\b165[0-9]\b|massachusetts|boston\s*•?\s*165", re.IGNORECASE), "1659 17th-century Colonial Puritan Massachusetts and Cromwellian England", True),
+    (re.compile(r"\b164[4-9]\b|canterbury|plum\s+pudding|pudim\s+de\s+ameixa|puritan", re.IGNORECASE), "1647 17th-century English Civil War Puritan England", True),
+    (re.compile(r"s[eé]c(?:ulo|\.)\s*(?:xiv|xv|xvi|14|15|16)\b|tudor|abade\s+da\s+desordem|twelfth\s+night", re.IGNORECASE), "15th-century Late Medieval and Tudor Europe", True),
+    (re.compile(r"krampus|alpes\s+austr", re.IGNORECASE), "11th century Medieval Austrian Alps", True),
+    (re.compile(r"bari\s+harbor|\b1087\b", re.IGNORECASE), "11th-century Medieval Italy and Europe", True),
+    (re.compile(r"s[eé]c(?:ulo|\.)\s*(?:xi|11|onze)\b", re.IGNORECASE), "11th century Medieval Europe", True),
+    (re.compile(r"\byule\b|\bodin\b|escandin[aá]v|ca[cç]ada\s+selvagem|s[eé]c(?:ulo|\.)\s*(?:viii|ix|8|9)\b", re.IGNORECASE), "9th century Early Medieval Scandinavian and Germanic winter", True),
+    (re.compile(r"s[eé]c(?:ulo|\.)\s*(?:iv|4|quarto)\b|fourth[\s-]+century|4th[\s-]+century|l[ií]cia\s+romana|nicolau\s+de\s+mira|\bmyra\b|\bmira\b", re.IGNORECASE), "4th century AD Byzantine Anatolia, Ancient Myra Lycia", True),
+    (re.compile(r"\b336\s*(?:d\.?c\.?|ad)\b|\b354\b|\b325\b|constantin|sol\s+invictus", re.IGNORECASE), "Late Roman Empire 336 AD, Constantinian Rome", True),
+    (re.compile(r"\b274\s*(?:d\.?c\.?|ad)\b|aurelian", re.IGNORECASE), "Late Roman Empire 274 AD, Emperor Aurelian era", True),
+    (re.compile(r"\b217\s*(?:a\.?c\.?|bc)\b|saturn[aá]lia|templo\s+de\s+saturno", re.IGNORECASE), "Ancient Rome 217 BC, Roman Republic", True),
+    (re.compile(r"pr[eé][\s-]*crist[aã]|mediterr[aâ]neo|antiguidade|ancient\s+winter|solst[ií]cio\s+de\s+inverno", re.IGNORECASE), "Pre-Christian Ancient Mediterranean and Northern Europe winter solstice", True),
+)
+
+
+def _match_explicit_era_in_text(text: str) -> Optional[Tuple[str, bool]]:
+    """Match an explicit historical era, century range, or pre-1940 date inside a single text span."""
+    if not text or not text.strip():
+        return None
+    clean = text.strip()
+    is_multi_span = bool(_MULTI_ERA_SPAN_RE.search(clean))
+
+    # 1. Explicit century ranges (e.g. 'SÉC. XI–XVII') — prioritize destination/end century unless matched by named rule
+    for rx, era_label, is_pre_modern in _HISTORICAL_ERA_RULES:
+        if is_multi_span and ("217" in era_label or "1931" in era_label):
+            continue
+        if rx.search(clean):
+            return era_label, is_pre_modern
+
+    if is_multi_span:
+        return None
+
+    # 2. Generic century range ('SÉC. XI–XVII', 'SÉCULO XV A XVII') -> use destination century
+    m_sec_rng = re.search(
+        r"\bs[eé]c(?:ulo|\.)\s*(?:[ivxl]+|\d{1,2})\s*(?:[-–—]|a|to)\s*([ivxl]+|\d{1,2})\b",
+        clean,
+        re.IGNORECASE,
+    )
+    if m_sec_rng:
+        sec_end = m_sec_rng.group(1).upper()
+        if sec_end in ("XXI", "21"):
+            return "", False
+        return f"Historical {sec_end} Century Europe", True
+
+    # 3. Generic English ordinal century ('17th century', '15th-century', '4th century AD')
+    m_en_cent = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)[\s-]+century\b", clean, re.IGNORECASE)
+    if m_en_cent:
+        c_num = int(m_en_cent.group(1))
+        if c_num >= 21:
+            return "", False
+        if 1 <= c_num <= 20:
+            return f"Historical {c_num}th-century Era", c_num <= 20
+
+    # 4. Generic BC/AD year ('48 a.C.', '79 AD')
+    m_bc = re.search(r"\b(\d{1,4})\s*(a\.?c\.?|bc|d\.?c\.?|ad)\b", clean, re.IGNORECASE)
+    if m_bc:
+        yr = m_bc.group(1)
+        suf = "BC" if m_bc.group(2).lower().startswith(("a", "b")) else "AD"
+        return f"Ancient Historical Era {yr} {suf}", True
+
+    # 5. Generic calendar year (1000..1939)
+    m_yr = re.search(r"\b(1[0-8]\d{2}|19[0-3]\d)\b", clean)
+    if m_yr:
+        yr_int = int(m_yr.group(1))
+        return f"Historical Era {yr_int}", yr_int <= 1940
+
+    # 6. Generic Portuguese century ('SÉC. XVII', 'SÉCULO IV')
+    m_sec = re.search(r"\bs[eé]c(?:ulo|\.)\s*([ivxl]+|\d{1,2})\b", clean, re.IGNORECASE)
+    if m_sec:
+        sec_tok = m_sec.group(1).upper()
+        if sec_tok in ("XXI", "21"):
+            return "", False
+        return f"Historical {sec_tok} Century Europe", True
+
+    return None
 
 
 def _extract_historical_era_lock(
@@ -320,34 +438,63 @@ def _extract_historical_era_lock(
     lower_third_subtitle: str = "",
     prompt_en: str = "",
 ) -> Tuple[str, bool]:
-    """Extract a canonical English historical period lock and whether the scene is pre-modern."""
-    combined_meta = f"{lower_third_title or ''} {lower_third_subtitle or ''}".strip()
-    combined_all = f"{combined_meta} {prompt_en or ''}".strip()
+    """Extract a canonical English historical period lock and whether the scene is pre-modern.
 
-    for rx, era_label, is_pre_modern in _HISTORICAL_ERA_RULES:
-        if combined_meta and rx.search(combined_meta):
-            return era_label, is_pre_modern
-    for rx, era_label, is_pre_modern in _HISTORICAL_ERA_RULES:
-        if combined_all and rx.search(combined_all):
-            return era_label, is_pre_modern
+    Priority order:
+      1. Modern / Contemporary / Act-4 Epilogue override (`ACT_4`, `HOJE`, `MODERNA`,
+         `CONTEMPORÂNEO`, `SÉC. XXI`, `O ETERNO SOLSTÍCIO`, `living room`, `sala escura`) -> `("", False)`.
+      2. Explicit century / year / destination in `prompt_en` (e.g. `17th century Dutch Golden Age`,
+         `eleventh-century Bari`).
+      3. Explicit century / year / destination in `lower_third_title` (e.g. `MIRA A AMSTERDÃ • SÉC. XI–XVII`
+         overrides secondary `\\bmira\\b`!).
+      4. Combined metadata (`lower_third_title` + `lower_third_subtitle`), then full text.
+    """
+    lt_title = str(lower_third_title or "").strip()
+    lt_sub = str(lower_third_subtitle or "").strip()
+    p_en = str(prompt_en or "").strip()
+    combined_meta = f"{lt_title} {lt_sub}".strip()
+    combined_all = f"{combined_meta} {p_en}".strip()
 
-    # Generic year/century detection (e.g., '1517', '1789', '44 a.C.', 'SÉC. XVII')
-    m_bc = re.search(r"\b(\d{1,4})\s*(a\.?c\.?|bc|d\.?c\.?|ad)\b", combined_meta, re.IGNORECASE)
-    if m_bc:
-        yr = m_bc.group(1)
-        suf = "BC" if m_bc.group(2).lower().startswith(("a", "b")) else "AD"
-        return f"Ancient Historical Era {yr} {suf}", True
+    # Check if prompt_en explicitly specifies a pre-1940 historical era
+    prompt_match = _match_explicit_era_in_text(p_en) if p_en else None
+    meta_has_modern = bool(combined_meta and _MODERN_META_ERA_RE.search(combined_meta))
+    prompt_has_modern = bool(p_en and _MODERN_PROMPT_ERA_RE.search(p_en))
 
-    m_yr = re.search(r"\b(1[0-8]\d{2}|19[0-3]\d)\b", combined_meta)
-    if m_yr:
-        yr_int = int(m_yr.group(1))
-        return f"Historical Era {yr_int}", yr_int <= 1940
+    # 1. Contemporary / Modern / Act-4 Epilogue override (prevents S25 'O ETERNO SOLSTÍCIO' false ancient lock!)
+    if meta_has_modern:
+        if prompt_match is not None and prompt_match[1] and not prompt_has_modern:
+            return prompt_match
+        return "", False
 
-    m_sec = re.search(r"\bs[eé]c(?:ulo|\.)\s*([ivxl]+|\d{1,2})\b", combined_meta, re.IGNORECASE)
-    if m_sec:
-        sec_tok = m_sec.group(1).upper()
-        if sec_tok not in ("XXI", "21"):
-            return f"Historical {sec_tok} Century Europe", True
+    if prompt_has_modern and (prompt_match is None or not prompt_match[1]):
+        # If the prompt/narration explicitly describes a modern/Act-4 scene (e.g. modern living room,
+        # 'festa moderna', 'ACT_4', 'SÉC. XXI') and lower_third_title has no specific single pre-1940 date,
+        # treat as contemporary (is_pre_modern=False).
+        title_match_chk = _match_explicit_era_in_text(lt_title) if lt_title else None
+        if title_match_chk is None or _MULTI_ERA_SPAN_RE.search(combined_meta):
+            return "", False
+
+    # 2. Prioritize explicit century/year/destination in prompt_en over secondary words in metadata
+    if prompt_match is not None:
+        return prompt_match
+
+    # 3. Prioritize explicit century/year/destination in lower_third_title
+    if lt_title:
+        title_match = _match_explicit_era_in_text(lt_title)
+        if title_match is not None:
+            return title_match
+
+    # 4. Combined lower_third_title + lower_third_subtitle
+    if combined_meta:
+        meta_match = _match_explicit_era_in_text(combined_meta)
+        if meta_match is not None:
+            return meta_match
+
+    # 5. Full combined context fallback
+    if combined_all:
+        all_match = _match_explicit_era_in_text(combined_all)
+        if all_match is not None:
+            return all_match
 
     return "", False
 
@@ -358,34 +505,86 @@ def _enforce_historical_era_prompt_lock(
     lower_third_subtitle: str = "",
 ) -> str:
     """Prepend an explicit historical era lock extracted from scene metadata and append strict
-    anti-anachronism negative directives to EVERY visual prompt before Google Flow generation.
+    anti-anachronism negative directives to pre-modern visual prompts before Google Flow generation.
+    Idempotent: never duplicates an existing era prefix or negative-lock tail.
     """
     base = " ".join(str(prompt_en or "").strip().split())
     if not base:
         return base
 
-    era_label, _ = _extract_historical_era_lock(lower_third_title, lower_third_subtitle, base)
+    era_label, is_pre_modern = _extract_historical_era_lock(lower_third_title, lower_third_subtitle, base)
     out = base
+    if not is_pre_modern:
+        return re.sub(r"\s{2,}", " ", out).strip()
+
     if era_label:
-        # Prepend period lock only if not already explicitly prefixed
-        if era_label.lower() not in out.lower():
+        # Prepend period lock ONLY if not already explicitly prefixed or containing a historical scene lock
+        out_low = out.lower()
+        if (era_label.lower() not in out_low) and ("historical scene:" not in out_low):
             out = f"{era_label} historical scene: {out}"
 
-    if "NO Kevlar helmets" not in out:
+    if ("NO Kevlar helmets" not in out) and ("authentic period-accurate historical clothing" not in out.lower()):
         out = f"{out.rstrip(' .,;')}, {_HISTORICAL_ERA_NEGATIVE_LOCK}"
     return re.sub(r"\s{2,}", " ", out).strip()
 
 
+# Modern currency & numismatic coin patterns that MUST ALWAYS be blocked even when 'coins' is in query
+_MODERN_CURRENCY_COIN_RE = re.compile(
+    r"\b(?:"
+    r"\d+\s*kr\b|kronor|kroner|shillings?|farthings?|sixpence|halfpenny|"
+    r"pence|penny|cents?|centavos?|euro\s+coins?|dollar\s+coins?|quarter\s+dollar|"
+    r"krugerrand|commemorative\s+coins?|numismat\w*|coinage\s+of\s+(?:19|20)|"
+    r"(?:19\d\d|20[0-2]\d)\s+(?:gold\s+|silver\s+|bronze\s+|copper\s+)?(?:coins?|shillings?|kr|kronor|penny|cent|dollar|franc|mark)|"
+    r"(?:coins?|shillings?|kronor)\s+(?:19\d\d|20[0-2]\d)|"
+    r"george\s+v\b|elizabeth\s+ii\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_ANCIENT_COIN_ALLOW_TERMS = (
+    " roman ", " ancient ", " byzantine ", " medieval ", " aureus ",
+    " denarius ", " solidus ", " sestertius ", " drachma ", " antoninianus ",
+)
+
+
 def _is_offtopic_media_tags(tags_text: str, query: str = "", mood: str = "") -> bool:
-    """Reject off-topic stock hits (tile floors, butterflies, textures, modern offices in history docs)."""
-    t_low = f" {(tags_text or '').lower()} "
-    q_low = (query or "").lower()
-    for bad in OFFTOPIC_MEDIA_TAGS:
-        if bad in t_low and bad not in q_low:
+    """Reject off-topic stock hits (tile floors, butterflies, modern currency coins, modern offices)."""
+    t_norm = re.sub(r"[^a-z0-9]+", " ", (tags_text or "").lower()).strip()
+    q_norm = re.sub(r"[^a-z0-9]+", " ", (query or "").lower()).strip()
+    if not t_norm:
+        return False
+
+    # ALWAYS block modern currency coins (20kr, kronor, 1933 shilling, etc.) — NEVER unblock just
+    # because 'coin' or 'coins' appears in a historical query!
+    if _MODERN_CURRENCY_COIN_RE.search(t_norm):
+        return True
+
+    t_pad = f" {t_norm} "
+    q_pad = f" {q_norm} "
+
+    def _matches_tag(tag_str: str, padded_haystack: str) -> bool:
+        b_norm = re.sub(r"[^a-z0-9]+", " ", tag_str.lower()).strip()
+        if not b_norm:
+            return False
+        if f" {b_norm} " in padded_haystack:
             return True
+        if len(b_norm) >= 4 and not b_norm.endswith("s") and f" {b_norm}s " in padded_haystack:
+            return True
+        return False
+
+    for bad in OFFTOPIC_MEDIA_TAGS:
+        if _matches_tag(bad, t_pad):
+            if bad == "coin":
+                # Only allow genuinely ancient/roman/byzantine/medieval coins when query asks for coins
+                if _matches_tag("coin", q_pad) and any(aw in t_pad for aw in _ANCIENT_COIN_ALLOW_TERMS):
+                    continue
+                return True
+            if not _matches_tag(bad, q_pad):
+                return True
+
     if mood in ("dark_horror", "epic_history"):
         for bad in DARK_HISTORY_EXTRA_BAD_TAGS:
-            if bad in t_low and bad not in q_low:
+            if _matches_tag(bad, t_pad) and not _matches_tag(bad, q_pad):
                 return True
     return False
 
@@ -483,7 +682,7 @@ MOOD_DOC_PHOTO_QUERIES: Dict[str, List[str]] = {
         "medieval stone castle europe",
         "gothic cathedral interior candle",
         "old parchment manuscript book",
-        "ancient marble statue museum",
+        "ancient roman marble sculpture chiaroscuro",
         "historic european architecture",
     ],
     "corporate_thriller": list(CURATED_DOC_PHOTO_QUERIES),
@@ -493,6 +692,12 @@ GEMINI_IMAGE_MODELS: Tuple[str, ...] = (
     "gemini-2.5-flash-image",
     "gemini-3.1-flash-image",
     "gemini-3.1-flash-lite-image",
+)
+
+GEMINI_VISION_MODELS: Tuple[str, ...] = (
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
 )
 
 _BESPOKE_HISTORY_FOLKLORE_RE = re.compile(
@@ -807,14 +1012,17 @@ def _search_openverse_photos(
     min_width: int = 640,
     mood: str = "",
 ) -> List[Dict[str, str]]:
-    """Query Openverse (Smithsonian, Wikimedia, Flickr CC, Museum archives — 100% commercial CC licenses, zero API key)."""
+    """Query Openverse (Smithsonian, Wikimedia, Flickr CC, archival collections — commercial CC licenses)."""
+    clean_query = _sanitize_search_query(query, mood=mood)
+    if not clean_query:
+        return []
     results: List[Dict[str, str]] = []
     seen_urls: Set[str] = set()
     try:
         r = client.get(
             "https://api.openverse.org/v1/images/",
             params={
-                "q": query,
+                "q": clean_query,
                 "page_size": 10,
                 "license_type": "commercial",
             },
@@ -830,7 +1038,7 @@ def _search_openverse_photos(
             ]).lower()
             if any(bad in title_tags for bad in PHOTO_BAD_WORDS):
                 continue
-            if _is_offtopic_media_tags(title_tags, query=query, mood=mood):
+            if _is_offtopic_media_tags(title_tags, query=clean_query, mood=mood):
                 continue
             w = int(item.get("width") or 0)
             h = int(item.get("height") or 0)
@@ -929,6 +1137,96 @@ def _check_dark_horror_visual_guard(bgr: np.ndarray) -> Tuple[bool, str]:
         return True, "guard_skip"
 
 
+def _call_gemini_vision_json(
+    payload: Dict[str, Any],
+    gkey: str,
+    timeout: float = 14.0,
+    max_attempts_per_model: int = 3,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Resilient Gemini Vision JSON caller with 3-attempt exponential backoff on transient errors
+    (HTTP 429/500/502/503/504 and network timeouts) + automatic 3-model failover
+    (`gemini-flash-lite-latest` -> `gemini-2.5-flash-lite` -> `gemini-2.5-flash`).
+    STRICT FAIL-CLOSED: returns `(None, err_code)` if all retries and failover models fail.
+    """
+    retryable_codes = {429, 500, 502, 503, 504}
+    last_err = "http_0"
+    headers = {"Content-Type": "application/json", "x-goog-api-key": gkey}
+
+    for model_id in GEMINI_VISION_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent"
+        for attempt in range(max(1, int(max_attempts_per_model))):
+            try:
+                resp = httpx.post(url, json=payload, headers=headers, timeout=timeout)
+                code = int(resp.status_code)
+                if code == 200:
+                    data = resp.json()
+                    cands = data.get("candidates") or []
+                    parts = (cands[0].get("content") or {}).get("parts") or [] if cands else []
+                    raw_txt = ""
+                    for part in parts:
+                        if isinstance(part, dict) and part.get("text"):
+                            raw_txt = str(part["text"]).strip()
+                            break
+                    if raw_txt.startswith("```"):
+                        raw_txt = re.sub(
+                            r"^```(?:json)?\s*|\s*```$",
+                            "",
+                            raw_txt,
+                            flags=re.IGNORECASE | re.DOTALL,
+                        ).strip()
+                    parsed: Optional[Dict[str, Any]] = None
+                    if raw_txt:
+                        try:
+                            obj = json.loads(raw_txt)
+                            if isinstance(obj, dict):
+                                parsed = obj
+                        except Exception:
+                            m_json = re.search(r"\{.*\}", raw_txt, re.DOTALL)
+                            if m_json:
+                                try:
+                                    obj = json.loads(m_json.group(0))
+                                    if isinstance(obj, dict):
+                                        parsed = obj
+                                except Exception:
+                                    parsed = None
+                    if parsed is not None:
+                        return parsed, f"ok:{model_id}"
+                    last_err = "json_parse_err"
+                    if attempt + 1 < max_attempts_per_model:
+                        time.sleep(0.6 * (2 ** attempt))
+                        continue
+                    break
+
+                last_err = f"http_{code}"
+                if code in (401, 403):
+                    # Authentication failure will not recover via retry or model failover
+                    return None, last_err
+                if code in retryable_codes:
+                    if attempt + 1 < max_attempts_per_model:
+                        time.sleep(0.75 * (2 ** attempt))
+                        continue
+                    break
+                # Non-retryable (e.g. 404 model unavailable / 400): failover immediately to next model
+                break
+            except httpx.TimeoutException:
+                last_err = "timeout"
+                if attempt + 1 < max_attempts_per_model:
+                    time.sleep(0.75 * (2 ** attempt))
+                    continue
+                break
+            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as exc:
+                last_err = f"net_err:{type(exc).__name__}"
+                if attempt + 1 < max_attempts_per_model:
+                    time.sleep(0.75 * (2 ** attempt))
+                    continue
+                break
+            except Exception as exc:
+                last_err = f"vision_err:{str(exc)[:40]}"
+                break
+
+    return None, last_err
+
+
 def vision_select_best_candidate(
     thumb_bgrs: List[np.ndarray],
     query: str,
@@ -937,24 +1235,25 @@ def vision_select_best_candidate(
     min_score: int = 7,
     strict_vision: bool = True,
 ) -> Tuple[int, int, str]:
-    """Multimodal Gemini Flash Lite Vision Critic: inspects up to 4 candidate thumbnails in ONE
-    ~1s API call via a labeled 2x2 grid (`1`, `2`, `3`, `4`) and returns `(best_idx_0based, score, reason)`.
-    FAIL-CLOSED when `strict_vision=True`: returns `(-1, 0, reason)` on missing API key, HTTP/network/JSON
-    error, dark-horror brightness/sky rejection, or when no candidate reaches `min_score`.
+    """Multimodal Gemini Vision Critic (Batch-4 2x2 grid): inspects up to 4 candidate thumbnails
+    in ONE call with 3-attempt exponential backoff + 3-model failover, evaluating BOTH:
+      (a) Zero modern anachronisms for historical scenes, AND
+      (b) Direct semantic relevance to the spoken narration phrase (`scene_context`) and `query`.
+    ALWAYS STRICT FAIL-CLOSED: returns `(-1, 0, reason)` on missing API key, guard rejection,
+    persistent API/HTTP/timeout error, JSON failure, or when no candidate reaches `min_score`.
     """
+    _ = strict_vision  # Parameter retained for caller compatibility; gate is ALWAYS fail-closed.
     if not thumb_bgrs:
         return -1, 0, "no_candidates"
     gkey = _read_gemini_api_key()
     if not gkey:
-        if strict_vision:
-            return -1, 0, "no_vision_key"
-        return 0, 7, "no_vision_key"
+        return -1, 0, "no_vision_key"
 
     raw_n = min(4, len(thumb_bgrs))
     kept_indices: List[int] = []
     kept_bgrs: List[np.ndarray] = []
     last_guard_reason = ""
-    if mood == "dark_horror":
+    if mood in ("dark_horror", "epic_history"):
         for idx in range(raw_n):
             ok_g, g_why = _check_dark_horror_visual_guard(thumb_bgrs[idx])
             if ok_g:
@@ -963,7 +1262,7 @@ def vision_select_best_candidate(
             else:
                 last_guard_reason = g_why
         if not kept_indices:
-            return -1, 0, f"dark_horror_guard:{last_guard_reason or 'sunny_or_bright'}"
+            return -1, 0, f"visual_guard:{last_guard_reason or 'sunny_or_bright'}"
     else:
         kept_indices = list(range(raw_n))
         kept_bgrs = list(thumb_bgrs[:raw_n])
@@ -985,48 +1284,56 @@ def vision_select_best_candidate(
 
     ok_enc, buf = cv2.imencode(".jpg", grid, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
     if not ok_enc:
-        if strict_vision:
-            return -1, 0, "encode_failed"
-        return kept_indices[0], 7, "encode_skip"
+        return -1, 0, "encode_failed"
     b64_img = base64.b64encode(buf.tobytes()).decode("ascii")
 
+    era_label, is_pre_modern = _extract_historical_era_lock(scene_context, "", query)
     mood_desc = {
         "dark_horror": (
             "dark gothic historical horror documentary (strictly NO sunny daytime skies, NO blue summer sky, "
-            "NO bright sunlit ruins or green meadows, NO 90%-black empty dark frames, NO modern electric LED or fairy lights, "
-            "NO modern night drone aerials of electrified cities/highways, NO modern police/Kevlar/riot vans/cars, "
-            "NO modern hoodies/jeans/sneakers/masks, NO cartoon/painterly cozy cabins, NO plastic figurines/miniatures/toys, "
-            "NO glossy 3D plastic CGI renders, NO beaches, paragliders, tropical resorts, Asian rice terraces in European history, or cheerful stock photos)"
+            "NO bright sunlit ruins or green meadows, NO pitch-black empty frames, NO modern electric LED or fairy lights, "
+            "NO modern night drone aerials of electrified cities/highways, NO modern police/Kevlar/riot vans/cars/race cars, "
+            "NO modern wristwatches, NO modern hoodies/jeans/sneakers/tourists/cosplay parades, NO kitchen scales or branded products, "
+            "NO modern museum plaques/glass display cases/art gallery walls, NO modern printing presses/film projectors, "
+            "NO modern currency coins, NO plastic figurines/miniatures/souvenirs, NO NASA globes, NO cheerful stock photos)"
         ),
         "epic_history": (
-            "authentic historical cinema documentary (strictly NO modern vehicles, police, Kevlar gear, modern hoodies/jeans, "
-            "electric LED/fairy lights, modern aerial cities/highways, sports, tourists, neon, toys/figurines, or anachronistic modern objects)"
+            "authentic historical cinema documentary (strictly NO modern cars/race cars/vehicles, wristwatches, police/Kevlar gear, "
+            "modern clothing/tourists/parades, modern buildings/townhouses/suburban houses, electric LED/fairy lights, "
+            "kitchen scales, modern museum plaques/galleries, modern printing presses/projectors, modern coins, NASA globes, "
+            "toys/figurines, or anachronistic modern objects)"
         ),
         "investigative_crime": "gritty noir investigative true-crime documentary (strictly NO cartoons, bright vacation scenes, toys, or stock clip-art)",
         "corporate_thriller": "prestige financial/corporate documentary thriller",
     }.get(mood, "prestige cinematic documentary")
 
-    dark_rule = (
-        "DARK HORROR & HISTORICAL ERA STRICT GATE: Immediately REJECT (set best=0) any image with sunny daytime lighting, "
-        "clear blue summer sky, bright sunlit greenery/grass, pitch-black nearly-blank frames, modern electric LED Christmas/fairy lights, "
-        "modern night highway/town drone aerials, modern tactical police/vans/cars/asphalt, modern hoodies/jeans/sneakers/face masks, "
-        "soft cartoon/cozy AI cabins, plastic/painted toy figurines, miniatures, dolls, or glossy 3D plastic CGI renders. "
-        "Accept ONLY dark, moody, cinematic, chiaroscuro, nocturnal/overcast, or authentic period-accurate archival visuals.\n"
-        if mood in ("dark_horror", "epic_history")
-        else ""
-    )
+    era_gate_txt = ""
+    if mood in ("dark_horror", "epic_history"):
+        era_hdr = f"TARGET HISTORICAL ERA: {era_label} (PRE-1920 STRICT ANACHRONISM AUDIT)" if (era_label and is_pre_modern) else "HISTORICAL DOCUMENTARY STRICT GATE"
+        era_gate_txt = (
+            f"GATE A — ZERO MODERN ANACHRONISMS ({era_hdr}): Immediately REJECT (best=0) ANY image showing "
+            "modern cars/race cars/vans/trucks, modern wristwatches/dials, electric LED/fairy/neon lights, "
+            "modern tourists/crowds/clothing (hoodies, jeans, sneakers, sleeveless dresses, cosplay/parades), "
+            "modern buildings/apartments/townhouses/suburban houses/highways/airports, digital kitchen scales or branded products/logos, "
+            "modern museum plaques/glass cases/gallery walls/framed photos, modern offset printing presses or IMAX/film projectors, "
+            "modern 20th/21st-century coins, modern book stacks/stage auditoriums, NASA/satellite maps, "
+            "sunny blue daytime sky, bright sunlit greenery, pitch-black frames, plastic figurines/souvenirs, or watermarks/text overlays.\n"
+        )
 
     prompt_txt = (
-        f"You are the strict Visual Director for a {mood_desc}.\n"
-        f"Target shot prompt: {query}\n"
-        f"Scene narration context: {(scene_context or query)[:260]}\n"
-        f"{dark_rule}"
-        f"Look at the {n_c} candidate images labeled 1..{n_c} in the grid.\n"
-        f"Pick the SINGLE best image that genuinely depicts the target subject and period/mood with ZERO modern anachronisms, "
-        f"ZERO watermarks/text overlays, ZERO toys/figurines/miniatures/3D plastic CGI, ZERO off-topic scenery "
-        f"(e.g. sunny blue-sky ruins, bright greenery, modern electric fairy lights, highway aerials, modern riot police or vans, "
-        f"modern hoodies/jeans, paragliders, tropical resorts, tile floors, butterflies, modern tourists, wrong-region villages).\n"
-        f"If NONE of the images score at least {min_score}/10 for this exact scene, set best=0.\n"
+        f"You are the ruthless Visual Director & Historical Continuity Critic for a {mood_desc}.\n"
+        f"Target shot query: {query[:220]}\n"
+        f"Spoken narration / scene context: {(scene_context or query)[:300]}\n"
+        f"{era_gate_txt}"
+        "GATE B — DIRECT SEMANTIC RELEVANCE TO SPOKEN NARRATION & TARGET QUERY: "
+        "The winning image MUST directly and unmistakably depict the exact historical subject, person, event, place, or object "
+        "described in BOTH the Target shot query AND Spoken narration context. "
+        "IMMEDIATELY REJECT (best=0) off-topic keyword-pun collisions or unrelated nature/filler shots "
+        "(e.g., reject a pine cone or volcano when narrating Bishop Nicholas, reject a Native American mural for oil painting brush, "
+        "reject Washington DC or Kansas houses for Victorian London, reject a rusty bucket or generic rock on grass).\n"
+        f"Inspect the {n_c} candidate image(s) labeled 1..{n_c} in the grid.\n"
+        f"Pick the SINGLE best image ONLY if it passes BOTH Gate A (zero anachronisms) AND Gate B (direct semantic match) "
+        f"with score >= {min_score}/10. If NONE passes BOTH gates at >= {min_score}/10, set best=0.\n"
         'Reply STRICT JSON ONLY: {"best": 0, "score": 0, "reason": "short"}'
     )
     payload = {
@@ -1042,38 +1349,18 @@ def vision_select_best_candidate(
             "temperature": 0.1,
         },
     }
+    parsed, call_status = _call_gemini_vision_json(payload, gkey=gkey, timeout=14.0, max_attempts_per_model=3)
+    if parsed is None:
+        return -1, 0, call_status
     try:
-        resp = None
-        for attempt in range(2):
-            resp = httpx.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
-                json=payload,
-                headers={"Content-Type": "application/json", "x-goog-api-key": gkey},
-                timeout=12.0,
-            )
-            if resp.status_code in (429, 503) and attempt == 0:
-                time.sleep(1.0)
-                continue
-            break
-        if resp is None or resp.status_code != 200:
-            code = resp.status_code if resp is not None else 0
-            if strict_vision:
-                return -1, 0, f"http_{code}"
-            return kept_indices[0], 7, f"http_{code}"
-        raw_txt = str(resp.json()["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
-        if raw_txt.startswith("```"):
-            raw_txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_txt, flags=re.IGNORECASE | re.DOTALL).strip()
-        parsed = json.loads(raw_txt)
         best_1 = int(parsed.get("best") or 0)
         score = int(parsed.get("score") or 0)
         reason = str(parsed.get("reason") or "")[:90]
         if 1 <= best_1 <= n_c and score >= min_score:
             return kept_indices[best_1 - 1], score, reason
-        return -1, score, reason
+        return -1, score, reason or "below_threshold"
     except Exception as exc:
-        if strict_vision:
-            return -1, 0, f"vision_err:{str(exc)[:40]}"
-        return kept_indices[0], 7, f"vision_err:{str(exc)[:40]}"
+        return -1, 0, f"vision_parse_err:{str(exc)[:40]}"
 
 
 def _gemini_vision_batch_pick_best(
@@ -1091,7 +1378,7 @@ def _gemini_vision_batch_pick_best(
         scene_context=scene_context,
         mood=mood,
         min_score=min_score,
-        strict_vision=strict_vision,
+        strict_vision=True,
     )
 
 
@@ -1103,7 +1390,8 @@ def _verify_single_image_vision(
     min_score: int = 7,
     strict_vision: bool = True,
 ) -> Tuple[bool, int, str]:
-    """Validate a single image (Path or BGR ndarray) through Gemini Vision Critic."""
+    """Validate a single image (Path or BGR ndarray) through Gemini Vision Critic (ALWAYS fail-closed)."""
+    _ = strict_vision
     try:
         if isinstance(img_path_or_bgr, np.ndarray):
             bgr = img_path_or_bgr
@@ -1117,13 +1405,11 @@ def _verify_single_image_vision(
             scene_context=scene_context,
             mood=mood,
             min_score=min_score,
-            strict_vision=strict_vision,
+            strict_vision=True,
         )
         return (idx == 0), score, reason
     except Exception as exc:
-        if strict_vision:
-            return False, 0, f"single_vision_err:{str(exc)[:40]}"
-        return True, 7, "single_vision_skip"
+        return False, 0, f"single_vision_err:{str(exc)[:40]}"
 
 
 def verify_historical_anachronism_vision(
@@ -1134,11 +1420,16 @@ def verify_historical_anachronism_vision(
     mood: str = "dark_horror",
     strict_vision: bool = True,
 ) -> Tuple[bool, int, str]:
-    """Screen ANY image — including bespoke Google Flow AI plates — for historical anachronisms
-    (modern Kevlar riot police, modern police vans, modern cars/asphalt, hoodies/jeans/sneakers,
-    electric LED fairy lights, or off-era props in pre-1920 scenes).
-    Returns `(passed, score, reason)`.
+    """Screen ANY image — including bespoke Google Flow AI plates — for BOTH:
+      (a) Historical anachronisms (modern cars/race cars, wristwatches, police/Kevlar gear,
+          electric LEDs, modern tourists/clothing, modern buildings, kitchen scales, modern museum
+          plaques/galleries, modern printing presses/projectors, modern coins), AND
+      (b) Direct semantic relevance to the target prompt and scene context.
+    Enforces `_check_dark_horror_visual_guard` on BOTH `dark_horror` AND `epic_history`.
+    Uses 3-attempt exponential backoff + 3-model failover and is ALWAYS STRICT FAIL-CLOSED:
+    returns `(False, 0, err_code)` on any persistent API/HTTP/timeout failure.
     """
+    _ = strict_vision  # Parameter retained for caller compatibility; ALWAYS fail-closed.
     era_label, is_pre_modern = _extract_historical_era_lock(lower_third_title, lower_third_subtitle, query)
     if isinstance(img_path_or_bgr, np.ndarray):
         bgr = img_path_or_bgr
@@ -1147,36 +1438,46 @@ def verify_historical_anachronism_vision(
     if bgr is None or bgr.size == 0:
         return False, 0, "unreadable_image"
 
-    if mood == "dark_horror":
+    if mood in ("dark_horror", "epic_history"):
         ok_g, g_why = _check_dark_horror_visual_guard(bgr)
-        if not ok_g and (g_why.startswith("too_dark_crushed") or g_why.startswith("electric_neon_lights")):
+        if not ok_g:
             return False, 0, f"visual_guard:{g_why}"
 
     gkey = _read_gemini_api_key()
     if not gkey:
-        return (not strict_vision), (0 if strict_vision else 7), "no_vision_key"
+        return False, 0, "no_vision_key"
 
     tile = _center_crop_resize_bgr(bgr, 512, 320, high_quality=False)
     ok_enc, buf = cv2.imencode(".jpg", tile, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
     if not ok_enc:
-        return (not strict_vision), 0, "encode_failed"
+        return False, 0, "encode_failed"
     b64_img = base64.b64encode(buf.tobytes()).decode("ascii")
 
+    ctx_meta = f"{lower_third_title} {lower_third_subtitle}".strip()
     era_clause = (
         f"TARGET HISTORICAL ERA: {era_label} (PRE-1920 STRICT ANACHRONISM AUDIT!). "
         "You MUST set anachronism=true and pass=false if the image contains ANY: "
         "modern police/riot gear/Kevlar helmets/clear ballistic shields/assault rifles, "
-        "modern cars/vans/trucks/flashing blue-red LED strobes, modern hoodies/puffer jackets/blue jeans/sneakers/COVID masks, "
-        "modern asphalt/metal crowd barriers/roll-down shop shutters, electric LED fairy lights, or smartphones/laptops."
+        "modern cars/race cars/vans/trucks/flashing blue-red LED strobes, modern wristwatches/dials, "
+        "modern hoodies/puffer jackets/blue jeans/sneakers/sleeveless dresses/tourists/cosplay parades/COVID masks, "
+        "modern buildings/apartments/townhouses/suburban houses/asphalt/metal crowd barriers/roll-down shop shutters, "
+        "digital kitchen scales or commercial branded products/logos, modern museum plaques/glass display cases/gallery walls, "
+        "modern offset printing presses or IMAX/film projectors, modern 20th/21st-century coins, NASA globes, "
+        "electric LED/fairy/neon lights, or smartphones/laptops."
         if is_pre_modern
-        else f"TARGET ERA/CONTEXT: {era_label or lower_third_title or query}. Reject watermarks, text overlays, modern tactical police, or blatantly off-topic stock."
+        else f"TARGET ERA/CONTEXT: {era_label or ctx_meta or query}. Reject watermarks, burned-in text overlays, modern tactical police, race cars, commercial logos, or blatantly off-topic stock."
     )
     prompt_txt = (
-        f"You are a ruthless Historical Continuity & Anachronism Inspector for a prestige Netflix/BBC documentary.\n"
+        "You are a ruthless Historical Continuity, Anachronism & Semantic Relevance Inspector for a prestige Netflix/BBC documentary.\n"
         f"{era_clause}\n"
-        f"Scene prompt: {query[:260]}\n"
-        f"Check this single image for modern anachronisms, wrong historical century clothing/vehicles/lighting, or watermarks.\n"
-        'Reply STRICT JSON ONLY: {"pass": true, "anachronism": false, "score": 8, "reason": "short"}'
+        f"Scene context / title: {(ctx_meta or query)[:240]}\n"
+        f"Target shot prompt: {query[:280]}\n"
+        "Verify BOTH requirements:\n"
+        "  1. ZERO modern anachronisms, wrong historical century clothing/vehicles/lighting, burned-in text, or watermarks.\n"
+        "  2. DIRECT SEMANTIC RELEVANCE: the image must genuinely depict the subject/scene described in the Target shot prompt "
+        "and Scene context (set relevant=false and pass=false for off-topic photos like a pine cone for Bishop Nicholas, "
+        "a wristwatch for an ancient manuscript, a race car, or unrelated scenery).\n"
+        'Reply STRICT JSON ONLY: {"pass": true, "anachronism": false, "relevant": true, "score": 8, "reason": "short"}'
     )
     payload = {
         "contents": [{
@@ -1187,29 +1488,24 @@ def verify_historical_anachronism_vision(
         }],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "maxOutputTokens": 180,
+            "maxOutputTokens": 200,
             "temperature": 0.05,
         },
     }
+    parsed, call_status = _call_gemini_vision_json(payload, gkey=gkey, timeout=14.0, max_attempts_per_model=3)
+    if parsed is None:
+        return False, 0, call_status
     try:
-        resp = httpx.post(
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
-            json=payload,
-            headers={"Content-Type": "application/json", "x-goog-api-key": gkey},
-            timeout=12.0,
+        passed = (
+            bool(parsed.get("pass", False))
+            and not bool(parsed.get("anachronism", False))
+            and bool(parsed.get("relevant", True))
         )
-        if resp.status_code != 200:
-            return (not strict_vision), 0, f"http_{resp.status_code}"
-        raw_txt = str(resp.json()["candidates"][0]["content"]["parts"][0]["text"] or "").strip()
-        if raw_txt.startswith("```"):
-            raw_txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_txt, flags=re.IGNORECASE | re.DOTALL).strip()
-        parsed = json.loads(raw_txt)
-        passed = bool(parsed.get("pass", False)) and not bool(parsed.get("anachronism", False))
         score = int(parsed.get("score") or (8 if passed else 2))
         reason = str(parsed.get("reason") or "")[:90]
-        return (passed and score >= 6), score, reason
+        return (passed and score >= 7), score, reason or "rejected"
     except Exception as exc:
-        return (not strict_vision), 0, f"anachronism_err:{str(exc)[:40]}"
+        return False, 0, f"anachronism_parse_err:{str(exc)[:40]}"
 
 
 def _is_permissive_wikimedia_license(extmeta: Dict[str, Any]) -> Tuple[bool, str]:
@@ -1230,6 +1526,182 @@ def _is_permissive_wikimedia_license(extmeta: Dict[str, Any]) -> Tuple[bool, str
     return False, lic_short or "unknown_license"
 
 
+_WIKI_GENRE_ANCHORS: Set[str] = {
+    "painting", "engraving", "woodcut", "illustration", "manuscript",
+    "portrait", "fresco", "etching", "drawing", "lithograph", "codex",
+    "tapestry", "mosaic", "sculpture", "bust",
+}
+
+_WIKI_FILLER_WORDS: Set[str] = {
+    # English stopwords (prevent broken fragments like 'Chronograph of')
+    "of", "in", "the", "on", "from", "with", "at", "to", "by", "and", "for",
+    "a", "an", "as", "or", "is", "was", "were", "into", "over", "under",
+    # Atmospheric/stylistic fillers — NEVER strip genre anchors (painting/engraving/woodcut/etc.)!
+    "dark", "atmospheric", "cinematic", "moody", "dramatic", "shadow", "shadows",
+    "chiaroscuro", "candlelit", "nocturnal", "still", "scene", "frame", "detail",
+    "photo", "image", "museum", "museums",
+}
+
+_WIKI_ART_BONUS_TERMS: Tuple[str, ...] = (
+    "painting", "engraving", "etching", "woodcut", "lithograph", "fresco",
+    "manuscript", "codex", "illustration", "mosaic", "miniature", "tapestry",
+    "leech", "bruegel", "nast", "durer", "rembrandt", "rubens", "caravaggio",
+    "portrait", "broadsheet", "postcard", "184", "186", "188",
+    "164", "165", "166", "17th", "18th", "19th",
+)
+
+# Boundary-safe HARD REJECT regex for modern snapshot / off-topic Wikimedia filenames & titles
+# (careful: 'landscape' != 'dsc', 'climax' != 'imax', 'Caravaggio'/'Carol' != 'car', 'grace' != 'race')
+_WIKI_MODERN_SNAP_CAM_RE = re.compile(
+    r"(?:^|[^a-z])(?:dsc|img|pxl)(?:[_\-\s]?\d|[_\-])",
+    re.IGNORECASE,
+)
+
+_WIKI_MODERN_SNAP_TITLE_RE = re.compile(
+    r"(?:"
+    r"(?<!\d)(?:199\d|20[012]\d)(?!\d)|"
+    r"\bdsc\b|\bunsplash\b|\bpxhere\b|\bmodern\b|\bplaques?\b|\beditions?\b|"
+    r"\bmuseums?\b|\bexhibits?\b|\bexhibitions?\b|\bdisplays?\b|"
+    r"\bcostumes?\b|\bparades?\b|\ble\s+mans\b|\b(?:wrist)?watch(?:es)?\b|"
+    r"\bautomatic\b|\bheidelberg\b|\bimax\b|\brac(?:e|es|ing)\b|\bcars?\b|"
+    r"\bscales?\b|\bkitchens?\b|\bkronor\b|\bkroner\b|\b\d+\s*kr\b|\bshillings?\b|"
+    r"\bnasa\b|\bnara\b|\bairports?\b|\bhighways?\b|"
+    r"\bpaperbacks?\b|\bbookshops?\b|\bstorefronts?\b|\bselfies?\b|\bcosplay\b|"
+    r"\btourists?\b|\bsouvenirs?\b|\bprojectors?\b|\bkrampuslauf\b|\bperchtenlauf\b|"
+    r"\bethanol\b|\bjoop\b|\bwestg\b|\bbookshelf\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_WIKI_HISTORICAL_ART_CATS_RE = re.compile(
+    r"\b(?:"
+    r"paintings?|engravings?|woodcuts?|manuscripts?|illustrations?|"
+    r"historical\s+maps?|sculptures?|etchings?|lithographs?|fresco(?:es)?|"
+    r"mosaics?|tapestries|illuminated\s+manuscripts?|byzantine\s+icons?"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_WIKI_MODERN_CAT_REJECT_RE = re.compile(
+    r"\b(?:"
+    r"unsplash|pxhere|automobiles|race\s+cars?|le\s+mans|wristwatches|"
+    r"nasa|nara|coins\s+of\s+sweden|modern\s+architecture|parades|"
+    r"krampuslauf|perchtenlauf|cosplay|museum\s+interiors?|commemorative\s+plaques?|"
+    r"airports?|highways?|kitchen\s+scales?|imax|film\s+projectors?|offset\s+printing"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_WIKI_MODERN_DESC_REJECT_RE = re.compile(
+    r"\b(?:"
+    r"unsplash|pxhere|le\s+mans|race\s+car|ford\s+ecoboost|wristwatch|chronograph\s+watch|"
+    r"heidelberg|imax|film\s+projector|kitchen\s+scale|digital\s+scale|ethanol\s+burn|"
+    r"joop|nasa|nara|airport|highway|kronor|kroner|\d+\s*kr\b|shillings?|"
+    r"cosplay|krampuslauf|perchtenlauf|parade|modern\s+printing\s+press|selfie|souvenir|tourist"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_html_tags(raw: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", str(raw or ""))).strip()
+
+
+def _sanitize_search_query(query: str, mood: str = "") -> str:
+    """Normalize a search query and strip 'museum'/'museums' so museum-hallway / tourist photos aren't lured."""
+    q = _normalize_query(query, "")
+    if not q:
+        return ""
+    if mood in ("dark_horror", "epic_history", ""):
+        q = re.sub(r"\bmuseums?\b", "", q, flags=re.IGNORECASE)
+        q = re.sub(r"\s{2,}", " ", q).strip()
+    return q
+
+
+def _build_wikimedia_search_queries(query_en: str) -> List[str]:
+    """Build meaningful 4-6 token Wikimedia CirrusSearch queries preserving genre anchors
+    (painting, engraving, woodcut, illustration, manuscript, portrait, fresco) and NEVER
+    blindly truncating to 2-word fragments (`core_2`).
+    """
+    norm_q = _sanitize_search_query(query_en, mood="dark_horror")
+    if not norm_q:
+        return []
+    queries: List[str] = [norm_q]
+    seen_low: Set[str] = {norm_q.lower()}
+
+    core_tokens = [
+        tok for tok in re.findall(r"[A-Za-z0-9'-]+", norm_q)
+        if tok.lower() not in _WIKI_FILLER_WORDS and len(tok) >= 2
+    ]
+    if core_tokens:
+        # Keep 4-6 core tokens intact (NEVER truncate >=4-token queries to 2 words!)
+        if len(core_tokens) >= 4:
+            q6 = " ".join(core_tokens[:6]).strip()
+            if q6 and q6.lower() not in seen_low:
+                queries.append(q6)
+                seen_low.add(q6.lower())
+            if len(core_tokens) > 4:
+                # Preserve any trailing genre anchor (painting/engraving/woodcut/manuscript/etc.)
+                tail_anchors = [t for t in core_tokens[4:] if t.lower() in _WIKI_GENRE_ANCHORS]
+                q4_tokens = list(core_tokens[:4])
+                if tail_anchors and tail_anchors[0].lower() not in {t.lower() for t in q4_tokens}:
+                    q4_tokens.append(tail_anchors[0])
+                q4 = " ".join(q4_tokens).strip()
+                if q4 and q4.lower() not in seen_low:
+                    queries.append(q4)
+                    seen_low.add(q4.lower())
+        else:
+            q_all = " ".join(core_tokens).strip()
+            if q_all and q_all.lower() not in seen_low:
+                queries.append(q_all)
+                seen_low.add(q_all.lower())
+    return queries
+
+
+def _check_wikimedia_modern_metadata(
+    title_raw: str,
+    extmeta: Dict[str, Any],
+    mood: str = "",
+) -> Tuple[bool, str, bool]:
+    """HARD-REJECT modern snapshots, modern objects, and post-1960 non-art photo uploads using
+    filename/title + `extmetadata` (`DateTimeOriginal`, `ImageDescription`, `Categories`).
+    Returns `(is_rejected, reason, is_historical_art_cat)`.
+    """
+    _ = mood
+    clean_title = re.sub(r"^file:", "", str(title_raw or ""), flags=re.IGNORECASE).strip()
+    if _WIKI_MODERN_SNAP_CAM_RE.search(clean_title):
+        return True, "modern_cam_prefix", False
+    title_norm = re.sub(r"[^a-z0-9]+", " ", clean_title.lower()).strip()
+    m_title = _WIKI_MODERN_SNAP_TITLE_RE.search(title_norm)
+    if m_title:
+        return True, f"modern_title:{m_title.group(0)}", False
+
+    cats_raw = _strip_html_tags(((extmeta.get("Categories") or {}).get("value")) or "")
+    desc_raw = _strip_html_tags(((extmeta.get("ImageDescription") or {}).get("value")) or "")
+    dto_raw = _strip_html_tags(((extmeta.get("DateTimeOriginal") or {}).get("value")) or "")
+
+    is_historical_art_cat = bool(cats_raw and _WIKI_HISTORICAL_ART_CATS_RE.search(cats_raw))
+
+    if cats_raw:
+        m_cat = _WIKI_MODERN_CAT_REJECT_RE.search(cats_raw)
+        if m_cat:
+            return True, f"modern_cat:{m_cat.group(0)}", is_historical_art_cat
+
+    if desc_raw:
+        m_desc = _WIKI_MODERN_DESC_REJECT_RE.search(desc_raw)
+        if m_desc:
+            return True, f"modern_desc:{m_desc.group(0)}", is_historical_art_cat
+
+    # Inspect DateTimeOriginal: hard-reject uploads dated >= 1960 unless Categories clearly contain
+    # Paintings, Engravings, Woodcuts, Manuscripts, Illustrations, Historical maps, or Sculptures.
+    if dto_raw:
+        dto_years = [int(y) for y in re.findall(r"(?<!\d)(1\d{3}|20\d{2})(?!\d)", dto_raw)]
+        if dto_years and min(dto_years) >= 1960 and not is_historical_art_cat:
+            return True, f"dated_{min(dto_years)}_non_art", False
+
+    return False, "", is_historical_art_cat
+
+
 def fetch_wikimedia_commons_archival_photo(
     query_en: str,
     out_dir: Path,
@@ -1244,58 +1716,25 @@ def fetch_wikimedia_commons_archival_photo(
     """Priority 1 Free Archival Source: Query Wikimedia Commons API (`action=query`, `generator=search`,
     `gsrnamespace=6`, `prop=imageinfo`, `iiprop=url|extmetadata|dimensions`, `iiurlwidth=1920`),
     filtering strictly for:
+      - Meaningful 4-6 token queries preserving genre anchors (zero `core_2` truncation)
+      - HARD REJECT of modern snapshot filenames & post-1960 non-art `extmetadata`
+      - `base_rel >= 3` BEFORE any museum `PD-old`/`PD-Art` bonus (zero bonus for `CC0`!)
       - Bitmap images (`image/jpeg`, `image/png`) with `width >= 900`
-      - Aspect ratio matching `16:9` / landscape when `is_wide=True` (`1.15 <= w/h <= 2.65`)
+      - Aspect ratio matching `16:9` / landscape when `is_wide=True`
       - Valid Public Domain / CC0 / CC-BY / CC-BY-SA license via `extmetadata`
-      - Gemini Vision Critic validation (`_gemini_vision_batch_pick_best` / `_verify_single_image_vision`)
+      - MANDATORY Batch-4 Gemini Vision Critic (`min_score=7`, strict fail-closed — ZERO 0ms bypass!)
       - Global perceptual `dhash` deduplication (`_SEEN_PHOTO_DHASHES` + optional `used_dhashes`)
     """
-    norm_q = _normalize_query(query_en, "")
-    if not norm_q:
+    _ = strict_vision  # 0ms Vision bypass is permanently abolished; Batch-4 Vision Critic ALWAYS runs.
+    queries_to_try = _build_wikimedia_search_queries(query_en)
+    if not queries_to_try:
         return None
+    norm_q = queries_to_try[0]
     out_path_dir = Path(out_dir)
     out_path_dir.mkdir(parents=True, exist_ok=True)
     used = used_urls if used_urls is not None else set()
     dhash_pool: Set[int] = _SEEN_PHOTO_DHASHES | (used_dhashes if used_dhashes is not None else set())
     allowed_mimes = {"image/jpeg", "image/png"}
-
-    queries_to_try = [norm_q]
-    short_q = _shorten_query(norm_q, max_words=4)
-    if short_q and short_q.lower() != norm_q.lower() and len(short_q.split()) >= 2:
-        queries_to_try.append(short_q)
-    # Strip stylistic adjectives to build a concise 2-3 word historical subject query for Wikimedia CirrusSearch
-    _wiki_filler = {
-        "antique", "vintage", "historical", "history", "dark", "atmospheric", "cinematic",
-        "moody", "original", "classic", "old", "ancient", "traditional", "dramatic", "shadow",
-        "shadows", "candlelit", "nocturnal", "night", "winter", "illustration", "painting",
-        "engraving", "portrait", "drawing", "etching", "art", "artwork", "photo", "still",
-        "scene", "frame", "detail", "period", "century", "european", "folklore",
-    }
-    core_tokens = [
-        tok for tok in re.findall(r"[A-Za-z0-9'-]+", norm_q)
-        if tok.lower() not in _wiki_filler and len(tok) >= 2
-    ]
-    if core_tokens:
-        core_q = " ".join(core_tokens[:3]).strip()
-        if core_q and core_q.lower() not in {x.lower() for x in queries_to_try}:
-            queries_to_try.append(core_q)
-        if len(core_tokens) >= 2:
-            core_2 = " ".join(core_tokens[:2]).strip()
-            if core_2 and core_2.lower() not in {x.lower() for x in queries_to_try}:
-                queries_to_try.append(core_2)
-
-    _art_bonus_terms = (
-        "painting", "engraving", "etching", "woodcut", "lithograph", "fresco",
-        "manuscript", "codex", "illustration", "mosaic", "miniature", "tapestry",
-        "leech", "bruegel", "nast", "durer", "rembrandt", "rubens", "caravaggio",
-        "portrait", "chronograph", "broadsheet", "postcard", "184", "186", "188",
-        "164", "165", "166", "17th", "18th", "19th",
-    )
-    _modern_snap_terms = (
-        "dsc_", "img_", "pxl_", "2018", "2019", "2020", "2021", "2022", "2023",
-        "2024", "2025", "books", "shelf", "paperback", "edition", "sign", "plaque",
-        "tourist", "modern", "souvenir", "bookshop", "storefront", "selfie", "cosplay",
-    )
 
     candidates: List[Dict[str, Any]] = []
     seen_urls: Set[str] = set()
@@ -1308,7 +1747,7 @@ def fetch_wikimedia_commons_archival_photo(
                         "action": "query",
                         "generator": "search",
                         "gsrnamespace": 6,
-                        "gsrsearch": q,
+                        "gsrsearch": f"{q} filetype:bitmap",
                         "gsrlimit": 16,
                         "prop": "imageinfo",
                         "iiprop": "url|extmetadata|dimensions|mime|size",
@@ -1355,35 +1794,64 @@ def fetch_wikimedia_commons_archival_photo(
                     if not ok_lic:
                         continue
 
+                    # HARD REJECT modern snapshots / post-1960 non-art uploads (NEVER soft -6!)
+                    is_modern_rej, _, is_historical_art_cat = _check_wikimedia_modern_metadata(
+                        title_raw, extmeta, mood=mood
+                    )
+                    if is_modern_rej:
+                        continue
+
+                    # Require genuine lexical relevance BEFORE any PD/art bonus!
+                    base_rel = _score_media_relevance(q, title_l, mood=mood)
+                    if base_rel < 3:
+                        continue
+
                     full_url = str(ii.get("thumburl") or ii.get("url") or "").strip()
                     if not full_url or full_url in used or full_url in seen_urls:
                         continue
                     # Build a lighter 480px preview URL if thumburl is 1920px
                     thumb_preview = re.sub(r"/\d+px-", "/480px-", full_url) if "/1920px-" in full_url else full_url
-                    lic_l = lic_lbl.lower()
-                    is_pd_art = ("public domain" in lic_l) or lic_l.startswith("pd") or ("cc0" in lic_l)
-                    rel_score = _score_media_relevance(q, title_l, mood=mood)
-                    if is_pd_art:
-                        rel_score += 6
-                    if any(term in title_l for term in _art_bonus_terms):
+
+                    # Separate CC0 (ZERO bonus — Unsplash/PxHere!) from genuine museum PD-old / PD-Art
+                    lic_short_l = str(((extmeta.get("LicenseShortName") or {}).get("value")) or "").lower()
+                    lic_name_l = str(((extmeta.get("License") or {}).get("value")) or "").lower()
+                    lic_combined = f"{lic_lbl.lower()} {lic_short_l} {lic_name_l}"
+                    is_cc0 = ("cc0" in lic_combined) or ("cc-zero" in lic_combined)
+                    is_pd_museum = (
+                        (not is_cc0)
+                        and (
+                            "pd-art" in lic_combined
+                            or "pd-old" in lic_combined
+                            or "pd-1923" in lic_combined
+                            or "pd-us-expired" in lic_combined
+                            or (("public domain" in lic_combined or lic_short_l.startswith("pd")) and is_historical_art_cat)
+                        )
+                    )
+
+                    rel_score = base_rel
+                    if is_pd_museum:
+                        rel_score += 5
+                    if any(term in title_l for term in _WIKI_ART_BONUS_TERMS):
                         rel_score += 4
+                    if is_historical_art_cat:
+                        rel_score += 2
                     if is_wide and ar >= 1.18:
                         rel_score += 2
-                    if any(term in title_l for term in _modern_snap_terms):
-                        rel_score -= 6
+
                     seen_urls.add(full_url)
                     candidates.append({
                         "url": full_url,
                         "thumb": thumb_preview,
                         "title": title_raw,
                         "license": lic_lbl,
-                        "is_pd": is_pd_art,
+                        "is_pd_museum": is_pd_museum,
+                        "base_rel": base_rel,
                         "width": eff_w,
                         "height": eff_h,
                         "ar_dist": abs(ar - (16.0 / 9.0 if is_wide else 9.0 / 16.0)),
                         "rel_score": rel_score,
                     })
-                if len(candidates) >= 5:
+                if len(candidates) >= 8:
                     break
             except Exception:
                 continue
@@ -1395,38 +1863,21 @@ def fetch_wikimedia_commons_archival_photo(
 
         cand_items: List[Dict[str, Any]] = []
         cand_bgrs: List[np.ndarray] = []
-        max_thumbs_needed = 4 if strict_vision else 1
-        for item in candidates[:8]:
-            if len(cand_items) >= max_thumbs_needed:
+        for item in candidates[:12]:
+            if len(cand_items) >= 4:
                 break
             tbgr = _download_thumb_bgr(client, item["thumb"], timeout=8.0)
             if tbgr is None and item["thumb"] != item["url"]:
                 tbgr = _download_thumb_bgr(client, item["url"], timeout=10.0)
             if tbgr is None:
                 continue
-            if mood == "dark_horror":
+            if mood in ("dark_horror", "epic_history"):
                 ok_g, _ = _check_dark_horror_visual_guard(tbgr)
                 if not ok_g:
                     continue
             dh = compute_image_dhash(tbgr)
             if is_perceptual_duplicate(dh, dhash_pool, max_hamming=8):
                 continue
-            # Fast anachronism guard ONLY on modern CC-BY uploads when strict_vision=False;
-            # genuine Public Domain / CC0 museum works pass immediately at 0ms Vision cost!
-            if (not strict_vision) and (not item.get("is_pd")) and mood in ("dark_horror", "epic_history"):
-                ok_ana, ana_sc, ana_why = verify_historical_anachronism_vision(
-                    tbgr,
-                    query=norm_q,
-                    lower_third_title=topic_context[:120],
-                    mood=mood,
-                    strict_vision=False,
-                )
-                if not ok_ana and ana_why != "no_vision_key":
-                    print(
-                        f"[DocMedia] Wikimedia fast-gate rejected modern CC photo '{item['title'][:48]}' ({ana_sc}/10: {ana_why})",
-                        flush=True,
-                    )
-                    continue
             cand_items.append(item)
             cand_bgrs.append(tbgr)
 
@@ -1434,36 +1885,21 @@ def fetch_wikimedia_commons_archival_photo(
             return None
 
         ctx_str = (topic_context or norm_q).strip()
-        if strict_vision:
-            if len(cand_bgrs) == 1:
-                ok_v, v_score, v_reason = _verify_single_image_vision(
-                    cand_bgrs[0],
-                    query=norm_q,
-                    scene_context=ctx_str,
-                    mood=mood,
-                    min_score=7,
-                    strict_vision=True,
-                )
-                best_i = 0 if ok_v else -1
-            else:
-                best_i, v_score, v_reason = _gemini_vision_batch_pick_best(
-                    cand_bgrs,
-                    query=norm_q,
-                    scene_context=ctx_str,
-                    mood=mood,
-                    min_score=7,
-                    strict_vision=True,
-                )
-            if best_i < 0:
-                print(
-                    f"[DocMedia] Wikimedia Vision rejected all {len(cand_items)} plates for '{norm_q}' ({v_score}/10: {v_reason})",
-                    flush=True,
-                )
-                return None
-            winner = cand_items[best_i]
-        else:
-            winner = cand_items[0]
-            v_score, v_reason = (9, "pd_museum_fast") if winner.get("is_pd") else (8, "cc_anachronism_ok")
+        best_i, v_score, v_reason = _gemini_vision_batch_pick_best(
+            cand_bgrs,
+            query=norm_q,
+            scene_context=ctx_str,
+            mood=mood,
+            min_score=7,
+            strict_vision=True,
+        )
+        if best_i < 0:
+            print(
+                f"[DocMedia] Wikimedia Vision rejected all {len(cand_items)} plates for '{norm_q}' ({v_score}/10: {v_reason})",
+                flush=True,
+            )
+            return None
+        winner = cand_items[best_i]
 
         q_hash = hashlib.sha256(norm_q.lower().encode("utf-8")).hexdigest()[:12]
         dl = _download_and_validate_photo(
@@ -1509,8 +1945,9 @@ def verify_video_frame_vision(
     strict_vision: bool = True,
 ) -> Tuple[bool, int, str]:
     """Extract a representative frame from a downloaded video and verify semantic relevance via Gemini Vision.
-    FAIL-CLOSED (`return False, 0, reason`) when `strict_vision=True`.
+    ALWAYS FAIL-CLOSED (`return False, 0, reason`).
     """
+    _ = strict_vision
     try:
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -1530,13 +1967,11 @@ def verify_video_frame_vision(
             scene_context=scene_context,
             mood=mood,
             min_score=min_score,
-            strict_vision=strict_vision,
+            strict_vision=True,
         )
         return (idx == 0), score, reason
     except Exception as exc:
-        if strict_vision:
-            return False, 0, f"verify_err:{str(exc)[:40]}"
-        return True, 7, "verify_skip"
+        return False, 0, f"verify_err:{str(exc)[:40]}"
 
 
 def _search_pixabay_photos(
@@ -1548,12 +1983,15 @@ def _search_pixabay_photos(
 ) -> List[Dict[str, str]]:
     if not api_key:
         return []
+    clean_query = _sanitize_search_query(query, mood=mood)
+    if not clean_query:
+        return []
     scored_results: List[Tuple[int, Dict[str, str]]] = []
     seen_urls: Set[str] = set()
 
-    queries_to_try = [query]
-    short_q = _shorten_query(query, max_words=3)
-    if short_q and short_q.lower() != query.lower():
+    queries_to_try = [clean_query]
+    short_q = _shorten_query(clean_query, max_words=4)
+    if short_q and short_q.lower() != clean_query.lower():
         queries_to_try.append(short_q)
 
     for q in queries_to_try:
@@ -1606,10 +2044,9 @@ def _search_wikimedia_photos(
     results: List[Dict[str, str]] = []
     seen_urls: Set[str] = set()
 
-    queries_to_try = [query]
-    short_q = _shorten_query(query, max_words=3)
-    if short_q and short_q.lower() != query.lower():
-        queries_to_try.append(short_q)
+    queries_to_try = _build_wikimedia_search_queries(query)
+    if not queries_to_try:
+        return []
 
     allowed_mimes = {"image/jpeg", "image/png", "image/webp"}
     for q in queries_to_try:
@@ -1620,10 +2057,10 @@ def _search_wikimedia_photos(
                     "action": "query",
                     "generator": "search",
                     "gsrnamespace": 6,
-                    "gsrsearch": q,
-                    "gsrlimit": 10,
+                    "gsrsearch": f"{q} filetype:bitmap",
+                    "gsrlimit": 12,
                     "prop": "imageinfo",
-                    "iiprop": "url|size|mime",
+                    "iiprop": "url|extmetadata|size|mime",
                     "iiurlwidth": 1280,
                     "format": "json",
                 },
@@ -1634,7 +2071,8 @@ def _search_wikimedia_photos(
                 continue
             pages = r.json().get("query", {}).get("pages", {})
             for page in pages.values():
-                title_l = str(page.get("title") or "").lower()
+                title_raw = str(page.get("title") or "")
+                title_l = title_raw.lower()
                 if any(bad in title_l for bad in PHOTO_BAD_WORDS):
                     continue
                 if _is_offtopic_media_tags(title_l, query=q, mood=mood):
@@ -1642,6 +2080,18 @@ def _search_wikimedia_photos(
                 ii = (page.get("imageinfo") or [{}])[0]
                 mime = str(ii.get("mime") or "").lower()
                 if mime not in allowed_mimes:
+                    continue
+                extmeta = ii.get("extmetadata") if isinstance(ii.get("extmetadata"), dict) else {}
+                ok_lic, _ = _is_permissive_wikimedia_license(extmeta)
+                if not ok_lic:
+                    continue
+                is_modern_rej, _, is_historical_art_cat = _check_wikimedia_modern_metadata(
+                    title_raw, extmeta, mood=mood
+                )
+                if is_modern_rej:
+                    continue
+                base_rel = _score_media_relevance(q, title_l, mood=mood)
+                if base_rel < 3:
                     continue
                 w = int(ii.get("thumbwidth") or ii.get("width") or 0)
                 h = int(ii.get("thumbheight") or ii.get("height") or 0)
@@ -1657,10 +2107,16 @@ def _search_wikimedia_photos(
                     url = str(ii.get("url") or "").strip()
                 if not url or url in seen_urls:
                     continue
-                rel_score = _score_media_relevance(q, title_l, mood=mood)
-                priority = (0 if w >= min_width else 10) - max(0, rel_score)
+                thumb_preview = re.sub(r"/\d+px-", "/480px-", url) if "/1280px-" in url else url
+                bonus = 3 if is_historical_art_cat else 0
+                priority = (0 if w >= min_width else 10) - (base_rel + bonus)
                 seen_urls.add(url)
-                results.append({"source": "wikimedia_photo", "url": url, "priority": str(priority)})
+                results.append({
+                    "source": "wikimedia_photo",
+                    "url": url,
+                    "thumb": thumb_preview,
+                    "priority": str(priority),
+                })
             if results:
                 break
         except Exception:
@@ -2014,6 +2470,7 @@ def fetch_doc_real_photo(
         return w_px >= h_px * 1.25
 
     # 0. Fast persistent cache lookup by query hash (respecting used_urls, AR, dhash AND Vision check)
+    effective_strict = strict_vision or (resolved_mood in ("dark_horror", "epic_history"))
     cached_entries = _load_photo_query_index(q_hash)
     for entry in cached_entries:
         c_url = str(entry.get("url") or "")
@@ -2028,7 +2485,7 @@ def fetch_doc_real_photo(
             c_ar = str(entry.get("aspect_ratio") or "").strip()
             if (c_ar and c_ar != ar_clean) or not _orientation_matches_ar(cw, ch):
                 continue
-        if strict_vision:
+        if effective_strict:
             bgr_c = cv2.imread(str(c_file), cv2.IMREAD_COLOR)
             if bgr_c is not None:
                 if c_src in ("google_flow_bespoke", "google_flow_pro_nano_banana_2"):
@@ -2050,7 +2507,7 @@ def fetch_doc_real_photo(
                         scene_context=ctx_text,
                         mood=resolved_mood,
                         min_score=7,
-                        strict_vision=strict_vision,
+                        strict_vision=True,
                     )
                     if v_idx != 0:
                         print(f"[DocMedia] Vision rejected cached photo ({v_sc}/10: {v_why}) -> {c_file.name}", flush=True)
@@ -2093,18 +2550,19 @@ def fetch_doc_real_photo(
             evaluate ALL 4 simultaneously in ONE 1-second Gemini Vision Critic call, and ONLY
             download full-res of the winning candidate if score >= 7/10!
             """
+            clean_sq = _sanitize_search_query(search_q, mood=resolved_mood) or search_q
             pool: List[Dict[str, str]] = []
-            # Historical / museum subjects prioritize Wikimedia + Openverse ahead of generic Pixabay
+            # Historical subjects prioritize Wikimedia + Openverse ahead of generic Pixabay
             if resolved_mood in ("dark_horror", "epic_history"):
-                pool.extend(_search_wikimedia_photos(client, search_q, min_width=eff_min_w, mood=resolved_mood)[:4])
-                pool.extend(_search_openverse_photos(client, search_q, min_width=eff_min_w, mood=resolved_mood)[:4])
+                pool.extend(_search_wikimedia_photos(client, clean_sq, min_width=eff_min_w, mood=resolved_mood)[:4])
+                pool.extend(_search_openverse_photos(client, clean_sq, min_width=eff_min_w, mood=resolved_mood)[:4])
                 if pixabay_key:
-                    pool.extend(_search_pixabay_photos(client, search_q, pixabay_key, min_width=eff_min_w, mood=resolved_mood)[:4])
+                    pool.extend(_search_pixabay_photos(client, clean_sq, pixabay_key, min_width=eff_min_w, mood=resolved_mood)[:4])
             else:
                 if pixabay_key:
-                    pool.extend(_search_pixabay_photos(client, search_q, pixabay_key, min_width=eff_min_w, mood=resolved_mood)[:4])
-                pool.extend(_search_openverse_photos(client, search_q, min_width=eff_min_w, mood=resolved_mood)[:4])
-                pool.extend(_search_wikimedia_photos(client, search_q, min_width=eff_min_w, mood=resolved_mood)[:4])
+                    pool.extend(_search_pixabay_photos(client, clean_sq, pixabay_key, min_width=eff_min_w, mood=resolved_mood)[:4])
+                pool.extend(_search_openverse_photos(client, clean_sq, min_width=eff_min_w, mood=resolved_mood)[:4])
+                pool.extend(_search_wikimedia_photos(client, clean_sq, min_width=eff_min_w, mood=resolved_mood)[:4])
 
             fresh: List[Dict[str, str]] = []
             seen_u: Set[str] = set()
@@ -2118,7 +2576,7 @@ def fetch_doc_real_photo(
             if not fresh:
                 return None
 
-            if not strict_vision:
+            if not effective_strict:
                 for item in fresh[:6]:
                     dl = _download_and_validate_photo(client, item["url"], item["source"], q_hash, min_width=min(eff_min_w, 320))
                     if dl is not None:
@@ -2131,14 +2589,14 @@ def fetch_doc_real_photo(
             # Download up to 4 small thumbnails (fast, ~30KB each) and run Batch-4 Gemini Vision selection!
             cand_items: List[Dict[str, str]] = []
             cand_bgrs: List[np.ndarray] = []
-            for item in fresh[:8]:
+            for item in fresh[:10]:
                 if len(cand_items) >= 4:
                     break
                 t_url = str(item.get("thumb") or item["url"])
                 tbgr = _download_thumb_bgr(client, t_url)
                 if tbgr is None:
                     continue
-                if resolved_mood == "dark_horror":
+                if resolved_mood in ("dark_horror", "epic_history"):
                     ok_g, _ = _check_dark_horror_visual_guard(tbgr)
                     if not ok_g:
                         continue
@@ -2153,15 +2611,15 @@ def fetch_doc_real_photo(
 
             best_i, v_score, v_reason = vision_select_best_candidate(
                 cand_bgrs,
-                query=search_q,
+                query=clean_sq,
                 scene_context=ctx_text,
                 mood=resolved_mood,
                 min_score=7,
-                strict_vision=strict_vision,
+                strict_vision=True,
             )
             if best_i < 0:
                 print(
-                    f"[DocMedia] Vision rejected all {len(cand_items)} stock hits for '{search_q}' ({v_score}/10: {v_reason})",
+                    f"[DocMedia] Vision rejected all {len(cand_items)} stock hits for '{clean_sq}' ({v_score}/10: {v_reason})",
                     flush=True,
                 )
                 return None
@@ -2171,7 +2629,7 @@ def fetch_doc_real_photo(
             if dl is not None:
                 p, w, h = dl
                 print(
-                    f"[DocMedia] Vision APPROVED {winner['source']} ({v_score}/10: {v_reason}) | q='{search_q}'",
+                    f"[DocMedia] Vision APPROVED {winner['source']} ({v_score}/10: {v_reason}) | q='{clean_sq}'",
                     flush=True,
                 )
                 return _record_and_return(p, winner["url"], winner["source"], w, h)
@@ -2198,7 +2656,7 @@ def fetch_doc_real_photo(
                 if flow_path is not None and flow_path.exists():
                     ok_v, fw, fh = _validate_photo_file(flow_path, min_width=320, min_height=200)
                     if ok_v and _orientation_matches_ar(fw, fh):
-                        if strict_vision and resolved_mood in ("dark_horror", "epic_history"):
+                        if effective_strict and resolved_mood in ("dark_horror", "epic_history"):
                             ok_a, a_sc, a_why = verify_historical_anachronism_vision(
                                 flow_path,
                                 query=flow_prompt,
@@ -2228,7 +2686,7 @@ def fetch_doc_real_photo(
                 mood=resolved_mood,
                 used_urls=used,
                 used_dhashes=dhashes,
-                strict_vision=strict_vision,
+                strict_vision=True,
             )
             if wiki_hit is not None and wiki_hit.exists():
                 return wiki_hit
@@ -2243,8 +2701,8 @@ def fetch_doc_real_photo(
         if flow_hit is not None:
             return flow_hit
 
-        # 3. Last resort: try mood-matched curated queries ONLY when not strictly historical or still passing Vision >= 7/10!
-        if resolved_mood not in ("dark_horror", "epic_history") or not strict_vision:
+        # 3. Last resort: try mood-matched curated queries ONLY when not historical (never pollute history docs!)
+        if resolved_mood not in ("dark_horror", "epic_history") and not effective_strict:
             fb_pool = list(mood_defaults)
             start_idx = int(q_hash[:4], 16) % len(fb_pool)
             for offset in range(min(3, len(fb_pool))):
@@ -2618,7 +3076,7 @@ def _fetch_pixabay_doc_broll(
                 tbgr = _download_thumb_bgr(client, t_url) if t_url else None
                 if tbgr is None:
                     continue
-                if mood == "dark_horror":
+                if mood in ("dark_horror", "epic_history"):
                     ok_g, _ = _check_dark_horror_visual_guard(tbgr)
                     if not ok_g:
                         continue
