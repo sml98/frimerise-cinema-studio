@@ -5,19 +5,31 @@ __pycache__/
 *$py.class
 *.egg-info/
 
-# Local SQLite Database (Contains User API Keys — NEVER COMMIT)
+# Local SQLite Database & Auth Tokens (Contains User API Keys — NEVER COMMIT)
 data/frimerise.db
 data/frimerise.db-journal
 data/frimerise.db-wal
 data/frimerise.db-shm
+data/gdrive_token.json
+data/gdrive_credentials.json
+.env
+.env.*
+*.pem
+*.key
 
 # Large Local Models, Browser Profiles, Caches & Generated Video Outputs
 data/models/
 data/broll_cache/
 data/cartoon_bg_cache/
+data/cartoon_bgs/
+data/bespoke_cache/
+data/doc_bgs/
+data/characters/
+data/logos/
 data/camoufox_profiles/
 data/references/
 outputs/
+fila_videos.json
 
 # Heavy Local Binary Bundles (Reproducible via bootstrap_assets.py / start_frimerise.sh)
 vendor/syslibs/

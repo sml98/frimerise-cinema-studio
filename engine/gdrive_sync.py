@@ -59,7 +59,10 @@ UPLOAD_TOP_FILES = (
     "cover_9x16.png",
     "preview_540p.mp4",
     "quality_report.json",
+    "qc_report.json",
     "words.json",
+    "script.json",
+    "edl_timeline.json",
     "timeline.otio",
 )
 UPLOAD_SUBDIRS = ("shorts_cascade", "dubbed")
@@ -75,6 +78,19 @@ PRUNABLE_HEAVY_FILES = (
 )
 
 
+def _find_rclone_bin() -> Optional[str]:
+    found = shutil.which("rclone")
+    if found:
+        return found
+    for cand in (
+        Path.home() / ".local" / "bin" / "rclone",
+        BASE_DIR / ".venv" / "bin" / "rclone",
+    ):
+        if cand.exists() and cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
 def sanitize_folder_name(topic: str, job_id: str) -> str:
     """Create a clean, readable, filesystem- & Drive-safe folder name for a project."""
     raw = (topic or "Projeto_FrimeRise").strip()
@@ -87,7 +103,7 @@ def sanitize_folder_name(topic: str, job_id: str) -> str:
 
 
 def _detect_rclone_drive_remote(preferred: str = "") -> Optional[str]:
-    rclone_bin = shutil.which("rclone")
+    rclone_bin = _find_rclone_bin()
     if not rclone_bin:
         return None
     try:
@@ -153,7 +169,7 @@ def probe_gdrive_status() -> Dict[str, Any]:
     settings = get_settings() or {}
     root_folder = (settings.get("gdrive_root_folder") or "FrimeRise").strip() or "FrimeRise"
     auto_upload = settings.get("gdrive_auto_upload", "1") == "1"
-    prune_local = settings.get("gdrive_prune_local", "0") == "1"
+    prune_local = settings.get("gdrive_prune_local", "1") == "1"
     preferred_remote = (settings.get("gdrive_rclone_remote") or "").strip()
     custom_local = (settings.get("gdrive_local_dir") or "").strip()
 
@@ -187,7 +203,7 @@ def probe_gdrive_status() -> Dict[str, Any]:
         "root_folder": root_folder,
         "auto_upload": auto_upload,
         "prune_local": prune_local,
-        "rclone_installed": shutil.which("rclone") is not None,
+        "rclone_installed": _find_rclone_bin() is not None,
         "rclone_remote": rclone_remote or "",
         "local_sync_dir": str(local_sync_dir) if local_sync_dir else "",
         "setup_command": "./setup_gdrive.sh",
@@ -217,7 +233,7 @@ def _upload_via_rclone(
     job_dir: Path,
     files: List[Tuple[Path, str]],
 ) -> Dict[str, Any]:
-    rclone_bin = shutil.which("rclone")
+    rclone_bin = _find_rclone_bin()
     if not rclone_bin:
         raise RuntimeError("rclone não encontrado")
 
@@ -235,7 +251,7 @@ def _upload_via_rclone(
             check=True,
             capture_output=True,
             text=True,
-            timeout=600,
+            timeout=1800,
         )
         if proc.returncode == 0:
             uploaded += 1
@@ -423,6 +439,23 @@ def prune_local_heavy_files(
                 p.unlink(missing_ok=True)
                 removed.append(fname)
                 pruned_files.append(fname)
+            except Exception:
+                pass
+
+    # Also prune heavy video deliverables inside shorts_cascade/ and dubbed/ ONLY when confirmed uploaded
+    for sub in UPLOAD_SUBDIRS:
+        sub_dir = job_dir / sub
+        if not (sub_dir.exists() and sub_dir.is_dir()):
+            continue
+        for f in sorted(sub_dir.rglob("*.mp4")):
+            rel_sub = str(f.relative_to(job_dir)).replace("\\", "/")
+            if rel_sub not in confirmed:
+                continue
+            try:
+                freed_bytes += f.stat().st_size
+                f.unlink(missing_ok=True)
+                removed.append(rel_sub)
+                pruned_files.append(rel_sub)
             except Exception:
                 pass
 

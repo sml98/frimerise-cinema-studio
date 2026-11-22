@@ -1,0 +1,28 @@
+{
+  "videos": [
+    {
+      "topic": "A Verdadeira História Oculta da Biblioteca de Alexandria",
+      "engine_style": "netflix_doc",
+      "aspect_ratio": "16:9",
+      "target_minutes": 17.0,
+      "language": "pt_br",
+      "voice_id": "Charon",
+      "lut_file": "04_crisp_commercial.cube",
+      "caption_style": "selective_emphasis",
+      "thumb_3words": "O INCÊNDIO OCULTO",
+      "auto_shorts_cascade": true,
+      "custom_directives": "Foco histórico rigoroso em fontes primárias, sem clichês e sem CTA no final."
+    },
+    {
+      "topic": "Como o Império Holandês Criou a Primeira Bolha Financeira da História",
+      "engine_style": "netflix_doc",
+      "aspect_ratio": "9:16",
+      "target_minutes": 2.5,
+      "language": "pt_br",
+      "voice_id": "Charon",
+      "lut_file": "02_dark_wealth.cube",
+      "caption_style": "cinema_minimal",
+      "thumb_3words": "A BOLHA REAL"
+    }
+  ]
+}

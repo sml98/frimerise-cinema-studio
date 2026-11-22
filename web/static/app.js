@@ -1879,7 +1879,7 @@ function renderGdriveCard() {
     dirIn.value = s.gdrive_local_dir || gd.local_sync_dir || '';
   }
   if (autoCb) autoCb.checked = (s.gdrive_auto_upload ?? '1') === '1';
-  if (pruneCb) pruneCb.checked = (s.gdrive_prune_local ?? '0') === '1';
+  if (pruneCb) pruneCb.checked = (s.gdrive_prune_local ?? '1') === '1';
 
   if (pill && detail) {
     if (gd.connected) {
