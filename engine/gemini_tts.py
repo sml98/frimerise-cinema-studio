@@ -73,6 +73,30 @@ _ROMAN_CENTURY_PT: Dict[str, str] = {
     "XXI": "vinte e um",
 }
 
+_CARDINAL_CENTURY_TO_ORDINAL_PT: Dict[str, str] = {
+    "um": "primeiro",
+    "1": "primeiro",
+    "dois": "segundo",
+    "2": "segundo",
+    "três": "terceiro",
+    "tres": "terceiro",
+    "3": "terceiro",
+    "quatro": "quarto",
+    "4": "quarto",
+    "cinco": "quinto",
+    "5": "quinto",
+    "seis": "sexto",
+    "6": "sexto",
+    "sete": "sétimo",
+    "7": "sétimo",
+    "oito": "oitavo",
+    "8": "oitavo",
+    "nove": "nono",
+    "9": "nono",
+    "dez": "décimo",
+    "10": "décimo",
+}
+
 _ROMAN_ORDINAL_FEM_PT: Dict[str, str] = {
     "I": "primeira",
     "II": "segunda",
@@ -202,6 +226,12 @@ def normalize_narration_for_speech(text: str, lang: str = "pt_br") -> str:
         s = re.sub(
             r"\bs[eé]culo\s+([IVX]{1,4})\b",
             lambda m: f"século {_ROMAN_CENTURY_PT.get(m.group(1).upper(), m.group(1))}",
+            s,
+            flags=re.I,
+        )
+        s = re.sub(
+            r"\bs[eé]c(?:ulo|\.?)\s+(um|dois|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez|[1-9]|10)\b",
+            lambda m: f"século {_CARDINAL_CENTURY_TO_ORDINAL_PT.get(m.group(1).lower(), m.group(1))}",
             s,
             flags=re.I,
         )

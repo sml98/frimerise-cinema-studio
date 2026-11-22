@@ -1364,13 +1364,13 @@ def master_broadcast_audio(
     sfx_events: List[Tuple[Path, float, float]],  # (sfx_path, time_s, volume)
     output_m4a: Path,
     duration_s: float,
-    music_volume: float = 0.19,
-    tail_pad_s: float = 0.40,
+    music_volume: float = 0.34,
+    tail_pad_s: float = 1.25,
     thermal_limit_c: float = 85.0,
 ) -> Tuple[Path, float]:
     """Apply Broadcast FM Chain:
-    Voice: highpass=85Hz -> De-Esser 6500Hz -> Presence 3200Hz -> Compressor + 0.40s clean tail
-    Mix: voice + sidechain-ducked looping music bed + timed SFX hits
+    Voice: highpass=85Hz -> De-Esser 6500Hz -> Presence 3200Hz -> Compressor + cinema breathing tail
+    Mix: voice + vocal-pocket-EQ'd & smoothly sidechain-ducked (-22 LUFS under speech) looping music bed + timed SFX hits
     Master Bus (AFTER amix): loudnorm=I=-14:TP=-1.5:LRA=11 -> 192kHz alimiter=limit=0.80:level=false:attack=3:release=40:latency=true -> aresample=48000
     so True Peak is mathematically capped <= -1.5 dBTP even after AAC 192k encoding (zero 0.0 dBFS clipping!).
     Returns (output_m4a, final_duration_s).
@@ -1378,7 +1378,7 @@ def master_broadcast_audio(
     final_dur = round(duration_s + tail_pad_s, 3)
     inputs = ["-i", str(voice_wav)]
     filter_parts = [
-        # FM Broadcast voice chain (EQ + de-esser + compressor) + 0.40s clean breathing tail
+        # FM Broadcast voice chain (EQ + de-esser + compressor) + clean cinema breathing tail
         # Loudnorm & brickwall True-Peak limiter run AFTER amix on the full master bus!
         (
             "[0:a]highpass=f=85,"
@@ -1394,16 +1394,24 @@ def master_broadcast_audio(
     next_idx = 1
 
     if music_mp3 and music_mp3.exists() and music_volume > 0.001:
+        eff_bgm_vol = (
+            max(0.32, float(music_volume) * 1.85)
+            if 0.001 < float(music_volume) < 0.28
+            else float(music_volume)
+        )
+        # Compensate for voice chain makeup=2 (+6dB) so ducked BGM sits at true cinema -22..-21 dBFS under speech
+        bgm_bus_vol = min(1.55, eff_bgm_vol * 3.45) if eff_bgm_vol <= 0.55 else eff_bgm_vol
         inputs.extend(["-stream_loop", "-1", "-i", str(music_mp3)])
-        fade_out_d = min(0.85, max(0.35, final_dur * 0.12))
+        fade_out_d = min(1.20, max(0.35, float(tail_pad_s) * 0.90 if tail_pad_s >= 0.8 else final_dur * 0.12))
         fade_out_start = max(0.0, final_dur - fade_out_d)
         filter_parts.append(
             f"[{next_idx}:a]atrim=0:{final_dur:.3f},asetpts=PTS-STARTPTS,"
-            f"volume={music_volume:.3f},afade=t=in:st=0:d=0.30,afade=t=out:st={fade_out_start:.3f}:d={fade_out_d:.3f}[bgm_raw]"
+            "equalizer=f=1100:t=q:w=1.2:g=-2.8,"
+            f"volume={bgm_bus_vol:.3f},afade=t=in:st=0:d=0.30,afade=t=out:st={fade_out_start:.3f}:d={fade_out_d:.3f}[bgm_raw]"
         )
-        # Sidechain compression ducks music automatically whenever narrator speaks
+        # Smooth, musical broadcast ducking curve (~3.5-4.5 dB gentle duck during speech, smooth swell in pauses)
         filter_parts.append(
-            "[bgm_raw][v_sc]sidechaincompress=threshold=0.03:ratio=5.5:attack=15:release=260:makeup=1[bgm_ducked]"
+            "[bgm_raw][v_sc]sidechaincompress=threshold=0.085:ratio=2.2:attack=25:release=480:makeup=1.18[bgm_ducked]"
         )
         mix_labels.append("[bgm_ducked]")
         next_idx += 1

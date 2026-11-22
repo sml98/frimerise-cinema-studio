@@ -242,11 +242,7 @@ def audit_viral_script_dict(script: Dict[str, Any], lang: Optional[str] = None) 
     hook_txt = str(script.get("hook_a", ""))
     all_texts = [hook_txt, *cleaned_body]
     natural_q_count = sum(1 for t in all_texts if "?" in t)
-    est_total_dur = sum(_estimate_line_seconds(t) for t in all_texts if t.strip())
-    plan_has_natural_loops = (
-        natural_q_count >= max(2, int(est_total_dur // 30.0))
-        or (est_total_dur <= 36.0 and natural_q_count >= 1)
-    )
+    plan_has_natural_loops = natural_q_count >= 1
 
     elapsed_s = _estimate_line_seconds(hook_txt) if hook_txt.strip() else 0.0
     since_last_loop_s = 0.0
@@ -311,11 +307,7 @@ def audit_cartoon_episode_plan(plan: Any, lang: Optional[str] = None) -> Tuple[A
     bridges = _pick_bridge_pool("cartoon", resolved_lang)
 
     natural_q_count = sum(1 for t in sample_lines if "?" in t)
-    est_total_dur = sum(_estimate_line_seconds(t) for t in sample_lines if t.strip())
-    plan_has_natural_loops = (
-        natural_q_count >= max(2, int(est_total_dur // 30.0))
-        or (est_total_dur <= 36.0 and natural_q_count >= 1)
-    )
+    plan_has_natural_loops = natural_q_count >= 1
 
     for scene in getattr(plan, "scenes", []):
         for dl in getattr(scene, "dialogue_lines", []):
@@ -428,11 +420,8 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
         est_plan_dur += _estimate_line_seconds(intro_txt)
     all_plan_texts = [t for t in [intro_txt, *scene_texts, *body_texts] if t.strip()]
     natural_q_count = sum(1 for t in all_plan_texts if "?" in t)
-    # Skip redundant boilerplate bridge injection when the plan already contains natural '?' open loops
-    plan_has_natural_loops = (
-        natural_q_count >= max(2, int(est_plan_dur // 30.0))
-        or (est_plan_dur <= 36.0 and natural_q_count >= 1)
-    )
+    # Skip redundant boilerplate bridge injection when the plan already contains >= 1 natural '?' open loop
+    plan_has_natural_loops = natural_q_count >= 1
 
     # Check if cold_open / hook_a already starts with an open loop
     if intro_txt:
