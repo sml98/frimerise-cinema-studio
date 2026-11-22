@@ -29,6 +29,7 @@ from engine.intel_vaapi import (
 from engine.kinetic_captions import (
     CAPTION_STYLES,
     draw_kinetic_captions,
+    group_words_into_chunks as _kc_group_words_into_chunks,
     resolve_caption_style,
 )
 
@@ -170,58 +171,15 @@ def _sanitize_card_text(txt: str) -> str:
     return " ".join(cleaned.split())
 
 
-def group_words_into_chunks(words: List[Dict[str, Any]], max_words: int = 3) -> List[Dict[str, Any]]:
-    """Split any multi-word tokens and group into crisp 2-3 word Hormozi subtitle chunks."""
-    # First normalize: guarantee every entry is a single clean word with no glued spaces
-    clean_words: List[Dict[str, Any]] = []
-    global_idx = 0
-    for w in words:
-        raw = str(w.get("word", "")).strip()
-        parts = [
-            p
-            for p in re.split(r"\s+", raw)
-            if p and (re.search(r"[0-9A-Za-zÀ-ÿ]", p) or any(_is_emoji(ch) for ch in p))
-        ]
-        if not parts:
-            continue
-        st = float(w["start"])
-        en = float(w["end"])
-        step = max(0.06, (en - st) / float(len(parts)))
-        for j, part in enumerate(parts):
-            clean_words.append(
-                {
-                    "word": part,
-                    "start": round(st + j * step, 3),
-                    "end": round(st + (j + 1) * step, 3),
-                    "g_idx": global_idx,
-                }
-            )
-            global_idx += 1
-
-    chunks: List[Dict[str, Any]] = []
-    buf: List[Dict[str, Any]] = []
-    for w in clean_words:
-        buf.append(w)
-        txt = w["word"]
-        end_punct = txt.endswith((".", "!", "?", ";", ":"))
-        char_len = sum(len(x["word"]) for x in buf) + max(0, len(buf) - 1)
-        if len(buf) >= max_words or end_punct or char_len >= 16:
-            chunks.append(
-                {
-                    "start": buf[0]["start"],
-                    "end": buf[-1]["end"],
-                    "words": list(buf),
-                }
-            )
-            buf = []
-    if buf:
-        chunks.append({"start": buf[0]["start"], "end": buf[-1]["end"], "words": buf})
-
-    for i in range(len(chunks) - 1):
-        gap = chunks[i + 1]["start"] - chunks[i]["end"]
-        if 0 < gap <= 0.30:
-            chunks[i]["end"] = chunks[i + 1]["start"]
-    return chunks
+def group_words_into_chunks(
+    words: List[Dict[str, Any]],
+    max_words: int = 3,
+    selective: bool = False,
+) -> List[Dict[str, Any]]:
+    """Split multi-word tokens, compact spelled-out numbers/dates, prevent orphaned
+    conjunctions, and group into crisp subtitle chunks via `engine.kinetic_captions`.
+    """
+    return _kc_group_words_into_chunks(words, max_words=max_words, selective=selective)
 
 
 class SkiaMotionCompositor:
@@ -705,21 +663,23 @@ def render_cover_9x16(
             scrim = skia.Paint()
             if is_dark_cinema:
                 scrim_colors = [
-                    skia.ColorSetARGB(92, 8, 6, 8),
-                    skia.ColorSetARGB(158, 10, 6, 8),
-                    skia.ColorSetARGB(228, 16, 4, 8),
+                    skia.ColorSetARGB(46, 8, 6, 8),
+                    skia.ColorSetARGB(72, 10, 6, 8),
+                    skia.ColorSetARGB(212, 12, 6, 10),
+                    skia.ColorSetARGB(244, 14, 4, 8),
                 ]
             else:
                 scrim_colors = [
-                    skia.ColorSetARGB(120, 11, 7, 19),
-                    skia.ColorSetARGB(175, 11, 7, 19),
-                    skia.ColorSetARGB(220, 11, 7, 19),
+                    skia.ColorSetARGB(58, 11, 7, 19),
+                    skia.ColorSetARGB(92, 11, 7, 19),
+                    skia.ColorSetARGB(208, 11, 7, 19),
+                    skia.ColorSetARGB(240, 11, 7, 19),
                 ]
             scrim.setShader(
                 skia.GradientShader.MakeLinear(
                     [(0, 0), (0, h)],
                     scrim_colors,
-                    [0.0, 0.55, 1.0],
+                    [0.0, 0.48, 0.72, 1.0],
                 )
             )
             c.drawRect(skia.Rect.MakeWH(w, h), scrim)
@@ -749,14 +709,26 @@ def render_cover_9x16(
     ui_tf, _ = _load_verified_typeface("PlusJakartaSans-ExtraBold.ttf", role="cover_sub")
 
     clean_title = _sanitize_card_text(title).upper() or "VÍDEO EM ALTA"
-    title_font, lines = _wrap_text_to_width(clean_title, main_tf, 96.0, 56.0, w - 160.0, max_lines=4)
-    line_step = title_font.getSize() * 1.24
-    y0 = 920.0 - ((len(lines) - 1) * line_step) / 2.0
+    title_font, lines = _wrap_text_to_width(clean_title, main_tf, 88.0, 52.0, w - 160.0, max_lines=4)
+    if len(lines) >= 3 and title_font.getSize() > 78.0:
+        title_font, lines = _wrap_text_to_width(clean_title, main_tf, 78.0, 50.0, w - 160.0, max_lines=4)
+    line_step = title_font.getSize() * 1.22
+    # Anchor title block strictly in the lower third (`y = 0.72 * h`) so it NEVER censors
+    # the subject's eyes / upper face at `y = 0.45..0.55 * h`.
+    lower_third_anchor_y = float(h) * 0.72
+    block_span = max(0.0, (len(lines) - 1) * line_step)
+    y0 = lower_third_anchor_y - block_span * 0.5
+    min_safe_y0 = float(h) * 0.625 + title_font.getSize() * 0.85
+    max_safe_last_y = float(h) * 0.845
+    if y0 < min_safe_y0:
+        y0 = min_safe_y0
+    if (y0 + block_span) > max_safe_last_y:
+        y0 = max(min_safe_y0, max_safe_last_y - block_span)
 
     if is_dark_cinema and lines:
         bar_w = 180.0
         bar_x = (w - bar_w) / 2.0
-        bar_y = y0 - title_font.getSize() * 1.32
+        bar_y = y0 - title_font.getSize() * 1.18
         bar_p = skia.Paint(AntiAlias=True)
         bar_p.setShader(
             skia.GradientShader.MakeLinear(
@@ -767,10 +739,12 @@ def render_cover_9x16(
         )
         c.drawRoundRect(skia.Rect.MakeXYWH(bar_x, bar_y, bar_w, 6.0), 3.0, 3.0, bar_p)
 
+    last_line_y = y0
     for idx, line in enumerate(lines):
         tw = title_font.measureText(line)
         lx = (w - tw) / 2.0
         ly = y0 + idx * line_step
+        last_line_y = ly
         if idx == len(lines) - 1:
             pill_rect = skia.Rect.MakeXYWH(
                 lx - 30,
@@ -828,8 +802,8 @@ def render_cover_9x16(
 
     clean_sub = _sanitize_card_text(subtitle)
     if clean_sub:
-        sub_font, sub_lines = _wrap_text_to_width(clean_sub, ui_tf, 36.0, 24.0, w - 180.0, max_lines=2)
-        sy = 1560.0
+        sub_font, sub_lines = _wrap_text_to_width(clean_sub, ui_tf, 34.0, 22.0, w - 180.0, max_lines=2)
+        sy = min(float(h) - 140.0, max(last_line_y + title_font.getSize() * 0.92, float(h) * 0.865))
         sub_col = skia.ColorSetARGB(240, 240, 232, 224) if is_dark_cinema else skia.ColorSetARGB(240, 240, 235, 255)
         for sln in sub_lines:
             sw = sub_font.measureText(sln)
