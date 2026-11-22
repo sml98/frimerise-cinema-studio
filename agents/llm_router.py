@@ -1,7 +1,7 @@
 """FrimeRise Ultra-Low-Token LLM Router (< 1,800 tokens/video with Context Caching).
 Supports:
 - deepseek-flash (DeepSeek API)
-- gemini-3.8-flash / gemini-3.5-flash-lite (Google Gemini API)
+- gemini-2.5-flash / gemini-2.5-flash-lite (Google Gemini API)
 - ollama (Local Ollama server)
 - Instant PT-BR Viral Script Synthesizer fallback when no API key is configured yet.
 """
@@ -25,11 +25,22 @@ SKILLS_DIR = BASE_DIR / "skills"
 MODEL_PRICING = {
     "deepseek-flash": (0.14, 0.28),
     "deepseek-chat": (0.14, 0.28),
-    "gemini-3.8-flash": (0.10, 0.40),
-    "gemini-3.5-flash-lite": (0.05, 0.20),
+    "gemini-2.5-flash": (0.15, 0.60),
+    "gemini-2.5-flash-lite": (0.075, 0.30),
+    "gemini-flash-lite-latest": (0.075, 0.30),
     "ollama": (0.0, 0.0),
     "local_template": (0.0, 0.0),
 }
+
+_LEGACY_GEMINI_ALIASES = {
+    "gemini-3.5-flash-lite": "gemini-2.5-flash-lite",
+    "gemini-3.8-flash": "gemini-2.5-flash",
+}
+
+
+def normalize_llm_model_name(model_name: Optional[str]) -> str:
+    m = str(model_name or "gemini-2.5-flash-lite").strip()
+    return _LEGACY_GEMINI_ALIASES.get(m, m)
 
 # Static prefix kept byte-identical across calls so DeepSeek / Gemini Context Caching hits >80%
 CACHED_SYSTEM_PROMPT = (
@@ -61,7 +72,7 @@ def load_skill_text(skill_id: str) -> str:
     p = SKILLS_DIR / f"{skill_id}.md"
     if not p.exists():
         p = SKILLS_DIR / "01_negative_hook.md"
-    return p.read_text(encoding="utf-8")[:1400]
+    return p.read_text(encoding="utf-8")
 
 
 def _extract_json(raw: str) -> Dict[str, Any]:
@@ -83,7 +94,7 @@ def _normalize_language(language: Optional[str]) -> str:
 
 def _compute_duration_plan(target_duration_s: int) -> Tuple[int, int, int, int]:
     """Return (clamped_s, target_words, body_line_count, max_tokens)."""
-    sec = max(10, min(900, int(target_duration_s or 30)))
+    sec = max(10, min(1200, int(target_duration_s or 30)))
     target_words = max(28, int(round(sec * 2.55)))
     if sec <= 15:
         n_body = 1
@@ -192,6 +203,26 @@ def _offline_viral_script(
                 f"How one simple move in {clean_topic} multiplied results in record time!",
                 f"While competitors slept, this exact play in {clean_topic} took over the market!",
             ),
+            "04_reverse_countdown": (
+                f"3 secrets about {clean_topic} — and number 1 changes everything!",
+                f"Master these 3 pillars of {clean_topic} before everyone else catches up!",
+            ),
+            "05_breaking_news": (
+                f"Just in: this sudden shift in {clean_topic} rewrites the rules starting today!",
+                f"Almost nobody noticed, yet {clean_topic} just entered an entirely new era!",
+            ),
+            "06_hypnotic_story": (
+                f"In just 48 hours, one bold decision about {clean_topic} flipped a losing game!",
+                f"Nobody believed what happened the moment {clean_topic} hit the screen!",
+            ),
+            "07_local_business_ad": (
+                f"Stop overpaying for weak results when it comes to {clean_topic}!",
+                f"The exact system filling schedules for anyone looking for {clean_topic} this week!",
+            ),
+            "08_seamless_loop": (
+                f"...and that is exactly why almost nobody truly masters {clean_topic}!",
+                f"...and once you unlock {clean_topic}, your results never look the same again!",
+            ),
         }
         hook_a, hook_b = hooks_en.get(skill_id, hooks_en["01_negative_hook"])
         body_pool = [
@@ -239,6 +270,26 @@ def _offline_viral_script(
             "03_billionaire_case": (
                 f"¡Cómo una jugada simple en {clean_topic} multiplicó resultados en tiempo récord!",
                 f"¡Mientras la competencia dormía, esta estrategia en {clean_topic} dominó el mercado!",
+            ),
+            "04_reverse_countdown": (
+                f"¡3 secretos sobre {clean_topic} — y el número 1 lo cambia todo!",
+                f"¡Domina estos 3 pilares de {clean_topic} y adelántate al 99% del mercado!",
+            ),
+            "05_breaking_news": (
+                f"¡Última hora: este cambio en {clean_topic} redefine las reglas desde hoy!",
+                f"¡Casi nadie lo notó, pero {clean_topic} acaba de entrar en una nueva era!",
+            ),
+            "06_hypnotic_story": (
+                f"¡En solo 48 horas, esta decisión sobre {clean_topic} dio vuelta al juego!",
+                f"¡Nadie creyó lo que ocurrió cuando {clean_topic} apareció en pantalla!",
+            ),
+            "07_local_business_ad": (
+                f"¡Deja de pagar de más sin resultados cuando se trata de {clean_topic}!",
+                f"¡El método que está llenando agendas para quienes buscan {clean_topic} esta semana!",
+            ),
+            "08_seamless_loop": (
+                f"...y es exactamente por eso que casi nadie domina {clean_topic} de verdad!",
+                f"...y cuando desbloqueas {clean_topic}, tus resultados nunca vuelven a ser iguales!",
             ),
         }
         hook_a, hook_b = hooks_es.get(skill_id, hooks_es["01_negative_hook"])
@@ -394,7 +445,7 @@ def generate_viral_script(
 ) -> Dict[str, Any]:
     """Generate a structured viral script shaped by target duration, language, and custom directives."""
     settings = get_settings()
-    model_choice = provider_override or settings.get("default_llm") or "gemini-3.5-flash-lite"
+    model_choice = normalize_llm_model_name(provider_override or settings.get("default_llm") or "gemini-2.5-flash-lite")
     skill_md = load_skill_text(skill_id)
     lang = _normalize_language(language)
     sec, target_words, n_body, max_out_tokens = _compute_duration_plan(target_duration_s)
@@ -478,7 +529,12 @@ def generate_viral_script(
                 continue
 
         if prov == "gemini" and gkey:
-            candidates = [model_choice, "gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash"] if "gemini" in model_choice else ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash"]
+            raw_cands = (
+                [model_choice, "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-flash-lite-latest"]
+                if "gemini" in model_choice
+                else ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-flash-lite-latest"]
+            )
+            candidates = list(dict.fromkeys(raw_cands))
             for gm in candidates:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent"

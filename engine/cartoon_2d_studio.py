@@ -321,25 +321,30 @@ def generate_cartoon_episode_plan(
     tone: str = "Comédia Nordestina/BR",
     aspect_ratio: Literal["9:16", "16:9"] = "9:16",
     reference_transcript: str = "",
+    skill_id: Optional[str] = None,
 ) -> Tuple[CartoonEpisodePlan, Dict[str, Any]]:
     """Generate a validated CartoonEpisodePlan via LLM (if key configured) or high-craft built-in comedy."""
     settings = get_settings()
-    model_choice = settings.get("default_llm") or "gemini-3.5-flash-lite"
-    skill_path = SKILLS_DIR / "09_cartoon_dialogue.md"
-    if not skill_path.exists():
-        skill_path = SKILLS_DIR / "09_cartoon_comedy_dialogue.md"
-    skill_md = skill_path.read_text(encoding="utf-8")[:1400] if skill_path.exists() else ""
+    raw_model = str(settings.get("default_llm") or "gemini-2.5-flash-lite").strip()
+    model_choice = {
+        "gemini-3.5-flash-lite": "gemini-2.5-flash-lite",
+        "gemini-3.8-flash": "gemini-2.5-flash",
+    }.get(raw_model, raw_model)
+
+    skill_path = SKILLS_DIR / f"{skill_id}.md" if (skill_id and (SKILLS_DIR / f"{skill_id}.md").exists()) else (SKILLS_DIR / "09_cartoon_dialogue.md")
+    skill_md = skill_path.read_text(encoding="utf-8") if skill_path.exists() else ""
+    compact_schema = json.dumps(CartoonEpisodePlan.model_json_schema(), ensure_ascii=False, separators=(",", ":"))
 
     sys_prompt = (
         "Você é roteirista de Animação 2D Cartoon viral no Brasil (estilo @animabible7 e OverSimplified). "
         "Crie um episódio curto (22-32s, 2 personagens, 3 cenas, 5-6 falas engraçadas no total). "
         "Use emoções variadas (neutral, shocked, angry, smug, laughing, crying) e finalize com frase completa. "
         "Responda APENAS JSON válido seguindo exatamente o schema:\n"
-        + json.dumps(CartoonEpisodePlan.model_json_schema(), ensure_ascii=False)[:1800]
+        + compact_schema
     )
     user_prompt = (
         f"TEMA: {topic}\nTOM: {tone}\nFORMATO: {aspect_ratio}\n{skill_md}\n"
-        + (f"REFERÊNCIA CLONADA (reconte original):\n{reference_transcript[:700]}" if reference_transcript else "")
+        + (f"REFERÊNCIA CLONADA (reconte original):\n{reference_transcript[:900]}" if reference_transcript else "")
     )
 
     gkey = (settings.get("gemini_api_key") or "").strip()
@@ -348,9 +353,11 @@ def generate_cartoon_episode_plan(
 
     for prov in order:
         if prov == "gemini" and gkey:
-            for gm in (model_choice, "gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash"):
-                if "gemini" not in gm:
-                    continue
+            gem_candidates = list(dict.fromkeys([
+                m for m in (model_choice, "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-flash-lite-latest")
+                if "gemini" in m
+            ]))
+            for gm in gem_candidates:
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent"
                     r = httpx.post(
@@ -359,9 +366,9 @@ def generate_cartoon_episode_plan(
                         json={
                             "system_instruction": {"parts": [{"text": sys_prompt}]},
                             "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
-                            "generationConfig": {"temperature": 0.8, "maxOutputTokens": 1200, "responseMimeType": "application/json"},
+                            "generationConfig": {"temperature": 0.8, "maxOutputTokens": 1800, "responseMimeType": "application/json"},
                         },
-                        timeout=22.0,
+                        timeout=25.0,
                     )
                     if r.status_code == 200:
                         j = r.json()

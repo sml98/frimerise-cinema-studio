@@ -1,67 +1,103 @@
-# Skill 10: Documentário Investigativo Cinema (Estilo Netflix / MagnatesMedia / Vox / ColdFusion)
+# Skill 10: Documentário Investigativo Cinema v3.0.0 (Mixed-Media High-Retention Engine)
 
-## Objetivo Criativo
-Construir roteiros e planos visuais de **Documentário Investigativo Cinematográfico de Alto RPM** em **16:9 Widescreen (1920x1080)** (escalável de 25s demonstrativos até 3–15 minutos para YouTube Mid-Roll Ads) e **9:16 Vertical Doc (1080x1920)** nos idiomas **Português-BR (`pt_br` — Canal "Dossiê Capital")** e **Inglês-US (`en_us` — Canal "Vault Files")**.
+## Objetivo Criativo & Quality Lock v3.0.0
+Construir roteiros e planos visuais de **Documentário Investigativo Cinematográfico de Alto RPM** seguindo o contrato canônico `config/high_retention_doc_engine_v3.json` (`schema_version: 3.0.0`):
+- **16:9 YouTube Long-Form (`1920x1080 @ 30fps`)**: 15 a 18 minutos (ideal **17.0 min**, 25 cenas, 2.250–2.450 palavras, 90–98 palavras/cena), escalável para mini-docs (1–8 min) e **9:16 Vertical Doc (`1080x1920 @ 30fps`)**.
+- **Idiomas nativos suportados:** Português-BR (`pt_br`), Inglês-US (`en_us`) e Espanhol (`es`).
+- **Referências editoriais:** *Super Histórico, H2 History, Mega Curioso* (rigor factual BBC/Netflix Standards & Practices, cronologia estritamente progressiva, palavra-chave do tema na 1ª frase).
+- **Referências visuais:** *Vox, Johnny Harris, MagnatesMedia, Fern, Elementar*.
+- **Identidade de canal:** Crie `channel_name` coerente com o `mood` do tema (`dark_horror`, `epic_history`, `investigative_crime`, `corporate_thriller`) — use `"Dossiê Capital"` / `"Vault Files"` apenas quando `mood == "corporate_thriller"`.
 
-## Arquitetura Dramática em Atos (Cold Open + Capítulos + Retenção Mid-Roll)
-1. **Cold Open Magnético (0–15s):**
-   - Comece direto no momento de maior tensão financeira, fraude, anomalia bilionária ou paradoxo histórico (ex: *"Em 24 de fevereiro de 1995, um único operador em Singapura escondeu 1,4 bilhão de dólares debaixo do tapete do banco mais antigo do Império Britânico..."*).
-   - Proibido começar com *"Olá pessoal"* ou introduções genéricas.
-2. **Cartões de Capítulo Cinematográficos (`C A P Í T U L O   I`, `C A P Í T U L O   I I`, `C A P Í T U L O   I I I`):**
-   - Tipografia espaçada de cinema (`wide letter-spacing`), fundo escuro `#0B0713` com acento Dourado (`#FFD166`) ou Rosa (`#FF2E93`), acompanhado de impacto sonoro grave `assets/sfx/sub_boom.wav`.
-3. **Lower Thirds Investigativos & Color Grading `02_dark_wealth.cube` + Grão 35mm:**
-   - Cada cena exibe um Lower Third editorial limpo com Localização, Data exata ou Classificação Forense (ex: `SINGAPURA • CONTA SECRETA #88888`, `AUDITORIA FORENSE • US$ 2.1 BILHÕES`).
-4. **Os 5 Modos Visuais Investigativos Renderizados em Skia C++ (30fps):**
-   - `parallax_25d_photo`: Fotografia histórica/arquivística em camadas com paralaxe 2.5D, partículas de poeira de projetor, vinheta dramática e moldura forense.
-   - `newspaper_highlighter`: Recorte de jornal financeiro ou documento confidencial com animação de marca-texto (`Multiply-blend highlighter sweep`) em Dourado (`#FFD166`) ou Rosa (`#FF2E93`) grifando a frase-chave da prova.
-   - `dark_map_route`: Mapa tático investigativo escuro (mundo/cidade) com grade de coordenadas, rota tracejada animada e pino de destino pulsante com brilho néon.
-   - `sliding_timeline`: Linha do tempo deslizante horizontal/vertical conectando datas críticas, cifras bilionárias e eventos da escalada do caso.
-   - `red_string_board`: Quadro investigativo escuro de evidências conectando suspeitos, empresas de fachada e contas ocultas com fios vermelhos/rosa brilhantes (`#FF2E93`).
+## Arquitetura Dramática em 5 Atos (Cold Open -> Final Abrupto Zero-CTA)
+1. **`ACT_0_COLD_OPEN_HOOK` (Cenas 0–1 | 0–75s | cortes ~2.2s | ~148 WPM):**
+   - Nomeie explicitamente a palavra-chave central do tema já na **1ª frase** e estabeleça o paradoxo histórico/investigativo imediatamente.
+   - Proibido começar com *"Olá pessoal"*, *"Em um mundo onde"* ou *"Vamos mergulhar"*.
+   - Feche a Cena 1 com uma pergunta investigativa direta e concisa (`<= 16 palavras`) com entonação interrogativa ascendente genuína.
+2. **`ACT_1_WORLD_BUILDING` (Cenas 2–6 | cortes ~4.0s | ~138 WPM):**
+   - Construa contexto geográfico, datas primárias e fontes verificáveis avançando estritamente no tempo (nunca salte para trás na cronologia).
+3. **`ACT_2_DEEP_MECHANICS` (Cenas 7–15 | cortes ~3.5s | ~142 WPM):**
+   - Detalhe mecanismos ocultos, decretos, documentos e conexões causais; aplique **Pattern Interrupts** a cada `240s` (`240s, 480s, 720s`) com silêncio musical suave de `1.25s` sobre `room_tone_bed.wav` e transição seca (`pattern_interrupt_shutter.wav`).
+4. **`ACT_3_CLIMAX_REVELATION` (Cenas 16–21 | cortes ~2.7s | ~146 WPM):**
+   - Acelere a cadência visual à medida que as forças históricas convergem para a virada decisiva.
+5. **`ACT_4_ABRUPT_ENDING` (Cenas 22–24 | cortes ~4.5s | ~110–130 WPM):**
+   - Síntese forense conectando o passado ao presente. **ZERO CTA de YouTube** (proibido pedir like, inscrição, sininho ou despedida). Corte abrupto para tela preta exatos `0.50s` após a última sílaba falada.
 
-## Regra de Ouro de Retenção (Doctor Audit)
-- Cada cena deve conter pelo menos um **dado concreto** (ano, cifra em dólares/reais, nome de instituição, código de conta ou localização geográfica) e um **conector de tensão** (*"mas o que ninguém sabia"*, *"só que havia um detalhe oculto"*, *"foi aí que tudo mudou"*).
-- Alterne os 5 modos visuais (`parallax_25d_photo`, `newspaper_highlighter`, `dark_map_route`, `sliding_timeline`, `red_string_board`) para que duas cenas seguidas nunca repitam exatamente o mesmo layout visual.
+## Matriz Visual Mixed-Media (5 Categorias Obrigatórias • Skia C++ Zero-Copy + VAAPI)
+1. **`2.5D_Parallax`** (`parallax_25d_photo`, `cinema_multishot`): recorte `u2netp` ONNX com desfoque DOF `3px`, movimento contra-direcional (FG `1.00->1.14` / BG `1.06->1.00`) e **3D Depth Title** exclusivo no Shot 0 (`>= 92%` livre de oclusão).
+2. **`2D_Infographic_Over_Realism`** (`2d_schematic_over_realism`, `dark_map_route`, `sliding_timeline`): esquemas táticos Vox/Johnny Harris com cartões locais da cena, mapas cartográficos com origem != destino e timelines sincronizadas com placas históricas da época.
+3. **`Video_Over_Video_PiP`** (`video_over_video_collage`, `newspaper_highlighter`, `red_string_board`): colagem flutuante PiP, recorte de jornal de época com marca-texto `#FFD700` (`kMultiply`) e quadro forense de fios vermelhos com placas da era correspondente.
+4. **`Dark_3D_Reconstruction`** (`fern_3d_reconstruction`): reconstrução espacial em `#121417` com grade 3D, holofote volumétrico e silhueta/monólito arquivístico.
+5. **`Atmospheric_B_Roll`**: filmagens reais a `0.85x` aprovadas pelo Vision Gate estrito; nunca abrir cena em B-roll genérico ou anacrônico.
 
-## Contrato JSON Esperado (`NetflixDocPlan`)
+## Coesão Visual, Tipografia & Áudio Broadcast
+- **Visual Cohesion Unifier Stack (pré-UI em Skia C++):** contraste `+12%`, saturação `-22%`, sombras `#0D1B2A`, highlights `#E0C097`, vinheta `0.35`, granulação 35mm `0.14`, poeira atmosférica `0.16`, acentos `#EAB308` / `#D9381E` / `#F8FAFC` e barra de progresso 3px `#D9381E -> #EAB308`.
+- **Tipografia & Legendas:** `Cinzel-Bold.ttf` (títulos/capítulos) + `CourierPrime-Bold.ttf` (HUD forense/legendas); modo `selective_emphasis` no 16:9 e `cinema_minimal` no 9:16; sem caixas de glifo (`[]`) nem colisão com Lower Thirds.
+- **Voz & Master Bus:** Gemini Expressive TTS (`Charon` / `Orus` / `Fenrir`) travado em **1 único modelo** por documentário inteiro (nunca misturar modelos/engines no meio do vídeo) + Gate acústico de consistência de locutor; Master `-14.0 LUFS`, True Peak `<= -1.0 dBTP`, `LRA >= 4.5 LU`.
+- **Mídia sem Anacronismos:** Google Flow Pro com Era-Lock obrigatório + Wikimedia Commons com Gemini Vision Critic estrito (`strict_vision=True`); cada cena fornece `shot_prompts_en` cronológicos sincronizados às frases da narração.
+
+## Regra de Ouro de Retenção (RetentionDoctor v3)
+- Cada cena entrega dados concretos (ano, local, instituição, documento ou consequência histórica real) sem clichês robóticos de IA.
+- Distribua Open Loops ao longo de todo o documentário (nunca concentre tudo numa única cena) e responda cada pergunta na cena seguinte.
+- Alterne as 5 categorias visuais para que cenas consecutivas nunca repitam o mesmo layout.
+
+## Contrato JSON Esperado (`NetflixDocPlan` v3.0.0)
 ```json
 {
-  "title": "O Operador que Quebrou o Banco da Rainha",
-  "subtitle": "Dossiê Investigativo • Caso Barings Bank",
-  "channel_name": "Dossiê Capital",
+  "schema_version": "3.0.0",
+  "pipeline_name": "Mixed_Media_High_Retention_Documentary_Engine",
+  "title": "Título Editorial Investigativo",
+  "subtitle": "Arquivo Histórico • Recorte Cronológico",
+  "channel_name": "Nome do Canal Coerente com o Mood",
+  "mood": "dark_horror | epic_history | investigative_crime | corporate_thriller",
   "lang": "pt_br",
   "aspect_ratio": "16:9",
-  "target_minutes": 0.5,
-  "lut_file": "02_dark_wealth.cube",
-  "voice_id": "pt-BR-AntonioNeural",
-  "thumbnail_hook": "ESCONDEU $1.4 BILHÃO",
+  "target_minutes": 17.0,
+  "voice_id": "Charon",
+  "caption_style": "selective_emphasis",
+  "thumbnail_hook": "TRÊS PALAVRAS FORTES",
+  "pattern_interrupt_times": [240.0, 480.0, 720.0],
   "scenes": [
     {
-      "scene_id": "sc_01",
+      "scene_id": "doc_sc_01",
+      "act_id": "ACT_0_COLD_OPEN_HOOK",
       "act_label": "COLD OPEN",
       "chapter_card": null,
-      "chapter_subtitle": null,
+      "chapter_subtitle": "TÍTULO TEMÁTICO DA CENA",
       "visual_mode": "parallax_25d_photo",
-      "narration": "Em fevereiro de 1995, um único erro escondido numa conta secreta derrubou um império bancário de 233 anos.",
-      "lower_third_title": "LONDRES & SINGAPURA • 1995",
-      "lower_third_subtitle": "CASO BARINGS BANK • ARQUIVO #88888",
-      "highlight_color": "#FFD166",
-      "evidence_headline": "BARINGS COLLAPSES AFTER $1.4B SECRET LOSS",
-      "evidence_quote": "Account 88888 concealed unauthorized futures trades for 32 months.",
-      "map_origin": "LONDRES",
-      "map_destination": "SINGAPURA",
-      "map_metric": "US$ 1.4 BILHÃO OCULTO",
+      "visual_category": "2.5D_Parallax",
+      "cut_cadence_s": 2.2,
+      "pattern_interrupt": false,
+      "narration": "90-98 palavras faladas naturais (15-18 min long-form), nomeando o tema já na 1ª frase, sem travessões nem clichês de IA.",
+      "lower_third_title": "LOCALIZAÇÃO • DATA EXATA",
+      "lower_third_subtitle": "CONTEXTO ARQUIVÍSTICO • FONTE PRIMÁRIA",
+      "highlight_color": "#EAB308",
+      "evidence_headline": "MANCHETE DOCUMENTAL CURTA DA CENA",
+      "evidence_quote": "Fato histórico ou trecho documental verificável específico desta cena.",
+      "map_origin": "ORIGEM HISTÓRICA",
+      "map_destination": "DESTINO HISTÓRICO",
+      "map_metric": "MÉTRICA OU MARCO HISTÓRICO",
       "timeline_points": [
-        {"date": "1992", "label": "Conta #88888 Criada", "value": "-US$ 2M"},
-        {"date": "1994", "label": "Apostas Dobradas", "value": "-US$ 208M"},
-        {"date": "1995", "label": "Colapso em Tóquio", "value": "-US$ 1.4B"}
+        {"date": "ANO 1", "label": "Marco Verificável 1", "value": "IMPACTO 1"},
+        {"date": "ANO 2", "label": "Marco Verificável 2", "value": "IMPACTO 2"},
+        {"date": "ANO 3", "label": "Marco Verificável 3", "value": "IMPACTO 3"}
       ],
       "board_nodes": [
-        {"id": "n1", "title": "NICK LEESON", "role": "Operador Chefe SIMEX", "badge": "SUSPEITO #1"},
-        {"id": "n2", "title": "CONTA #88888", "role": "Esconderijo de Perdas", "badge": "CAIXA PRETA"},
-        {"id": "n3", "title": "BARINGS BANK", "role": "Fundado em 1762", "badge": "FALÊNCIA"},
-        {"id": "n4", "title": "NIKKEI 225", "role": "Contratos Futuros", "badge": "-US$ 1.4B"}
+        {"id": "n1", "title": "ENTIDADE 1", "role": "Papel Histórico", "badge": "ARQUIVO #01"},
+        {"id": "n2", "title": "ENTIDADE 2", "role": "Mecanismo", "badge": "PROVA"},
+        {"id": "n3", "title": "ENTIDADE 3", "role": "Decreto / Evento", "badge": "VIRADA"},
+        {"id": "n4", "title": "ENTIDADE 4", "role": "Consequência", "badge": "LEGADO"}
       ],
-      "image_prompt_en": "cinematic dark moody 1990s stock exchange trading floor archival photo"
+      "broll_query_en": "concrete atmospheric historical stock video query",
+      "pip_broll_query_en": "different concrete atmospheric stock video query",
+      "photo_query_en": "specific historical engraving or artwork subject",
+      "extra_photo_queries_en": ["specific subject 1", "specific subject 2", "specific subject 3"],
+      "bespoke_image_prompt_en": "dramatic 35mm dark cinema historical still matching beat 1, period authentic, chiaroscuro lighting, no text",
+      "shot_prompts_en": [
+        "chronological beat 1 prompt, 35mm cinema, period authentic, no text",
+        "chronological beat 2 prompt, close-up detail, period authentic, no text",
+        "chronological beat 3 prompt, wide architectural angle, period authentic, no text",
+        "chronological beat 4 prompt, atmospheric candlelit frame, period authentic, no text"
+      ]
     }
   ]
 }

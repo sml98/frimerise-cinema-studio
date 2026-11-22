@@ -144,21 +144,30 @@ OPEN_LOOP_BRIDGES_CARTOON_ES = [
 ]
 
 OPEN_LOOP_BRIDGES_DOC_PT = [
-    "Mas havia um detalhe sombrio escondido nos arquivos... por que ninguém fala disso até hoje?",
-    "Só que os registros da época revelaram algo ainda mais perturbador: o que realmente aconteceu naquela noite?",
-    "E o capítulo seguinte viraria toda essa história do avesso... como esse segredo sobreviveu por tantos séculos?",
+    "Mas por que os arquivos ocultaram esse detalhe até hoje?",
+    "O que realmente aconteceu nos bastidores daquela noite?",
+    "Como esse segredo sobreviveu intacto por tantos séculos?",
+    "Mas qual prova esquecida mudou o rumo dessa história?",
+    "E por que quase ninguém conhece o que veio a seguir?",
+    "Mas quem ganhou poder quando a verdade desapareceu dos registros?",
 ]
 
 OPEN_LOOP_BRIDGES_DOC_EN = [
-    "Yet one chilling detail remained buried in the archives... why does almost nobody talk about it today?",
-    "But period records uncovered something far darker: what really happened behind closed doors that night?",
-    "And the next chapter turned the entire legend upside down... how did that secret survive for centuries?",
+    "Yet why did official archives bury that detail for centuries?",
+    "What really happened behind closed doors that night?",
+    "How did that hidden mechanism survive untouched for generations?",
+    "Which forgotten record suddenly turned the entire story upside down?",
+    "And why does almost nobody remember what came next?",
+    "Who stood to gain when the original truth disappeared?",
 ]
 
 OPEN_LOOP_BRIDGES_DOC_ES = [
-    "Pero había un detalle sombrío oculto en los archivos... ¿por qué casi nadie habla de esto hoy?",
-    "Sin embargo, los registros de la época revelaron algo más oscuro: ¿qué ocurrió realmente aquella noche?",
-    "Y el siguiente capítulo cambiaría toda la historia... ¿cómo sobrevivió ese secreto durante tantos siglos?",
+    "¿Pero por qué los archivos ocultaron ese detalle hasta hoy?",
+    "¿Qué ocurrió realmente tras puertas cerradas aquella noche?",
+    "¿Cómo sobrevivió ese secreto intacto durante tantos siglos?",
+    "¿Qué prueba olvidada cambió por completo el rumbo de la historia?",
+    "¿Y por qué casi nadie conoce lo que vino después?",
+    "¿Quién ganó poder cuando la verdad desapareció de los registros?",
 ]
 
 
@@ -267,11 +276,9 @@ def audit_viral_script_dict(script: Dict[str, Any], lang: Optional[str] = None) 
     resolved_lang = _detect_lang(sample_txt, lang or script.get("lang"))
     bridges = _pick_bridge_pool("viral", resolved_lang)
 
-    # Check whether the script already contains natural '?' open loops covering its duration
+    # Track per-window open loops (never disable spacing globally just because 1 '?' exists elsewhere)
     hook_txt = str(script.get("hook_a", ""))
-    all_texts = [hook_txt, *cleaned_body]
-    natural_q_count = sum(1 for t in all_texts if "?" in t)
-    plan_has_natural_loops = natural_q_count >= 1
+    natural_q_count = sum(1 for t in [hook_txt, *cleaned_body] if "?" in t)
 
     elapsed_s = _estimate_line_seconds(hook_txt) if hook_txt.strip() else 0.0
     since_last_loop_s = 0.0
@@ -290,7 +297,7 @@ def audit_viral_script_dict(script: Dict[str, Any], lang: Optional[str] = None) 
         if has_loop:
             open_loops_found += 1
             since_last_loop_s = 0.0
-        elif not plan_has_natural_loops and not is_last and (
+        elif not is_last and (
             since_last_loop_s >= OPEN_LOOP_SPACING_S
             or (idx == 0 and len(cleaned_body) <= 3 and open_loops_found == 0 and natural_q_count == 0)
         ):
@@ -304,8 +311,8 @@ def audit_viral_script_dict(script: Dict[str, Any], lang: Optional[str] = None) 
     script["body_lines"] = audited_body
     all_examples = list(dict.fromkeys([*prev_examples, *cliches_removed]))[:5]
     script["retention_audit"] = {
-        "doctor": "RetentionDoctor v2",
-        "passed": True,
+        "doctor": "RetentionDoctor v3",
+        "passed": bool((hook_txt.strip() or audited_body) and open_loops_found >= 1),
         "lang": resolved_lang,
         "cliches_blocked": prev_cliches + len(cliches_removed),
         "cliches_examples": all_examples,
@@ -315,7 +322,7 @@ def audit_viral_script_dict(script: Dict[str, Any], lang: Optional[str] = None) 
         ),
         "open_loops_injected": prev_injected + open_loops_injected,
         "estimated_duration_s": round(elapsed_s + (_estimate_line_seconds(script.get("closing_line", "")) if script.get("closing_line") else 0.0), 1),
-        "interval_rule": "24s open_loop_spacing (natural-question preserving)",
+        "interval_rule": "24s per-window open_loop_spacing",
     }
     return script
 
@@ -336,7 +343,6 @@ def audit_cartoon_episode_plan(plan: Any, lang: Optional[str] = None) -> Tuple[A
     bridges = _pick_bridge_pool("cartoon", resolved_lang)
 
     natural_q_count = sum(1 for t in sample_lines if "?" in t)
-    plan_has_natural_loops = natural_q_count >= 1
 
     for scene in getattr(plan, "scenes", []):
         for dl in getattr(scene, "dialogue_lines", []):
@@ -349,7 +355,7 @@ def audit_cartoon_episode_plan(plan: Any, lang: Optional[str] = None) -> Tuple[A
             if OPEN_LOOP_MARKERS_RE.search(clean_txt):
                 open_loops_found += 1
                 since_last_loop_s = 0.0
-            elif not plan_has_natural_loops and since_last_loop_s >= OPEN_LOOP_SPACING_S:
+            elif since_last_loop_s >= OPEN_LOOP_SPACING_S:
                 bridge = bridges[open_loops_injected % len(bridges)]
                 clean_txt = _append_bridge(clean_txt, bridge)
                 open_loops_injected += 1
@@ -371,25 +377,39 @@ def audit_cartoon_episode_plan(plan: Any, lang: Optional[str] = None) -> Tuple[A
             open_loops_found += 1
 
     report = {
-        "doctor": "RetentionDoctor v2",
-        "passed": True,
+        "doctor": "RetentionDoctor v3",
+        "passed": bool(sample_lines and open_loops_found >= 1),
         "lang": resolved_lang,
         "cliches_blocked": len(cliches_removed),
         "cliches_examples": cliches_removed[:5],
         "open_loops_total": open_loops_found,
         "open_loops_injected": open_loops_injected,
         "estimated_duration_s": round(elapsed_s, 1),
-        "interval_rule": "24s open_loop_spacing (natural-question preserving)",
+        "interval_rule": "24s per-window open_loop_spacing",
     }
     return plan, report
 
 
+def _write_back_attr(obj: Any, attr: str, value: Any) -> None:
+    """Safely mutate an attribute on a Pydantic model or plain Python object."""
+    try:
+        if hasattr(obj, attr):
+            setattr(obj, attr, value)
+            return
+    except Exception:
+        pass
+    try:
+        object.__setattr__(obj, attr, value)
+    except Exception:
+        pass
+
+
 def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
-    """Run Retention Doctor on a Netflix / MagnatesMedia Investigative Documentary Plan (`dict` or Pydantic object).
+    """Run Retention Doctor v3 on a Netflix / MagnatesMedia Investigative Documentary Plan (`dict` or Pydantic object).
     1. Purges all robotic AI clichés in PT-BR, EN-US, and ES across cold_open, chapters, scenes, and narration lines.
-    2. Enforces an investigative Open Loop on >= 24.0s gaps ONLY when the scene/plan lacks natural '?' open loops,
-       joining bridges as clean sentences (never ungrammatical ' — Capitalized').
-    3. Attaches `retention_audit` telemetry without overwriting prior `open_loops_injected` / `cliches_blocked` on re-call.
+    2. Enforces per-window investigative Open Loops across the ENTIRE documentary (never short-circuiting on a single '?').
+    3. Strips forbidden YouTube CTAs from ACT_4_ABRUPT_ENDING and computes a real `passed` boolean against v3 invariants.
+    4. Writes all mutated fields (`narration`, `duration_s`, `body_lines`, `retention_audit`) cleanly back onto Pydantic objects.
     """
     is_dict = isinstance(plan, dict)
     plan_dict: Dict[str, Any] = plan if is_dict else (plan.model_dump() if hasattr(plan, "model_dump") else dict(plan))
@@ -415,11 +435,12 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
             clean_txt, rem = sanitize_robotic_line(plan_dict[top_key])
             plan_dict[top_key] = clean_txt
             if not is_dict and hasattr(plan, top_key):
-                setattr(plan, top_key, clean_txt)
+                _write_back_attr(plan, top_key, clean_txt)
             cliches_removed.extend(rem)
 
-    # Collect text sample & count pre-existing natural '?' open loops across the plan
-    scenes = plan_dict.get("scenes") or plan_dict.get("chapters") or plan_dict.get("acts") or []
+    # Collect text sample & estimate total duration for per-window spacing
+    scenes_key = next((k for k in ("scenes", "chapters", "acts") if plan_dict.get(k)), "scenes")
+    scenes = plan_dict.get(scenes_key) or []
     sample_chunks: List[str] = [str(plan_dict.get("cold_open") or plan_dict.get("hook_a") or "")]
     narration_keys = ("narration", "text", "line_pt", "voiceover", "script_line", "script", "dialogue")
     scene_texts: List[str] = []
@@ -449,8 +470,12 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
         est_plan_dur += _estimate_line_seconds(intro_txt)
     all_plan_texts = [t for t in [intro_txt, *scene_texts, *body_texts] if t.strip()]
     natural_q_count = sum(1 for t in all_plan_texts if "?" in t)
-    # Skip redundant boilerplate bridge injection when the plan already contains >= 1 natural '?' open loop
-    plan_has_natural_loops = natural_q_count >= 1
+
+    # Per-window spacing: 24s for short docs (< 4 min / < 10 scenes), 90s (~every 2-3 scenes) for long-form docs
+    # so a 17-minute documentary gets well-spaced mid-video open loops without flooding every single scene.
+    n_scenes_total = len(scenes) if isinstance(scenes, list) else 0
+    is_long_form = (n_scenes_total >= 10) or (est_plan_dur >= 240.0)
+    loop_window_s = 90.0 if is_long_form else OPEN_LOOP_SPACING_S
 
     # Check if cold_open / hook_a already starts with an open loop
     if intro_txt:
@@ -461,9 +486,12 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
         else:
             since_last_loop_s += intro_dur
 
-    # Audit scene-by-scene narration
+    # Audit scene-by-scene narration with TRUE per-window enforcement (never short-circuit on natural_q_count >= 1!)
     ctas_removed: List[str] = []
     total_word_count = 0
+    abrupt_ending_clean = True
+    pydantic_scenes = getattr(plan, scenes_key, None) if not is_dict else None
+
     if isinstance(scenes, list) and scenes:
         n_scenes = len(scenes)
         for idx, sc in enumerate(scenes):
@@ -481,6 +509,8 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
                 clean_txt, cta_rem = strip_abrupt_ending_ctas(clean_txt)
                 ctas_removed.extend(cta_rem)
                 cliches_removed.extend(cta_rem)
+                if FORBIDDEN_TRAILING_CTA_RE.search(clean_txt):
+                    abrupt_ending_clean = False
 
             sc_dur = float(sc.get("duration_s") or _estimate_line_seconds(clean_txt))
             elapsed_s += sc_dur
@@ -489,7 +519,7 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
             if "?" in clean_txt or OPEN_LOOP_MARKERS_RE.search(clean_txt):
                 open_loops_found += 1
                 since_last_loop_s = 0.0
-            elif not plan_has_natural_loops and not is_last_scene and since_last_loop_s >= OPEN_LOOP_SPACING_S:
+            elif not is_last_scene and since_last_loop_s >= loop_window_s:
                 bridge = bridges[open_loops_injected % len(bridges)]
                 clean_txt = _append_bridge(clean_txt, bridge)
                 open_loops_injected += 1
@@ -498,13 +528,13 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
                 new_sc_dur = round(max(sc_dur, _estimate_line_seconds(clean_txt)), 2)
                 elapsed_s += max(0.0, new_sc_dur - sc_dur)
                 sc["duration_s"] = new_sc_dur
+                if pydantic_scenes is not None and idx < len(pydantic_scenes):
+                    _write_back_attr(pydantic_scenes[idx], "duration_s", new_sc_dur)
 
             total_word_count += len(clean_txt.split())
             sc[target_key] = clean_txt
-            if not is_dict and hasattr(plan, "scenes") and idx < len(getattr(plan, "scenes", [])):
-                obj_sc = plan.scenes[idx]
-                if hasattr(obj_sc, target_key):
-                    setattr(obj_sc, target_key, clean_txt)
+            if pydantic_scenes is not None and idx < len(pydantic_scenes):
+                _write_back_attr(pydantic_scenes[idx], target_key, clean_txt)
 
     # Also audit body_lines if the plan includes viral-script-style body_lines
     if isinstance(plan_dict.get("body_lines"), list):
@@ -517,11 +547,12 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
             if not scenes:
                 elapsed_s += dur
                 since_last_loop_s += dur
+                total_word_count += len(clean_txt.split())
             is_last_body = n_body > 1 and idx == n_body - 1
             if "?" in clean_txt or OPEN_LOOP_MARKERS_RE.search(clean_txt):
                 open_loops_found += 1
                 since_last_loop_s = 0.0
-            elif not scenes and not plan_has_natural_loops and not is_last_body and (
+            elif not scenes and not is_last_body and (
                 since_last_loop_s >= OPEN_LOOP_SPACING_S
                 or (idx == 0 and open_loops_found == 0 and natural_q_count == 0)
             ):
@@ -532,19 +563,54 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
                 since_last_loop_s = 0.0
             new_body.append(clean_txt)
         plan_dict["body_lines"] = new_body
+        if not is_dict and hasattr(plan, "body_lines"):
+            _write_back_attr(plan, "body_lines", new_body)
 
-    # Guarantee at least 1 open loop ONLY if the entire documentary has zero natural/marker open loops
-    if open_loops_found == 0 and natural_q_count == 0 and isinstance(scenes, list) and scenes and isinstance(scenes[0], dict):
+    # Guarantee at least 1 open loop if the entire documentary still has zero
+    if open_loops_found == 0 and isinstance(scenes, list) and scenes and isinstance(scenes[0], dict):
         t_key = next((nk for nk in narration_keys if isinstance(scenes[0].get(nk), str)), None)
         if t_key:
             bridge = bridges[0]
             scenes[0][t_key] = _append_bridge(scenes[0][t_key], bridge)
-            if not is_dict and hasattr(plan, "scenes") and len(getattr(plan, "scenes", [])) > 0:
-                obj_sc = plan.scenes[0]
-                if hasattr(obj_sc, t_key):
-                    setattr(obj_sc, t_key, scenes[0][t_key])
+            total_word_count += len(bridge.split())
+            if pydantic_scenes is not None and len(pydantic_scenes) > 0:
+                _write_back_attr(pydantic_scenes[0], t_key, scenes[0][t_key])
             open_loops_injected += 1
             open_loops_found += 1
+
+    # Compute REAL `passed` boolean against Cinema v3.0.0 invariants
+    issues: List[str] = []
+    if n_scenes_total == 0 and not body_texts:
+        issues.append("missing_scenes")
+    if total_word_count < 15:
+        issues.append(f"insufficient_words:{total_word_count}")
+    declared_target_min = float(plan_dict.get("target_minutes") or 0.0)
+    if declared_target_min >= 12.0:
+        if n_scenes_total < 15:
+            issues.append(f"longform_too_few_scenes:{n_scenes_total}")
+        if total_word_count < 1400:
+            issues.append(f"longform_word_count_low:{total_word_count}")
+    expected_min_loops = (
+        max(2, int(elapsed_s // max(120.0, loop_window_s * 1.5)))
+        if elapsed_s >= 180.0
+        else 1
+    )
+    eff_open_loops = max(
+        open_loops_found,
+        int(existing_audit.get("open_loops_total", 0)) if existing_audit else 0,
+    )
+    if eff_open_loops < expected_min_loops:
+        issues.append(f"open_loops_below_min:{eff_open_loops}<{expected_min_loops}")
+    if not abrupt_ending_clean:
+        issues.append("abrupt_ending_cta_remaining")
+    # Verify zero forbidden AI clichés survived sanitization
+    for sc in scenes if isinstance(scenes, list) else []:
+        if not isinstance(sc, dict):
+            continue
+        t_k = next((nk for nk in narration_keys if isinstance(sc.get(nk), str)), None)
+        if t_k and any(pat.search(sc[t_k]) for pat, _ in FORBIDDEN_AI_CLICHES):
+            issues.append("unresolved_ai_cliche")
+            break
 
     all_examples = list(dict.fromkeys([*prev_examples, *cliches_removed]))[:5]
     pi_triggers = [240, 480, 720] if elapsed_s >= 760.0 else ([t_pi for t_pi in (240, 480, 720) if elapsed_s >= t_pi + 30.0])
@@ -552,27 +618,24 @@ def audit_netflix_doc_plan(plan: Any, lang: Optional[str] = None) -> Any:
         "doctor": "RetentionDoctor v3",
         "schema_version": "3.0.0",
         "engine_style": "netflix_doc",
-        "passed": True,
+        "passed": len(issues) == 0,
+        "issues": issues,
         "lang": resolved_lang,
         "cliches_blocked": prev_cliches + len(cliches_removed),
         "cliches_examples": all_examples,
         "ctas_stripped": len(ctas_removed),
-        "abrupt_ending_clean": True,
+        "abrupt_ending_clean": abrupt_ending_clean,
+        "scenes_count": n_scenes_total,
         "total_words": total_word_count,
-        "open_loops_total": max(
-            open_loops_found,
-            int(existing_audit.get("open_loops_total", 0)) if existing_audit else 0,
-        ),
+        "open_loops_total": eff_open_loops,
         "open_loops_injected": prev_injected + open_loops_injected,
+        "open_loop_window_s": loop_window_s,
         "estimated_duration_s": round(max(1.0, elapsed_s), 1),
         "pattern_interrupt_triggers_s": pi_triggers,
-        "interval_rule": "24s open_loop_spacing + 240s pattern_interrupts + zero-CTA abrupt ending",
+        "interval_rule": f"{int(loop_window_s)}s per-window open_loop_spacing + 240s pattern_interrupts + zero-CTA abrupt ending",
     }
     plan_dict["retention_audit"] = report
     if not is_dict:
-        try:
-            setattr(plan, "retention_audit", report)
-        except Exception:
-            pass
+        _write_back_attr(plan, "retention_audit", report)
         return plan
     return plan_dict

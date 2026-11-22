@@ -178,7 +178,7 @@ def get_conn():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     conn.execute("PRAGMA foreign_keys=ON;")
     try:
         yield conn
@@ -189,6 +189,7 @@ def get_conn():
 
 def init_db() -> None:
     with get_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS settings (
@@ -311,6 +312,10 @@ def init_db() -> None:
                 cost_usd REAL NOT NULL DEFAULT 0.0,
                 created_at TEXT NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+            CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_schedules_status ON schedules(status);
             """
         )
 
@@ -358,9 +363,9 @@ def init_db() -> None:
                 ),
             )
 
-        # Default settings
+        # Default settings (valid Gemini 2.5 model identifiers)
         defaults = {
-            "default_llm": "gemini-3.5-flash-lite",
+            "default_llm": "gemini-2.5-flash-lite",
             "ollama_url": "http://localhost:11434",
             "thermal_limit_c": "85",
             "pexels_api_key": "",
@@ -375,6 +380,15 @@ def init_db() -> None:
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (k, v, now),
             )
+        # Migrate legacy invalid Gemini 3.5/3.8 model names in existing databases
+        conn.execute(
+            "UPDATE settings SET value = 'gemini-2.5-flash-lite', updated_at = ? WHERE key = 'default_llm' AND value = 'gemini-3.5-flash-lite'",
+            (now,),
+        )
+        conn.execute(
+            "UPDATE settings SET value = 'gemini-2.5-flash', updated_at = ? WHERE key = 'default_llm' AND value = 'gemini-3.8-flash'",
+            (now,),
+        )
 
 
 def get_settings() -> Dict[str, str]:
@@ -525,16 +539,17 @@ def update_job(job_id: str, **fields: Any) -> None:
 def append_job_log(job_id: str, message: str, progress: Optional[int] = None, stage: Optional[str] = None) -> None:
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {message}\n"
+    set_parts = ["log = COALESCE(log, '') || ?"]
+    vals: List[Any] = [line]
+    if progress is not None:
+        set_parts.append("progress = ?")
+        vals.append(progress)
+    if stage is not None:
+        set_parts.append("stage = ?")
+        vals.append(stage)
+    vals.append(job_id)
     with get_conn() as conn:
-        row = conn.execute("SELECT log FROM jobs WHERE id = ?", (job_id,)).fetchone()
-        existing = row["log"] if row else ""
-        updates = {"log": existing + line}
-        if progress is not None:
-            updates["progress"] = progress
-        if stage is not None:
-            updates["stage"] = stage
-        cols = ", ".join(f"{k} = ?" for k in updates)
-        conn.execute(f"UPDATE jobs SET {cols} WHERE id = ?", list(updates.values()) + [job_id])
+        conn.execute(f"UPDATE jobs SET {', '.join(set_parts)} WHERE id = ?", vals)
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:

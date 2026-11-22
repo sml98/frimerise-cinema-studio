@@ -24,7 +24,6 @@ Features:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import json
 import math
@@ -46,29 +45,29 @@ import skia
 from agents.llm_router import _extract_json
 from agents.retention_doctor import OPEN_LOOP_MARKERS_RE, audit_netflix_doc_plan
 from database import get_settings, record_token_usage
+import engine.audio_dsp as _audio_dsp_mod
 from engine.audio_dsp import (
     _estimate_word_timestamps,
     _get_wav_duration,
     _synthesize_espeak_fallback,
     align_script_words_to_audio,
+    generate_narration as _dsp_generate_narration,
     master_broadcast_audio,
     trim_silence_vad,
 )
-try:
-    from engine.audio_dsp import normalize_scene_wav_lufs
-except Exception:
-    normalize_scene_wav_lufs = None  # type: ignore
+normalize_scene_wav_lufs = getattr(_audio_dsp_mod, "normalize_scene_wav_lufs", None)
+validate_speaker_consistency = getattr(_audio_dsp_mod, "validate_speaker_consistency", None)
+
+import engine.gemini_tts as _gemini_tts_mod
 from engine.gemini_tts import (
     GEMINI_EXPRESSIVE_VOICES,
     has_valid_gemini_key,
     normalize_narration_for_speech,
     synthesize_gemini_tts_line,
 )
-try:
-    import engine.gemini_tts as _gemini_tts_mod
-    build_act_acting_direction = getattr(_gemini_tts_mod, "build_act_acting_direction", None)
-except Exception:
-    build_act_acting_direction = None  # type: ignore
+build_act_acting_direction = getattr(_gemini_tts_mod, "build_act_acting_direction", None)
+synthesize_gemini_tts_line_with_meta = getattr(_gemini_tts_mod, "synthesize_gemini_tts_line_with_meta", None)
+
 from engine.doc_media_engine import (
     VideoLayerReader,
     _enforce_historical_era_prompt_lock,
@@ -76,7 +75,6 @@ from engine.doc_media_engine import (
     compute_file_dhash,
     fetch_doc_broll_clip,
     fetch_doc_hero_or_archival_photo,
-    fetch_doc_real_photo,
     fetch_wikimedia_commons_archival_photo,
     is_perceptual_duplicate,
     load_skia_image_cover,
@@ -102,15 +100,13 @@ from engine.skia_compositor import (
 )
 
 try:
+    import engine.kinetic_captions as _kc_mod
     from engine.kinetic_captions import draw_kinetic_captions, resolve_caption_style
+    _kc_group_words_into_chunks = getattr(_kc_mod, "group_words_into_chunks", None)
 except Exception:
     draw_kinetic_captions = None  # type: ignore
     resolve_caption_style = None  # type: ignore
-
-try:
-    from engine.kinetic_captions import draw_kinetic_caption_chunk
-except Exception:
-    draw_kinetic_caption_chunk = None  # type: ignore
+    _kc_group_words_into_chunks = None  # type: ignore
 
 try:
     from engine.kinetic_captions import DARK_CINEMA_PILL_PALETTE
@@ -146,7 +142,6 @@ try:
     draw_2d_schematic_over_realism = getattr(_pmg_mod, "draw_2d_schematic_over_realism", None)
     draw_video_over_video_collage = getattr(_pmg_mod, "draw_video_over_video_collage", None)
     draw_fern_3d_reconstruction = getattr(_pmg_mod, "draw_fern_3d_reconstruction", None)
-    draw_chapter_whip_and_film_burn = getattr(_pmg_mod, "draw_chapter_whip_and_film_burn", None)
 except Exception:
     draw_depth_title_behind_subject = None  # type: ignore
     draw_anamorphic_film_burn_and_bokeh = None  # type: ignore
@@ -158,7 +153,6 @@ except Exception:
     draw_2d_schematic_over_realism = None  # type: ignore
     draw_video_over_video_collage = None  # type: ignore
     draw_fern_3d_reconstruction = None  # type: ignore
-    draw_chapter_whip_and_film_burn = None  # type: ignore
 
 _DEPTH_TITLE_ACCEPTS_FG_IMG: bool = False
 if draw_depth_title_behind_subject is not None:
@@ -175,6 +169,7 @@ DOC_BG_CACHE = BASE_DIR / "data" / "doc_bgs"
 DOC_BG_CACHE.mkdir(parents=True, exist_ok=True)
 HIGH_RETENTION_ENGINE_V3_CONFIG_PATH = CONFIG_DIR / "high_retention_doc_engine_v3.json"
 REFERENCE_BENCHMARKS_EDL_V3_PATH = CONFIG_DIR / "reference_benchmarks_edl_v3.json"
+_CACHED_V3_ENGINE_CONFIG: Optional[Dict[str, Any]] = None
 
 
 def load_high_retention_engine_config() -> Dict[str, Any]:
@@ -189,6 +184,85 @@ def load_high_retention_engine_config() -> Dict[str, Any]:
     return {
         "schema_version": "3.0.0",
         "pipeline_name": "Mixed_Media_High_Retention_Documentary_Engine",
+    }
+
+
+def _get_v3_engine_config(refresh: bool = False) -> Dict[str, Any]:
+    """Cached runtime access to `config/high_retention_doc_engine_v3.json` (single source of truth)."""
+    global _CACHED_V3_ENGINE_CONFIG
+    if _CACHED_V3_ENGINE_CONFIG is None or refresh:
+        _CACHED_V3_ENGINE_CONFIG = load_high_retention_engine_config()
+    return _CACHED_V3_ENGINE_CONFIG
+
+
+def _get_v3_act_spec(act_id: str) -> Dict[str, Any]:
+    cfg = _get_v3_engine_config()
+    acts = (cfg.get("narrative_architecture") or {}).get("acts") or []
+    for a in acts:
+        if isinstance(a, dict) and str(a.get("act_id") or "") == str(act_id):
+            return a
+    return {}
+
+
+def _get_v3_act_cadence(act_id: str, default: float = 3.5) -> float:
+    spec = _get_v3_act_spec(act_id)
+    try:
+        val = float(spec.get("cut_cadence_seconds") or default)
+        return max(1.6, min(6.5, val))
+    except Exception:
+        return default
+
+
+def _get_v3_pi_config() -> Tuple[List[float], float]:
+    """Return `(triggers_at_seconds, music_mute_seconds)` from canonical v3 config."""
+    act2 = _get_v3_act_spec("ACT_2_DEEP_MECHANICS")
+    pi = act2.get("pattern_interrupt_every_240s") if isinstance(act2, dict) else None
+    if isinstance(pi, dict):
+        trigs = [float(x) for x in (pi.get("triggers_at_seconds") or [240.0, 480.0, 720.0])]
+        mute_s = float(pi.get("music_mute_seconds") or 1.25)
+        return trigs, mute_s
+    return [240.0, 480.0, 720.0], 1.25
+
+
+def _get_v3_unifier_params() -> Tuple[float, float, float]:
+    """Return `(vignette_intensity, grain_opacity, dust_opacity)` from canonical v3 config."""
+    u = _get_v3_engine_config().get("visual_cohesion_unifier_stack") or {}
+    return (
+        float(u.get("vignette_intensity", 0.35)),
+        float(u.get("Master_35mm_Film_Grain", 0.14)),
+        float(u.get("Atmospheric_Dust_Motes", 0.16)),
+    )
+
+
+def _get_v3_caption_font_size(is_wide: bool) -> float:
+    ty = _get_v3_engine_config().get("typography_and_overlays") or {}
+    kc = ty.get("keyword_kinetic_captions") or {}
+    wide_px = float(kc.get("font_size_px", 64.0))
+    return wide_px if is_wide else 72.0
+
+
+def _get_v3_abrupt_hold_s() -> float:
+    act4 = _get_v3_act_spec("ACT_4_ABRUPT_ENDING")
+    try:
+        return max(0.35, min(1.0, float(act4.get("abrupt_cut_to_black_after_final_word_seconds", 0.50))))
+    except Exception:
+        return 0.50
+
+
+def _get_v3_audio_targets() -> Dict[str, Any]:
+    sd = _get_v3_engine_config().get("tactile_sound_design_engine") or {}
+    mb = sd.get("master_bus") or {}
+    m2 = sd.get("track_2_music_bed") or {}
+    v1 = sd.get("track_1_voiceover") or {}
+    f3 = sd.get("track_3_tactile_foley") or {}
+    return {
+        "integrated_lufs": float(mb.get("integrated_lufs", -14.0)),
+        "true_peak_dbtp": float(mb.get("true_peak_dbtp", -1.0)),
+        "min_lra_lu": float(mb.get("min_lra_lu", 4.5)),
+        "music_bed_db": float(m2.get("music_bed_db", -23.0)),
+        "music_auto_ducking_db": float(m2.get("music_auto_ducking_db", -5.0)),
+        "max_internal_silence_s": float(v1.get("max_internal_silence_seconds", 0.35)),
+        "foley_spec": f3,
     }
 
 
@@ -1479,29 +1553,23 @@ def _ensure_topic_open_loops(
         ),
     }
     pool = bridges_by_mood.get(mood, bridges_by_mood["epic_history"])
-    # Skip artificial open-loop injection whenever the plan already has >= 1 natural '?' hook
-    existing_q_hooks = sum(1 for sc in scenes if "?" in str(sc.narration or ""))
-    if existing_q_hooks >= 1:
-        return
-
+    # Per-window open-loop check (never short-circuit on 1 '?' across a 25-scene documentary!)
+    is_long = len(scenes) >= 10
+    loop_window_s = 90.0 if is_long else 24.0
     since_loop_s = 0.0
     b_idx = 0
     for idx, sc in enumerate(scenes):
-        if existing_q_hooks >= 1:
-            break
         txt = sc.narration.strip()
         dur_est = max(2.2, len(txt.split()) / 2.05)
         since_loop_s += dur_est
         if "?" in txt or OPEN_LOOP_MARKERS_RE.search(txt):
             since_loop_s = 0.0
             continue
-        # Inject at most 1 '?' hook ONLY when the entire script had zero '?' marks
-        if (idx == 0 or (idx < len(scenes) - 1 and since_loop_s >= 24.0)) and b_idx < len(pool):
-            q = pool[b_idx]
+        if (idx < len(scenes) - 1) and since_loop_s >= loop_window_s:
+            q = pool[b_idx % len(pool)]
             b_idx += 1
             base_clean = txt.rstrip(".!?…—- ").strip()
             sc.narration = f"{base_clean}. {q}" if base_clean else q
-            existing_q_hooks += 1
             since_loop_s = 0.0
 
 
@@ -1564,6 +1632,33 @@ def _sanitize_dark_history_prompt(prompt: str, mood: str) -> str:
     return re.sub(r"\s{2,}", " ", p).strip()
 
 
+_SHOT_PROMPT_BOILERPLATE_RE = re.compile(
+    r"\b(?:dramatic|wide|establishing|intimate|tense|moody|haunting|cinematic|vertical|full-bleed|"
+    r"9:16|16:9|35mm|film|grain|still|shot|frame|camera|angle|close-up|closeup|overhead|low-angle|"
+    r"chiaroscuro|lighting|candlelight|shadowy|nocturnal|atmospheric|photorealistic|documentary|"
+    r"showing|depicting|focusing|detail|strictly|historically|accurate|authentic|period|era|no\s+text|"
+    r"no\s+letters|no\s+watermark|ultra-detailed|high\s+contrast)\b",
+    re.IGNORECASE,
+)
+
+
+def _derive_archival_query_from_shot_prompt(shot_prompt: str, fallback_query: str = "") -> str:
+    """Extract a clean 4-6 word historical archival subject query from a chronological `shot_prompts_en` beat
+    (stripping camera/lighting boilerplate and any NEGATIVE/ERA LOCK suffixes).
+    """
+    raw = str(shot_prompt or "").strip()
+    if not raw:
+        return str(fallback_query or "").strip()
+    # Strip appended era-lock / negative directives first
+    raw = re.split(r"(?:STRICT\s+HISTORICAL|ERA\s+LOCK|NEGATIVE:|FORBIDDEN:|\(100%|,\s*no\s+text)", raw, maxsplit=1, flags=re.IGNORECASE)[0]
+    cleaned = _SHOT_PROMPT_BOILERPLATE_RE.sub(" ", raw)
+    cleaned = re.sub(r"[^A-Za-z0-9\s\-']", " ", cleaned)
+    tokens = [tok for tok in cleaned.split() if len(tok) >= 2 and tok.lower() not in {"of", "the", "in", "on", "at", "to", "a", "an", "with", "and", "by", "from", "for", "into", "over", "under"}]
+    if len(tokens) >= 2:
+        return " ".join(tokens[:6]).strip()
+    return str(fallback_query or "").strip()
+
+
 def _call_open_topic_director_llm(
     topic: str,
     n_scenes: int,
@@ -1574,75 +1669,95 @@ def _call_open_topic_director_llm(
     min_scene_words: int = 18,
     max_scene_words: int = 22,
     target_seconds: float = 60.0,
+    skill_id: Optional[str] = None,
 ) -> Optional[Tuple[Dict[str, Any], str, int, float]]:
-    """Call LIVE DeepSeek (`deepseek-chat`) OR Google Gemini (`gemini-flash-lite-latest` via
+    """Call LIVE DeepSeek (`deepseek-chat`) OR Google Gemini (`gemini-2.5-flash-lite` / `gemini-2.5-flash` via
     `headers={"x-goog-api-key": gkey}`) with automatic failover to author a 100% original, deeply
     researched, gripping Netflix / Dark History documentary blueprint for ANY arbitrary topic.
+
+    - Supports `pt_br`, `en_us`, and `es`.
+    - Reads FULL `skills/10_netflix_investigative_doc.md` (zero mid-sentence truncation!).
+    - Zero Christmas contamination in system prompt.
+    - For long-form 15-25 scene documentaries, chunks into 4-5 balanced Act calls (max 5-6 scenes/call)
+      and retries failed chunks cleanly instead of dropping Part 2 or padding with robotic boilerplate!
     """
     settings = get_settings() or {}
     dkey = str(settings.get("deepseek_api_key") or "").strip()
     gkey = str(settings.get("gemini_api_key") or "").strip()
-    default_llm = str(settings.get("default_llm") or "gemini-flash-lite-latest").strip().lower()
+    raw_llm = str(settings.get("default_llm") or "gemini-2.5-flash-lite").strip().lower()
+    default_llm = {
+        "gemini-3.5-flash-lite": "gemini-2.5-flash-lite",
+        "gemini-3.8-flash": "gemini-2.5-flash",
+    }.get(raw_llm, raw_llm)
     if not dkey and not gkey:
         return None
 
     is_en = clean_lang == "en_us"
+    is_es = clean_lang == "es"
     is_vertical = str(aspect_ratio).strip() == "9:16"
-    lang_label = "American English" if is_en else "Brazilian Portuguese (PT-BR)"
-    skill_path = SKILLS_DIR / "10_netflix_investigative_doc.md"
-    skill_excerpt = skill_path.read_text(encoding="utf-8")[:900] if skill_path.exists() else ""
-    if mood_hint != "corporate_thriller" and skill_excerpt:
-        skill_excerpt = re.sub(
+    lang_label = (
+        "American English"
+        if is_en
+        else ("Spanish (Latin America / Neutral Español)" if is_es else "Brazilian Portuguese (PT-BR)")
+    )
+    skill_path = (
+        SKILLS_DIR / f"{skill_id}.md"
+        if (skill_id and (SKILLS_DIR / f"{skill_id}.md").exists())
+        else (SKILLS_DIR / "10_netflix_investigative_doc.md")
+    )
+    skill_text = skill_path.read_text(encoding="utf-8") if skill_path.exists() else ""
+    if mood_hint != "corporate_thriller" and skill_text:
+        skill_text = re.sub(
             r"(?:Canal\s+)?[\"']?(?:Dossi[eê]\s+Capital|Vault\s+Files)[\"']?",
             "",
-            skill_excerpt,
+            skill_text,
             flags=re.IGNORECASE,
         )
-        skill_excerpt = re.sub(r"\s*—\s*\)", ")", skill_excerpt)
-        skill_excerpt = re.sub(r"[ \t]{2,}", " ", skill_excerpt)
+        skill_text = re.sub(r"\s*—\s*\)", ")", skill_text)
+        skill_text = re.sub(r"[ \t]{2,}", " ", skill_text)
 
     total_min_w = min_scene_words * n_scenes
     total_max_w = max_scene_words * n_scenes
     if is_vertical:
         framing_rule = (
             "   - `bespoke_image_prompt_en`: vivid 16-26 word English VERTICAL 9:16 full-bleed dark-cinema portrait still prompt depicting THAT scene's opening historical moment, dramatic candlelight/chiaroscuro, 35mm film grain, ZERO text/words/letters. NEVER use 'wide', 'widescreen', 'panoramic', 'landscape', or 'wide establishing'!\n"
-            "   - `shot_prompts_en`: array of 4 to 5 DISTINCT chronological English VERTICAL 9:16 35mm cinema still prompts (14-24 words EACH) — ONE bespoke vertical shot for EACH phrase/beat of that scene's narration! Every single prompt MUST depict a DIFFERENT vertical camera angle/subject matching that exact moment (e.g., 'Vertical full-bleed 9:16 35mm cinema still...' -> 'Intimate vertical close-up detail...' -> 'Tall dramatic portrait silhouette...' -> 'Moody vertical low-angle atmospheric frame...'), NEVER 'wide establishing' or 'wide angle', ZERO text/words/letters, ZERO modern anachronisms!\n"
+            "   - `shot_prompts_en`: array of 4 to 5 DISTINCT chronological English VERTICAL 9:16 35mm cinema still prompts (14-24 words EACH) — ONE bespoke vertical shot for EACH sentence/beat of that scene's narration! Every single prompt MUST depict a DIFFERENT vertical camera angle/subject matching that exact moment, NEVER 'wide establishing' or 'wide angle', ZERO text/words/letters, ZERO modern anachronisms!\n"
         )
         shot_example_json = (
             '      "bespoke_image_prompt_en": "Vertical full-bleed 9:16 dark cinema photorealistic portrait still, chiaroscuro lighting, no text",\n'
-            '      "shot_prompts_en": ["Vertical full-bleed 9:16 35mm cinema still matching phrase 1, no text", "Intimate vertical close-up detail matching phrase 2, no text", "Tall dramatic vertical portrait matching phrase 3, no text", "Moody vertical 9:16 atmospheric still matching phrase 4, no text"],\n'
+            '      "shot_prompts_en": ["Vertical full-bleed 9:16 35mm cinema still matching sentence 1, no text", "Intimate vertical close-up detail matching sentence 2, no text", "Tall dramatic vertical portrait matching sentence 3, no text", "Moody vertical 9:16 atmospheric still matching sentence 4, no text"],\n'
         )
     else:
         framing_rule = (
             "   - `bespoke_image_prompt_en`: vivid 16-26 word English dark-cinema photographic still prompt depicting THAT scene's opening historical moment, dramatic candlelight/chiaroscuro, 35mm film grain, ZERO text/words/letters.\n"
-            "   - `shot_prompts_en`: array of 4 to 5 DISTINCT chronological English 35mm cinema still prompts (14-24 words EACH) — ONE bespoke shot for EACH phrase/beat of that scene's narration! Every single prompt MUST depict a DIFFERENT camera angle/subject matching that exact moment of the story (e.g., wide establishing shot -> tense close-up object -> dramatic character/silhouettes -> eerie symbolic detail), ZERO text/words/letters, ZERO modern anachronisms!\n"
+            "   - `shot_prompts_en`: array of 4 to 5 DISTINCT chronological English 35mm cinema still prompts (14-24 words EACH) — ONE bespoke shot for EACH sentence/beat of that scene's narration! Every single prompt MUST depict a DIFFERENT camera angle/subject matching that exact moment of the story (e.g., wide establishing shot -> tense close-up object -> dramatic character/silhouettes -> eerie symbolic detail), ZERO text/words/letters, ZERO modern anachronisms!\n"
         )
         shot_example_json = (
-            '      "bespoke_image_prompt_en": "dark cinema photorealistic scene description, no text",\n'
-            '      "shot_prompts_en": ["chronological shot 1 matching phrase 1, 35mm cinema, no text", "shot 2 matching phrase 2, close-up detail, no text", "shot 3 matching phrase 3, dramatic wide angle, no text", "shot 4 matching phrase 4, moody atmospheric still, no text"],\n'
+            '      "bespoke_image_prompt_en": "dark cinema photorealistic scene description matching beat 1, no text",\n'
+            '      "shot_prompts_en": ["chronological shot 1 matching sentence 1, 35mm cinema, no text", "shot 2 matching sentence 2, close-up detail, no text", "shot 3 matching sentence 3, dramatic wide angle, no text", "shot 4 matching sentence 4, moody atmospheric still, no text"],\n'
         )
 
     sys_prompt = (
-        f"You are an Emmy-winning Netflix / A24 / Nostalgia / MagnatesMedia Documentary Showrunner & Historian writing in {lang_label}.\n"
+        f"You are an Emmy-winning Netflix / A24 / Vox / Super Histórico / MagnatesMedia Documentary Showrunner & Historian writing strictly in {lang_label}.\n"
         "Create a 100% ORIGINAL, deeply researched, spine-tingling, cinematic documentary script strictly about the user's EXACT TOPIC.\n"
         "ABSOLUTE STORYTELLING & VOICE RULES:\n"
-        "1. CONTINUOUS HUMAN NARRATIVE & STRICT FORWARD HISTORICAL CHRONOLOGY: Write like a master human storyteller telling ONE gripping, continuous story from Cold Open to unforgettable ending — NEVER disjointed bullet points, NEVER repeating ideas across scenes, and NEVER pasting the user's raw prompt text inside narration or headlines! Scenes MUST progress STRICTLY FORWARD in historical time from earliest era to modern day (e.g., for dark Christmas history: Act I Roman Saturnalia 217 a.C. & 336 d.C. Sol Invictus decree -> Act II 4th-century Bishop Nicholas of Myra -> Act III 11th/12th-century Alpine fusion with Krampus -> Act IV 1647 Puritan Ban by Oliver Cromwell & Plum Pudding Riots -> Epilogue 19th-century Victorian & modern corporate domestication — NEVER put 11th-c. Krampus before 4th-c. Saint Nicholas!). NEVER jump backwards in time across scenes, and NEVER connect two different centuries with 'Enquanto isso' / 'Meanwhile'! Verify historical geography and climate accurately.\n"
-        "2. REAL HISTORICAL DEPTH: Cite real eras, real years (e.g., 217 a.C., 336 d.C., 1647, 4th century, 1890s), real places (Rome, Myra, Austrian Alps, London, Iceland), real historical figures/folklore/edicts, and genuine plot twists!\n"
-        f"3. STRICT DURATION & NATURAL SPOKEN RHYTHM (~{int(round(target_seconds))}s TOTAL): Each scene narration MUST be strictly {min_scene_words}-{max_scene_words} crisp, visceral spoken words (total script ~{total_min_w}-{total_max_w} words across all {n_scenes} scenes so final video hits ~{int(round(target_seconds))}s cleanly!). Write spoken Portuguese/English naturally with commas and clean periods — NEVER em-dashes ('—'). Spell out centuries naturally using Portuguese ordinals for I-X and cardinals for XI+ (write 'século quarto' instead of 'SÉC. IV' or 'século quatro', 'século onze' instead of 'SÉC. XI', and 'antes de Cristo' instead of 'a.C.').\n"
-        "4. ZERO ROBOTIC AI CLICHÉS & ZERO OFF-TOPIC BRANDING: NEVER write 'Em um mundo onde', 'Vamos mergulhar', 'Em conclusão', 'Por trás da imagem familiar', 'As crônicas históricas conectaram', 'In a world where', or 'Let's dive in'. Invent a topic-authentic `channel_name` matching the mood (NEVER 'Dossiê Capital' or 'Vault Files' unless mood is 'corporate_thriller').\n"
-        "5. CRITICAL NARRATIVE RULE: Do NOT end every scene with a rhetorical question! At least 75% of scenes MUST end with a concrete, visceral, mind-blowing historical fact or consequence (e.g. 'Em Mira, o próprio bispo Nicolau demoliu templos pagãos com as próprias mãos.', 'Em Londres, soldados invadiam casas pelo cheiro de carne assada e arrastavam famílias para a prisão.'). Use at most 1 or 2 open-loop transition questions across the entire script — and whenever a scene asks a question, the VERY NEXT SCENE MUST directly answer it in its opening sentence! Only the final scene ends with a haunting second-person question to the viewer ('E você... quando acende as luzes na noite de vinte e quatro de dezembro... ainda sente a sombra do que tentaram apagar?').\n"
-        "6. VISUAL PRECISION & BAN CYBERPUNK NEON IN DARK HISTORY (ZERO OFF-TOPIC STOCK!): Every scene needs concrete, atmospheric English visual queries:\n"
-        "   - STRICTLY FORBID 'neon signs', 'neon reindeer', 'pink/green LED', or 'cyberpunk' in `shot_prompts_en` and `bespoke_image_prompt_en` for `dark_horror` / `epic_history` (even in modern-era epilogue scenes, use moody candlelit windows, snow falling under warm vintage streetlamps, dark shadows cast by a Christmas tree in an obsidian room!).\n"
-        "   - `broll_query_en` and `pip_broll_query_en` (MUST differ from each other): concrete, real atmospheric stock video phrases that exist on Pixabay (e.g., 'snow pine forest night', 'burning candle dark shadow', 'medieval stone castle fog', 'gothic cathedral interior', 'crackling fireplace dark', 'winter snow village night', 'old leather book candle', 'ancient roman stone ruins'). NEVER use abstract words like 'floor', 'butterfly', 'background', 'texture', or 'darkness' alone.\n"
-        "   - `photo_query_en` and `extra_photo_queries_en` (3-4 distinct concrete English museum/historical/photographic subjects matching THAT exact scene — e.g., 'Krampus Austrian folklore mask', 'Roman Saturnalia festival painting', 'Saint Nicholas Byzantine icon', 'Puritan Oliver Cromwell 17th century engraving', 'Victorian gothic winter postcard').\n"
+        "1. CONTINUOUS HUMAN NARRATIVE & STRICT FORWARD HISTORICAL CHRONOLOGY: Write like a master human storyteller telling ONE gripping, continuous story from Cold Open to unforgettable ending — NEVER disjointed bullet points, NEVER repeating ideas across scenes, and NEVER pasting raw prompt metadata inside narration or headlines! Name the core topic keyword in the VERY FIRST sentence of Scene 1. Scenes MUST progress STRICTLY FORWARD in historical time from earliest primary source to modern consequence. NEVER jump backwards in time across scenes, and NEVER connect two different centuries with 'Enquanto isso' / 'Meanwhile' / 'Mientras tanto'! Verify historical geography and dates strictly to BBC/Netflix factual standards.\n"
+        "2. REAL HISTORICAL DEPTH: Cite real eras, exact years, verifiable cities/regions, primary archival documents, historical figures, institutions, and genuine causal turning points directly relevant to the user's EXACT TOPIC!\n"
+        f"3. STRICT DURATION & NATURAL SPOKEN RHYTHM (~{int(round(target_seconds))}s TOTAL): Each scene narration MUST be strictly {min_scene_words}-{max_scene_words} crisp, visceral spoken words (total script ~{total_min_w}-{total_max_w} words across all {n_scenes} scenes so final video hits ~{int(round(target_seconds))}s cleanly!). Write natural spoken prose with commas and clean periods — NEVER em-dashes ('—'). In Portuguese, spell out centuries naturally using ordinals for I-X and cardinals for XI+ (e.g. 'século quarto', 'século onze', 'antes de Cristo').\n"
+        "4. ZERO ROBOTIC AI CLICHÉS & ZERO OFF-TOPIC BRANDING: NEVER write 'Em um mundo onde', 'Vamos mergulhar', 'Em conclusão', 'In a world where', 'Let's dive in', 'En un mundo donde', or 'Vamos a sumergirnos'. Invent a topic-authentic `channel_name` matching the mood (NEVER 'Dossiê Capital' or 'Vault Files' unless mood is 'corporate_thriller').\n"
+        "5. CRITICAL NARRATIVE & ENDING RULE: At least 75% of scenes MUST end with a concrete, visceral historical fact or consequence. Space concise open-loop investigative questions (<= 14 words each) naturally every 2-3 scenes, and ALWAYS answer each open-loop question directly in the opening sentence of the very next scene! On the FINAL scene ONLY, close with a haunting, concise, topic-specific reflection or second-person question — ZERO YouTube CTAs (NEVER ask viewers to like, subscribe, comment, or ring the bell!).\n"
+        "6. VISUAL PRECISION & ZERO ANACHRONISMS: Every scene needs concrete, period-authentic English visual queries directly matching THAT scene's sentences:\n"
+        "   - STRICTLY FORBID 'neon signs', 'pink/green LED', or 'cyberpunk' in `shot_prompts_en` and `bespoke_image_prompt_en` for `dark_horror` / `epic_history` (even in modern-era epilogue scenes, use moody candlelight, natural shadows, or period-authentic architecture).\n"
+        "   - `broll_query_en` and `pip_broll_query_en` (MUST differ from each other): concrete atmospheric stock video phrases matching THAT scene's setting (e.g., 'ancient stone ruins fog night', 'burning candle parchment dark', 'old archive library dust light', 'stormy ocean waves dark', 'historic european alley mist'). NEVER use abstract single words like 'floor', 'background', or 'darkness'.\n"
+        "   - `photo_query_en` and `extra_photo_queries_en` (3-4 distinct concrete English historical artwork/engraving/portrait/document subjects matching THAT EXACT scene's sentences — NEVER include the word 'museum' or modern photo terms!).\n"
         f"{framing_rule}"
-        "   - `prefer_gemini_photo`: true for vivid historical/macabre/folklore scenes where custom AI cinema art beats generic stock.\n"
-        "7. UNIQUE PER-SCENE UI METADATA & CHAPTER SUBTITLE: Give EVERY scene its OWN specific `chapter_subtitle` (a crisp 2-4 word UPPERCASE thematic chapter title matching THAT EXACT scene's subject/era — e.g. 'O MONSTRO DOS ALPES' for a Krampus scene, 'O NATAL PROIBIDO' for a 1647 London Puritans scene), its OWN `evidence_headline` (<= 48 chars, punchy newspaper headline), `evidence_quote` (1 gripping historical fact for THAT scene), and `lower_third_title` (`LOCATION • ERA`, clean ALL-CAPS).\n"
+        "   - `prefer_gemini_photo`: true for vivid historical/dramatic scenes where bespoke period cinema art beats generic stock.\n"
+        "7. UNIQUE PER-SCENE UI METADATA & CHAPTER SUBTITLE: Give EVERY scene its OWN specific `chapter_subtitle` (crisp 2-4 word UPPERCASE thematic title matching THAT EXACT scene), `evidence_headline` (<= 48 chars), `evidence_quote` (1 gripping documented fact for THAT scene), and `lower_third_title` (`LOCATION • ERA`, clean ALL-CAPS).\n"
         "8. Classify `mood` strictly as ONE of: \"dark_horror\", \"investigative_crime\", \"epic_history\", \"corporate_thriller\".\n"
         "Return ONLY valid JSON matching this exact schema:\n"
         "{\n"
         '  "title": "Editorial documentary title",\n'
-        '  "subtitle": "Short archival subtitle (e.g. Arquivo Histórico • Roma & Alpes)",\n'
+        '  "subtitle": "Short archival subtitle",\n'
         '  "channel_name": "Topic-authentic cinema channel name",\n'
         '  "mood": "dark_horror | investigative_crime | epic_history | corporate_thriller",\n'
         '  "thumbnail_hook": "2-3 PUNCHY WORDS",\n'
@@ -1670,8 +1785,8 @@ def _call_open_topic_director_llm(
         '      "map_metric": "Scene dramatic stat/era",\n'
         '      "broll_query_en": "3-4 word concrete English video query",\n'
         '      "pip_broll_query_en": "different 3-4 word English video query",\n'
-        '      "photo_query_en": "2-4 word concrete English photo query",\n'
-        '      "extra_photo_queries_en": ["photo q1", "photo q2", "photo q3", "photo q4"],\n'
+        '      "photo_query_en": "3-5 word concrete historical engraving/artwork query",\n'
+        '      "extra_photo_queries_en": ["historical subject 1", "historical subject 2", "historical subject 3", "historical subject 4"],\n'
         f"{shot_example_json}"
         '      "prefer_gemini_photo": true\n'
         "    }\n"
@@ -1681,14 +1796,15 @@ def _call_open_topic_director_llm(
     )
 
     def _invoke_single_call(usr_p: str, target_count: int) -> Optional[Tuple[Dict[str, Any], str, int, float]]:
-        max_out_tokens = min(16384, 2400 + target_count * 480)
+        max_out_tokens = min(16384, 2400 + target_count * 620)
+        min_accept = max(2, int(math.ceil(target_count * 0.8))) if target_count >= 3 else target_count
         provider_order = ["deepseek", "gemini"] if "deepseek" in default_llm else ["gemini", "deepseek"]
         for prov in provider_order:
             if prov == "deepseek" and dkey:
                 try:
                     from openai import OpenAI
 
-                    cli = OpenAI(api_key=dkey, base_url="https://api.deepseek.com", timeout=90.0)
+                    cli = OpenAI(api_key=dkey, base_url="https://api.deepseek.com", timeout=95.0)
                     resp = cli.chat.completions.create(
                         model="deepseek-chat",
                         messages=[
@@ -1701,7 +1817,7 @@ def _call_open_topic_director_llm(
                     )
                     raw_txt = resp.choices[0].message.content or "{}"
                     data = _extract_clean_json(raw_txt)
-                    if isinstance(data.get("scenes"), list) and len(data["scenes"]) >= max(3, int(target_count * 0.6)):
+                    if isinstance(data.get("scenes"), list) and len(data["scenes"]) >= min_accept:
                         u = resp.usage
                         pt = int(getattr(u, "prompt_tokens", 900))
                         ct = int(getattr(u, "completion_tokens", 1600))
@@ -1720,7 +1836,20 @@ def _call_open_topic_director_llm(
                     print(f"[NetflixDoc] DeepSeek open-topic director failed, failing over: {exc}", flush=True)
 
             if prov == "gemini" and gkey:
-                gemini_models = ("gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash")
+                gemini_models = list(
+                    dict.fromkeys(
+                        [
+                            m
+                            for m in (
+                                default_llm if "gemini" in default_llm else "",
+                                "gemini-2.5-flash",
+                                "gemini-2.5-flash-lite",
+                                "gemini-flash-lite-latest",
+                            )
+                            if m
+                        ]
+                    )
+                )
                 headers = {"Content-Type": "application/json", "x-goog-api-key": gkey}
                 for gm in gemini_models:
                     try:
@@ -1734,7 +1863,7 @@ def _call_open_topic_director_llm(
                                 "responseMimeType": "application/json",
                             },
                         }
-                        r = httpx.post(url, json=payload, headers=headers, timeout=95.0)
+                        r = httpx.post(url, json=payload, headers=headers, timeout=110.0)
                         if r.status_code != 200:
                             print(f"[NetflixDoc] Gemini ({gm}) HTTP {r.status_code}, trying next model...", flush=True)
                             continue
@@ -1744,11 +1873,11 @@ def _call_open_topic_director_llm(
                         if not txt:
                             txt = str(parts[0].get("text") or "") if parts else ""
                         data = _extract_clean_json(txt)
-                        if isinstance(data.get("scenes"), list) and len(data["scenes"]) >= max(3, int(target_count * 0.6)):
+                        if isinstance(data.get("scenes"), list) and len(data["scenes"]) >= min_accept:
                             meta = j.get("usageMetadata", {})
                             pt = int(meta.get("promptTokenCount", 900))
                             ct = int(meta.get("candidatesTokenCount", 1800))
-                            cost = round((pt * 0.05 + ct * 0.20) / 1_000_000.0, 6)
+                            cost = round((pt * 0.075 + ct * 0.30) / 1_000_000.0, 6)
                             try:
                                 record_token_usage("gemini", gm, pt, ct, 0, cost)
                             except Exception:
@@ -1761,151 +1890,250 @@ def _call_open_topic_director_llm(
                             return data, f"llm_gemini:{gm}", pt + ct, cost
                         else:
                             got_n = len(data.get("scenes", [])) if isinstance(data, dict) else 0
-                            print(f"[NetflixDoc] Gemini ({gm}) incomplete JSON ({got_n}/{target_count} scenes), trying next...", flush=True)
+                            print(f"[NetflixDoc] Gemini ({gm}) incomplete JSON ({got_n}/{target_count} scenes, need >={min_accept}), trying next...", flush=True)
                     except Exception as exc:
                         print(f"[NetflixDoc] Gemini ({gm}) open-topic director failed: {exc}", flush=True)
                         continue
         return None
 
     dir_block = f"\nUSER CREATIVE DIRECTIVES: {custom_directives.strip()}" if custom_directives.strip() else ""
-    if n_scenes <= 14:
+    if n_scenes <= 8:
         user_prompt = (
             f"EXACT DOCUMENTARY TOPIC: {topic}\n"
             f"LANGUAGE: {lang_label}\n"
             f"SUGGESTED MOOD: {mood_hint}\n"
             f"EXACT NUMBER OF SCENES REQUIRED: {n_scenes}\n"
             f"{dir_block}\n"
-            f"STYLE REFERENCE:\n{skill_excerpt}"
+            f"STYLE SPECIFICATION (v3.0.0):\n{skill_text}"
         )
         return _invoke_single_call(user_prompt, n_scenes)
 
-    part1_n = (n_scenes + 1) // 2
-    part2_n = n_scenes - part1_n
-    prompt_p1 = (
-        f"EXACT DOCUMENTARY TOPIC: {topic}\n"
-        f"LANGUAGE: {lang_label}\n"
-        f"SUGGESTED MOOD: {mood_hint}\n"
-        f"PART 1 OF 2 (Cold Open + Acts I & II — end on a gripping mid-story cliffhanger!)\n"
-        f"EXACT NUMBER OF SCENES IN PART 1: {part1_n}\n"
-        f"{dir_block}\n"
-        f"STYLE REFERENCE:\n{skill_excerpt}"
-    )
-    res1 = _invoke_single_call(prompt_p1, part1_n)
-    if res1 is None:
-        return None
-    data1, src1, tok1, cost1 = res1
-    p1_scenes = [s for s in (data1.get("scenes") or []) if isinstance(s, dict)][:part1_n]
-    prev_tail = " ".join(str(s.get("narration") or "") for s in p1_scenes[-2:])
-    used_facts = "; ".join(str(s.get("evidence_headline") or "") for s in p1_scenes if s.get("evidence_headline"))
+    # Balanced multi-act chunking (max 5-6 scenes per LLM call -> stays well inside token limits, zero truncation!)
+    if n_scenes >= 20:
+        # 5 balanced Act chunks (e.g., 25 -> [5, 5, 5, 5, 5])
+        base_c = n_scenes // 5
+        rem_c = n_scenes % 5
+        chunk_sizes = [base_c + (1 if i < rem_c else 0) for i in range(5)]
+        chunk_act_labels = [
+            "ACT 0 & ACT 1 START (Cold Open hook naming the topic in sentence 1 + earliest historical origins)",
+            "ACT 1 & EARLY ACT 2 (Chronological World Building + first primary-source turning points)",
+            "ACT 2 CORE (Deep Mechanics, hidden decrees, primary records & causal links — Pattern Interrupt territory)",
+            "ACT 3 CLIMAX (High-stakes convergence, major historical turning point & escalating momentum)",
+            "ACT 4 EPILOGUE & ABRUPT ENDING (Modern synthesis + haunting closing reflection — ZERO YouTube CTA!)",
+        ]
+    elif n_scenes >= 13:
+        base_c = n_scenes // 3
+        rem_c = n_scenes % 3
+        chunk_sizes = [base_c + (1 if i < rem_c else 0) for i in range(3)]
+        chunk_act_labels = [
+            "PART 1 OF 3 (Cold Open hook + Act I Historical Origins)",
+            "PART 2 OF 3 (Act II Deep Mechanics + Hidden Turning Points)",
+            "PART 3 OF 3 (Act III Climax + Act IV Abrupt Zero-CTA Ending)",
+        ]
+    else:
+        p1 = (n_scenes + 1) // 2
+        chunk_sizes = [p1, n_scenes - p1]
+        chunk_act_labels = [
+            "PART 1 OF 2 (Cold Open + Acts I & II — end on a gripping chronological bridge)",
+            "PART 2 OF 2 (Acts III & IV Climax + Abrupt Zero-CTA Ending — continue seamlessly after Part 1)",
+        ]
 
-    prompt_p2 = (
-        f"EXACT DOCUMENTARY TOPIC: {topic}\n"
-        f"LANGUAGE: {lang_label}\n"
-        f"SUGGESTED MOOD: {data1.get('mood') or mood_hint}\n"
-        f"PART 2 OF 2 (Acts III & IV + Dark Twist + Chilling Finale — continue SEAMLESSLY after Part 1!)\n"
-        f"PART 1 ENDED WITH: \"{prev_tail}\"\n"
-        f"ALREADY COVERED HEADLINES (DO NOT REPEAT): {used_facts}\n"
-        f"EXACT NUMBER OF NEW SCENES IN PART 2: {part2_n}\n"
-        f"{dir_block}"
-    )
-    res2 = _invoke_single_call(prompt_p2, part2_n)
-    if res2 is not None:
-        data2, _, tok2, cost2 = res2
-        p2_scenes = [s for s in (data2.get("scenes") or []) if isinstance(s, dict)][:part2_n]
-        data1["scenes"] = p1_scenes + p2_scenes
-        return data1, src1, tok1 + tok2, round(cost1 + cost2, 6)
-    return data1, src1, tok1, cost1
+    master_data: Optional[Dict[str, Any]] = None
+    master_src = ""
+    total_toks = 0
+    total_cost = 0.0
+    accumulated_scenes: List[Dict[str, Any]] = []
+
+    for ch_idx, (ch_n, ch_desc) in enumerate(zip(chunk_sizes, chunk_act_labels)):
+        prev_tail = " ".join(str(s.get("narration") or "") for s in accumulated_scenes[-2:])
+        used_facts = "; ".join(
+            str(s.get("evidence_headline") or "") for s in accumulated_scenes if s.get("evidence_headline")
+        )
+        continuity = (
+            f"\nPREVIOUS SECTION ENDED WITH: \"{prev_tail}\"\n"
+            f"ALREADY COVERED HEADLINES (DO NOT REPEAT, ADVANCE STRICTLY FORWARD IN TIME): {used_facts}\n"
+            if accumulated_scenes
+            else ""
+        )
+        chunk_prompt = (
+            f"EXACT DOCUMENTARY TOPIC: {topic}\n"
+            f"LANGUAGE: {lang_label}\n"
+            f"SUGGESTED MOOD: {(master_data.get('mood') if master_data else None) or mood_hint}\n"
+            f"SECTION {ch_idx + 1} OF {len(chunk_sizes)}: {ch_desc}\n"
+            f"EXACT NUMBER OF NEW SCENES REQUIRED IN THIS SECTION: {ch_n}\n"
+            f"WORDS PER SCENE: {min_scene_words}-{max_scene_words} spoken words EACH.\n"
+            f"{continuity}"
+            f"{dir_block}\n"
+            + (f"STYLE SPECIFICATION (v3.0.0):\n{skill_text}" if ch_idx == 0 else "")
+        )
+        res_ch = None
+        for ch_try in range(2):
+            res_ch = _invoke_single_call(
+                chunk_prompt
+                if ch_try == 0
+                else (chunk_prompt + f"\nIMPORTANT RETRY: Return EXACTLY {ch_n} complete JSON scenes in the 'scenes' array."),
+                ch_n,
+            )
+            if res_ch is not None:
+                break
+        if res_ch is None:
+            print(f"[NetflixDoc] Open-topic chunk {ch_idx + 1}/{len(chunk_sizes)} failed after retries!", flush=True)
+            if master_data is None:
+                return None
+            # Abort partial plan if > 30% of scenes are missing so we don't silently pad half the film with boilerplate
+            if len(accumulated_scenes) < int(n_scenes * 0.7):
+                return None
+            break
+
+        ch_data, ch_src, ch_tok, ch_cost = res_ch
+        total_toks += ch_tok
+        total_cost = round(total_cost + ch_cost, 6)
+        ch_scenes = [s for s in (ch_data.get("scenes") or []) if isinstance(s, dict)][:ch_n]
+        if master_data is None:
+            master_data = ch_data
+            master_src = ch_src
+        else:
+            # Merge timeline_points if later acts contributed newer historical eras
+            if isinstance(ch_data.get("timeline_points"), list) and len(master_data.get("timeline_points") or []) < 6:
+                master_tl = list(master_data.get("timeline_points") or [])
+                seen_dates = {str(x.get("date") or "").lower() for x in master_tl if isinstance(x, dict)}
+                for tp_x in ch_data["timeline_points"]:
+                    if isinstance(tp_x, dict) and str(tp_x.get("date") or "").lower() not in seen_dates:
+                        master_tl.append(tp_x)
+                        seen_dates.add(str(tp_x.get("date") or "").lower())
+                master_data["timeline_points"] = master_tl[:6]
+        accumulated_scenes.extend(ch_scenes)
+
+    if master_data is None or not accumulated_scenes:
+        return None
+    master_data["scenes"] = accumulated_scenes[:n_scenes]
+    return master_data, master_src, total_toks, total_cost
 
 
 def _build_open_topic_offline_dossier(topic: str, clean_lang: str, mood: str) -> Dict[str, Any]:
-    """Mood-authentic zero-finance fallback dossier ONLY used if BOTH DeepSeek and Gemini are offline."""
+    """Mood-authentic zero-finance fallback dossier ONLY used if BOTH DeepSeek and Gemini are offline.
+    100% topic-agnostic (ZERO Christmas/Krampus/1647 contamination!) and supports PT-BR, EN-US, and ES.
+    """
     is_en = clean_lang == "en_us"
-    clean_t = _clean_doc_text(topic) or ("A História Oculta" if not is_en else "The Hidden History")
+    is_es = clean_lang == "es"
+    clean_t = _clean_doc_text(topic) or (
+        "The Hidden History" if is_en else ("La Historia Oculta" if is_es else "A História Oculta")
+    )
     short_upper = clean_t.upper()[:26]
     media_pack = _OPEN_TOPIC_FALLBACK_MEDIA.get(mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
 
     if mood == "dark_horror":
-        origin = "ANTIGUIDADE" if not is_en else "ANCIENT ERA"
-        dest = "EUROPA MEDIEVAL" if not is_en else "MEDIEVAL EUROPE"
-        metric = "ARQUIVO SOMBRIO • ORIGEM OCULTA" if not is_en else "DARK ARCHIVE • HIDDEN ORIGIN"
-        sub = "Arquivo Sombrio • História Oculta" if not is_en else "Dark Archive • Hidden History"
-        hook = "O LADO SOMBRIO" if not is_en else "THE DARK TRUTH"
-        headline = f"ARQUIVOS HISTÓRICOS REVELAM O LADO SOMBRIO DE {short_upper}" if not is_en else f"FORGOTTEN ARCHIVES EXPOSE THE DARK ORIGIN OF {short_upper}"
+        origin = "ANCIENT ARCHIVE" if is_en else ("ARCHIVO ANTIGUO" if is_es else "ARQUIVO ANTIGO")
+        dest = "MODERN ERA" if is_en else ("ERA MODERNA" if is_es else "ERA MODERNA")
+        metric = "DARK ARCHIVE • HIDDEN ORIGIN" if is_en else ("ARCHIVO OSCURO • ORIGEN OCULTO" if is_es else "ARQUIVO SOMBRIO • ORIGEM OCULTA")
+        sub = "Dark Archive • Hidden History" if is_en else ("Archivo Oscuro • Historia Oculta" if is_es else "Arquivo Sombrio • História Oculta")
+        hook = "THE DARK TRUTH" if is_en else ("LA VERDAD OCULTA" if is_es else "O LADO SOMBRIO")
+        headline = (
+            f"FORGOTTEN ARCHIVES EXPOSE THE DARK ORIGIN OF {short_upper}"
+            if is_en
+            else (f"ARCHIVOS OLVIDADOS REVELAN EL ORIGEN DE {short_upper}" if is_es else f"ARQUIVOS HISTÓRICOS REVELAM O LADO SOMBRIO DE {short_upper}")
+        )
         quote = (
-            f"Crônicas antigas preservam detalhes inquietantes sobre {clean_t} que a versão moderna tentou suavizar."
-            if not is_en
-            else f"Ancient chronicles preserve unsettling accounts behind {clean_t} that modern retellings quietly erased."
+            f"Primary chronicles preserve unsettling evidence behind {clean_t} that official retellings quietly erased."
+            if is_en
+            else (
+                f"Las crónicas primarias conservan pruebas inquietantes sobre {clean_t} que la versión oficial borró."
+                if is_es
+                else f"Crônicas primárias preservam evidências inquietantes sobre {clean_t} que a versão oficial tentou apagar."
+            )
         )
         timeline = [
-            {"date": "ORIGEM", "label": "Primeiros Registros Antigos", "value": "RAIZ OCULTA"},
-            {"date": "SÉC. IV", "label": "Transformação Cultural", "value": "RITUAL ADAPTADO"},
-            {"date": "IDADE MÉDIA", "label": "Folclore & Advertências", "value": "LENDAS SOMBRIAS"},
-            {"date": "HOJE", "label": "A Máscara Moderna", "value": "VERDADE EXPOSTA"},
+            {"date": "FASE I" if not is_en else "PHASE I", "label": "Earliest Primary Records" if is_en else ("Primeros Registros" if is_es else "Primeiros Registros"), "value": "ORIGIN" if is_en else "RAIZ OCULTA"},
+            {"date": "FASE II" if not is_en else "PHASE II", "label": "Concealed Mechanism" if is_en else ("Mecanismo Oculto" if is_es else "Mecanismo Oculto"), "value": "EVIDENCE" if is_en else "PROVA"},
+            {"date": "FASE III" if not is_en else "PHASE III", "label": "Historical Rupture" if is_en else ("Ruptura Histórica" if is_es else "Ruptura Histórica"), "value": "TURNING POINT" if is_en else "VIRADA"},
+            {"date": "HOY" if is_es else ("TODAY" if is_en else "HOJE"), "label": "Modern Echo" if is_en else ("Eco Moderno" if is_es else "Eco Moderno"), "value": "EXPOSED" if is_en else "EXPOSTO"},
         ]
         nodes = [
-            {"id": "n1", "title": short_upper[:18], "role": "Origem Histórica", "badge": "ARQUIVO #01"},
-            {"id": "n2", "title": "RITUAIS ANTIGOS", "role": "Tradições Esquecidas", "badge": "FOLCLORE"},
-            {"id": "n3", "title": "CRÔNICAS VELADAS", "role": "Relatos Medievais", "badge": "PROVA HISTÓRICA"},
-            {"id": "n4", "title": "VERSÃO MODERNA", "role": "O Que Foi Apagado", "badge": "REVELADO"},
+            {"id": "n1", "title": short_upper[:18], "role": "Primary Subject" if is_en else ("Tema Central" if is_es else "Tema Central"), "badge": "FILE #01" if is_en else "ARQUIVO #01"},
+            {"id": "n2", "title": "ARCHIVES" if is_en else "ARQUIVOS", "role": "Primary Records" if is_en else ("Registros Primarios" if is_es else "Registros Primários"), "badge": "EVIDENCE" if is_en else "PROVA"},
+            {"id": "n3", "title": "CONCEALMENT" if is_en else ("OCULTACIÓN" if is_es else "OCULTAÇÃO"), "role": "Suppressed Testimony" if is_en else ("Testimonio Borrado" if is_es else "Testemunho Apagado"), "badge": "CLASSIFIED" if is_en else "RESTRITO"},
+            {"id": "n4", "title": "LEGACY" if is_en else "LEGADO", "role": "Modern Consequence" if is_en else ("Consecuencia Actual" if is_es else "Consequência Atual"), "badge": "REVEALED" if is_en else "REVELADO"},
         ]
-        narr = (
-            [
-                f"Arquivos antigos de {clean_t} revelam que a tradição nasceu em rituais de inverno repletos de excessos e sacrifícios.",
-                f"No século quarto, autoridades religiosas absorveram os antigos festivais pagãos e demoliram templos rivais com as próprias mãos.",
-                "Durante a Idade Média, lendas alpinas fundiram o inverno a criaturas sombrias que puniam os culpados na calada da noite.",
-                "Em 1647, soldados patrulhavam as ruas pelo cheiro de banquetes proibidos e arrastavam famílias inteiras para a prisão.",
-                f"E você, ao revisitar a origem de {clean_t}, ainda sente a sombra do que tentaram apagar?",
+        if is_en:
+            narr = [
+                f"Forgotten records about {clean_t} expose a disturbing truth buried beneath centuries of sanitized storytelling.",
+                f"Primary testimonies linked to {clean_t} show how fear, secrecy, and institutional power reshaped every surviving account.",
+                "Investigators comparing original manuscripts against later editions found entire chapters systematically rewritten or erased.",
+                f"When the suppressed timeline of {clean_t} finally resurfaced, the official narrative collapsed overnight.",
+                f"Knowing what the archives really recorded about {clean_t}, what else was quietly erased from history?",
             ]
-            if not is_en
-            else [
-                f"Ancient archives of {clean_t} reveal that the tradition began inside winter rituals of excess and blood sacrifice.",
-                "In the fourth century, early authorities absorbed pagan solstice feasts while tearing down rival temples with their bare hands.",
-                "Across medieval Europe, Alpine folklore fused winter nights with horned figures that punished the wicked in the dark.",
-                "By 1647, armed patrols hunted down forbidden feasts by the scent of roasting meat and dragged families to prison.",
-                f"And you, when the lights of {clean_t} flicker at midnight, do you still feel the shadow they tried to erase?",
+        elif is_es:
+            narr = [
+                f"Los archivos olvidados sobre {clean_t} exponen una verdad inquietante sepultada bajo siglos de relatos oficiales.",
+                f"Testimonios primarios vinculados a {clean_t} muestran cómo el silencio y el poder reescribieron cada documento sobreviviente.",
+                "Al comparar manuscritos originales con versiones posteriores, los historiadores descubrieron capítulos enteros eliminados a propósito.",
+                f"Cuando la cronología oculta de {clean_t} salió finalmente a la luz, la versión oficial se derrumbó por completo.",
+                f"Al mirar las pruebas reales detrás de {clean_t}, ¿qué más quedó sepultado en los archivos del pasado?",
             ]
-        )
+        else:
+            narr = [
+                f"Arquivos esquecidos sobre {clean_t} expõem uma verdade inquietante enterrada sob séculos de versões oficiais.",
+                f"Testemunhos primários ligados a {clean_t} mostram como o sigilo e o poder moldaram cada relato sobrevivente.",
+                "Ao cruzar manuscritos originais com edições posteriores, pesquisadores descobriram capítulos inteiros reescritos ou apagados.",
+                f"Quando a cronologia completa de {clean_t} finalmente veio à tona, a narrativa oficial ruiu diante das provas documentais.",
+                f"Diante do que os arquivos reais registram sobre {clean_t}, o que mais a história tentou manter nas sombras?",
+            ]
     else:
-        origin = "ARQUIVO ORIGINAL" if not is_en else "PRIMARY ARCHIVE"
-        dest = "PRESENTE" if not is_en else "PRESENT DAY"
-        metric = "DOSSIÊ HISTÓRICO COMPLETO" if not is_en else "COMPLETE ARCHIVAL FILE"
-        sub = "Arquivo Documental • Investigação" if not is_en else "Archival Documentary • Investigation"
-        hook = "A VERDADE OCULTA" if not is_en else "THE HIDDEN TRUTH"
-        headline = f"DOCUMENTOS REVELAM A HISTÓRIA REAL POR TRÁS DE {short_upper}" if not is_en else f"ARCHIVAL RECORDS REVEAL THE REAL STORY BEHIND {short_upper}"
+        origin = "PRIMARY ARCHIVE" if is_en else ("ARCHIVO PRIMARIO" if is_es else "ARQUIVO ORIGINAL")
+        dest = "PRESENT DAY" if is_en else ("PRESENTE" if is_es else "PRESENTE")
+        metric = "COMPLETE ARCHIVAL FILE" if is_en else ("EXPEDIENTE HISTÓRICO" if is_es else "DOSSIÊ HISTÓRICO COMPLETO")
+        sub = "Archival Documentary • Investigation" if is_en else ("Documental de Archivo • Investigación" if is_es else "Arquivo Documental • Investigação")
+        hook = "THE HIDDEN TRUTH" if is_en else ("LA VERDAD OCULTA" if is_es else "A VERDADE OCULTA")
+        headline = (
+            f"ARCHIVAL RECORDS REVEAL THE REAL STORY BEHIND {short_upper}"
+            if is_en
+            else (f"DOCUMENTOS REVELAN LA HISTORIA REAL DE {short_upper}" if is_es else f"DOCUMENTOS REVELAM A HISTÓRIA REAL POR TRÁS DE {short_upper}")
+        )
         quote = (
-            f"Registros históricos e evidências preservadas revelam como {clean_t} transformou seu tempo de maneira inesperada."
-            if not is_en
-            else f"Preserved historical records reveal how {clean_t} reshaped its era in ways rarely told today."
+            f"Preserved historical records reveal how {clean_t} reshaped its era in ways rarely told today."
+            if is_en
+            else (
+                f"Los registros históricos conservados revelan cómo {clean_t} transformó su época de forma inesperada."
+                if is_es
+                else f"Registros históricos e evidências preservadas revelam como {clean_t} transformou seu tempo de maneira inesperada."
+            )
         )
         timeline = [
-            {"date": "FASE I", "label": "Origem Documentada", "value": "INÍCIO"},
-            {"date": "FASE II", "label": "Virada Decisiva", "value": "RUPTURA"},
-            {"date": "FASE III", "label": "Clímax Histórico", "value": "IMPACTO"},
-            {"date": "LEGADO", "label": "Repercussão Atual", "value": "REVELADO"},
+            {"date": "FASE I" if not is_en else "PHASE I", "label": "Documented Origin" if is_en else ("Origen Documentado" if is_es else "Origem Documentada"), "value": "START" if is_en else "INÍCIO"},
+            {"date": "FASE II" if not is_en else "PHASE II", "label": "Decisive Turn" if is_en else ("Giro Decisivo" if is_es else "Virada Decisiva"), "value": "RUPTURE" if is_en else "RUPTURA"},
+            {"date": "FASE III" if not is_en else "PHASE III", "label": "Historical Climax" if is_en else ("Clímax Histórico" if is_es else "Clímax Histórico"), "value": "IMPACT" if is_en else "IMPACTO"},
+            {"date": "LEGACY" if is_en else "LEGADO", "label": "Modern Repercussion" if is_en else ("Repercusión Actual" if is_es else "Repercussão Atual"), "value": "REVEALED" if is_en else "REVELADO"},
         ]
         nodes = [
-            {"id": "n1", "title": short_upper[:18], "role": "Tema Central", "badge": "ARQUIVO #01"},
-            {"id": "n2", "title": "TESTEMUNHOS", "role": "Registros de Época", "badge": "EVIDÊNCIA"},
-            {"id": "n3", "title": "PONTO DE VIRADA", "role": "Evento Decisivo", "badge": "CRÍTICO"},
-            {"id": "n4", "title": "LEGADO REAL", "role": "Impacto Duradouro", "badge": "HISTÓRIA"},
+            {"id": "n1", "title": short_upper[:18], "role": "Core Subject" if is_en else ("Tema Central" if is_es else "Tema Central"), "badge": "FILE #01" if is_en else "ARQUIVO #01"},
+            {"id": "n2", "title": "WITNESSES" if is_en else ("TESTIMONIOS" if is_es else "TESTEMUNHOS"), "role": "Period Records" if is_en else ("Registros de Época" if is_es else "Registros de Época"), "badge": "EVIDENCE" if is_en else "EVIDÊNCIA"},
+            {"id": "n3", "title": "TURNING POINT" if is_en else ("PUNTO DE GIRO" if is_es else "PONTO DE VIRADA"), "role": "Decisive Event" if is_en else ("Evento Decisivo" if is_es else "Evento Decisivo"), "badge": "CRITICAL" if is_en else "CRÍTICO"},
+            {"id": "n4", "title": "REAL LEGACY" if is_en else ("LEGADO REAL" if is_es else "LEGADO REAL"), "role": "Lasting Impact" if is_en else ("Impacto Duradero" if is_es else "Impacto Duradouro"), "badge": "HISTORY" if is_en else "HISTÓRIA"},
         ]
-        narr = (
-            [
-                f"A história oficial sobre {clean_t} ocultou durante séculos os registros primários que deram origem a tudo.",
-                f"Documentos de época provam que as raízes de {clean_t} surgiram sob decretos implacáveis e disputas de poder.",
-                "Cada testemunho preservado conecta lugares distantes e mostra como decisões secretas alteraram o destino de uma geração inteira.",
-                "Quando a cronologia completa veio à tona, as provas documentais desmontaram de vez a versão oficial.",
-                f"E você, diante das provas reais sobre {clean_t}, ainda acredita na versão que contaram nos livros?",
-            ]
-            if not is_en
-            else [
+        if is_en:
+            narr = [
                 f"Official chronicles of {clean_t} concealed for centuries the primary records that sparked the entire affair.",
                 f"Period documents prove the roots of {clean_t} emerged under ruthless decrees and high-stakes power struggles.",
                 "Each preserved testimony connects distant capitals and exposes how covert decisions reshaped an entire generation.",
                 "When the complete chronological archive surfaced, hard forensic evidence dismantled the official myth overnight.",
-                f"And you, seeing the primary evidence behind {clean_t}, do you still believe the version told in textbooks?",
+                f"Seeing the primary evidence behind {clean_t}, do you still believe the version told in textbooks?",
             ]
-        )
+        elif is_es:
+            narr = [
+                f"Las crónicas oficiales sobre {clean_t} ocultaron durante siglos los registros primarios que iniciaron toda la historia.",
+                f"Documentos de época demuestran que las raíces de {clean_t} surgieron bajo decretos implacables y luchas de poder.",
+                "Cada testimonio conservado conecta capitales lejanas y muestra cómo decisiones secretas cambiaron a una generación entera.",
+                "Cuando la cronología documental completa salió a la luz, las pruebas desmontaron de inmediato el relato oficial.",
+                f"Frente a las pruebas reales sobre {clean_t}, ¿todavía crees en la versión que cuentan los libros?",
+            ]
+        else:
+            narr = [
+                f"A história oficial sobre {clean_t} ocultou durante séculos os registros primários que deram origem a tudo.",
+                f"Documentos de época provam que as raízes de {clean_t} surgiram sob decretos implacáveis e disputas de poder.",
+                "Cada testemunho preservado conecta lugares distantes e mostra como decisões secretas alteraram o destino de uma geração inteira.",
+                "Quando a cronologia completa veio à tona, as provas documentais desmontaram de vez a versão oficial.",
+                f"Diante das provas reais sobre {clean_t}, você ainda acredita na versão que contaram nos livros?",
+            ]
 
     return {
         "title": clean_t,
@@ -1974,28 +2202,28 @@ def _is_christmas_dark_history_topic(topic: str) -> bool:
 
 
 def _assign_act_metadata_for_index(idx: int, total_scenes: int) -> Tuple[str, float, bool]:
-    """Return `(act_id, cut_cadence_s, is_pattern_interrupt)` for scene `idx` in a 5-Act v3.0.0 arc."""
+    """Return `(act_id, cut_cadence_s, is_pattern_interrupt)` driven by `high_retention_doc_engine_v3.json`."""
     if total_scenes >= 20:
         if idx <= 1:
-            return "ACT_0_COLD_OPEN_HOOK", 2.2, False
+            return "ACT_0_COLD_OPEN_HOOK", _get_v3_act_cadence("ACT_0_COLD_OPEN_HOOK", 2.2), False
         if idx <= 6:
-            return "ACT_1_WORLD_BUILDING", 4.0, False
+            return "ACT_1_WORLD_BUILDING", _get_v3_act_cadence("ACT_1_WORLD_BUILDING", 4.0), False
         if idx <= 15:
-            return "ACT_2_DEEP_MECHANICS", 3.5, idx in (7, 12)
+            return "ACT_2_DEEP_MECHANICS", _get_v3_act_cadence("ACT_2_DEEP_MECHANICS", 3.5), idx in (7, 12)
         if idx <= 21:
-            return "ACT_3_CLIMAX_REVELATION", 2.7, idx == 16
-        return "ACT_4_ABRUPT_ENDING", 4.5, False
+            return "ACT_3_CLIMAX_REVELATION", _get_v3_act_cadence("ACT_3_CLIMAX_REVELATION", 2.7), idx == 16
+        return "ACT_4_ABRUPT_ENDING", _get_v3_act_cadence("ACT_4_ABRUPT_ENDING", 4.5), False
     # Proportional 5-act mapping for shorter documentaries
     ratio = idx / float(max(1, total_scenes - 1))
     if idx == 0:
-        return "ACT_0_COLD_OPEN_HOOK", 2.2, False
+        return "ACT_0_COLD_OPEN_HOOK", _get_v3_act_cadence("ACT_0_COLD_OPEN_HOOK", 2.2), False
     if ratio < 0.30:
-        return "ACT_1_WORLD_BUILDING", 4.0, False
+        return "ACT_1_WORLD_BUILDING", _get_v3_act_cadence("ACT_1_WORLD_BUILDING", 4.0), False
     if ratio < 0.68:
-        return "ACT_2_DEEP_MECHANICS", 3.5, False
+        return "ACT_2_DEEP_MECHANICS", _get_v3_act_cadence("ACT_2_DEEP_MECHANICS", 3.5), False
     if ratio < 0.88:
-        return "ACT_3_CLIMAX_REVELATION", 2.7, False
-    return "ACT_4_ABRUPT_ENDING", 4.5, False
+        return "ACT_3_CLIMAX_REVELATION", _get_v3_act_cadence("ACT_3_CLIMAX_REVELATION", 2.7), False
+    return "ACT_4_ABRUPT_ENDING", _get_v3_act_cadence("ACT_4_ABRUPT_ENDING", 4.5), False
 
 
 def _build_christmas_5act_masterpiece_plan(
@@ -2868,6 +3096,14 @@ def _build_christmas_5act_masterpiece_plan(
             vmode = "2d_schematic_over_realism"
 
         narr_txt = _normalize_pt_century_ordinals_in_text(_clean_doc_text(sp["narration"]), lang=clean_lang)
+        # Derive clean per-beat archival photo queries from chronological shot prompts (NEVER stuff broll_q/pip_q!)
+        beat_archival_queries: List[str] = []
+        for raw_sh in sp["shots"]:
+            derived_q = _derive_archival_query_from_shot_prompt(raw_sh, fallback_query=sp["photo_q"])
+            if derived_q and derived_q.lower() not in {q.lower() for q in beat_archival_queries}:
+                beat_archival_queries.append(derived_q)
+        if sp["photo_q"] and sp["photo_q"].lower() not in {q.lower() for q in beat_archival_queries}:
+            beat_archival_queries.insert(0, sp["photo_q"])
         scenes.append(
             NetflixDocScene(
                 scene_id=f"doc_sc_{idx + 1:02d}",
@@ -2877,7 +3113,7 @@ def _build_christmas_5act_masterpiece_plan(
                 chapter_subtitle=sp["chapter_subtitle"],
                 visual_mode=vmode,
                 visual_category=_resolve_visual_category(vmode, is_broll_shot=False),
-                cut_cadence_s=float(sp["cut_cadence_s"]),
+                cut_cadence_s=_get_v3_act_cadence(sp["act_id"], float(sp["cut_cadence_s"])),
                 pattern_interrupt=bool(sp["pattern_interrupt"]),
                 mood="dark_horror",
                 narration=narr_txt,
@@ -2897,12 +3133,13 @@ def _build_christmas_5act_masterpiece_plan(
                 broll_query_en=sp["broll_q"],
                 pip_broll_query_en=sp["pip_q"],
                 photo_query_en=sp["photo_q"],
-                extra_photo_queries_en=[sp["photo_q"], sp["broll_q"], sp["pip_q"]],
+                extra_photo_queries_en=beat_archival_queries[1:5] or [sp["photo_q"]],
                 shot_prompts_en=locked_shots,
                 transition_type=_select_transition_for_scene(idx, vmode, sp["chapter_card"] is not None),
             )
         )
 
+    v3_pi_triggers, _ = _get_v3_pi_config()
     plan_obj = NetflixDocPlan(
         schema_version="3.0.0",
         pipeline_name="Mixed_Media_High_Retention_Documentary_Engine",
@@ -2920,7 +3157,7 @@ def _build_christmas_5act_masterpiece_plan(
         topic_source="curated_5act_masterpiece_v3",
         tokens_used=0,
         cost_usd=0.0,
-        pattern_interrupt_times=[240.0, 480.0, 720.0] if len(scenes) >= 20 else [],
+        pattern_interrupt_times=v3_pi_triggers if len(scenes) >= 20 else [],
         scenes=scenes,
         hashtags=["#documentario", "#historia", "#natal", "#historiaobscura", "#superhistorico"],
     )
@@ -2934,21 +3171,33 @@ def generate_netflix_doc_plan(
     lang: str = "pt_br",
     custom_directives: str = "",
     caption_style: Optional[str] = None,
+    skill_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Generate a complete investigative Netflix / MagnatesMedia / Super Histórico / Vox documentary plan (dict).
 
-    - Schema v3.0.0 (`Mixed_Media_High_Retention_Documentary_Engine`, `16:9` default, supports up to `18.0` min).
-    - For Christmas / dark-winter historical topics in `16:9` or `target_minutes >= 12.0`, builds the
-      fact-checked 25-Scene, 5-Act Masterpiece (~2,250-2,450 words, ~16m-17m30s / 960-1,050s).
-    - Matches the 10 curated financial dossiers when the topic clearly requests one of them.
-    - For ANY new arbitrary open topic, invokes LIVE DeepSeek (`deepseek-chat`) or Google Gemini with
-      automatic failover, enforcing era-locked prompts and strict forward chronology.
+    - Schema v3.0.0 (`Mixed_Media_High_Retention_Documentary_Engine`, driven by `config/high_retention_doc_engine_v3.json`).
+    - Supports `pt_br`, `en_us`, and `es`.
+    - Hardcoded Christmas 5-Act Blueprint (Path 0) is strictly gated to `pt_br` + `t_min >= 12.0` + empty `custom_directives`.
+    - Path A (10 curated financial dossiers) supports BOTH DeepSeek and Gemini expansion with full v3 fields.
+    - Path B (open-topic AI Director) uses balanced multi-act chunking and zero Christmas contamination.
     - Always runs the final plan through `agents.retention_doctor.audit_netflix_doc_plan`.
     """
+    v3_cfg = _get_v3_engine_config()
+    v3_nav = v3_cfg.get("narrative_architecture") or {}
+    v3_target_min = float(((v3_cfg.get("target_format") or {}).get("target_minutes") or {}).get("ideal", 17.0))
+    v3_pi_triggers, _ = _get_v3_pi_config()
+
     ar: Literal["16:9", "9:16"] = "9:16" if str(aspect_ratio).strip() == "9:16" else "16:9"
-    clean_lang = "en_us" if str(lang).lower().startswith("en") else "pt_br"
+    norm_lang = str(lang or "pt_br").strip().lower().replace("-", "_")
+    if norm_lang.startswith("en"):
+        clean_lang = "en_us"
+    elif norm_lang.startswith("es"):
+        clean_lang = "es"
+    else:
+        clean_lang = "pt_br"
     is_en = clean_lang == "en_us"
-    default_min = 17.0 if ar == "16:9" else 2.75
+    is_es = clean_lang == "es"
+    default_min = v3_target_min if ar == "16:9" else 2.75
     t_min = max(0.35, min(20.0, float(target_minutes if target_minutes is not None else default_min)))
     target_seconds = max(25.0, t_min * 60.0)
 
@@ -2961,42 +3210,57 @@ def generate_netflix_doc_plan(
         resolved_cap_style = default_cap
 
     # =========================================================================
-    # PATH 0: 5-ACT 25-SCENE HISTORICAL CHRISTMAS MASTERPIECE (16:9 OR >= 12m)
+    # PATH 0: 5-ACT 25-SCENE HISTORICAL CHRISTMAS MASTERPIECE
+    # Strictly gated to pt_br + t_min >= 12.0 + empty custom_directives!
     # =========================================================================
-    if _is_christmas_dark_history_topic(topic) and (ar == "16:9" or t_min >= 12.0):
+    if (
+        _is_christmas_dark_history_topic(topic)
+        and clean_lang == "pt_br"
+        and t_min >= 12.0
+        and not str(custom_directives or "").strip()
+    ):
         return _build_christmas_5act_masterpiece_plan(
             aspect_ratio=ar,
-            target_minutes=t_min if t_min >= 12.0 else 17.0,
+            target_minutes=t_min,
             clean_lang=clean_lang,
             caption_style=resolved_cap_style,
         )
 
-    # Budget spoken narration cleanly for both short docs and 15-18 min (25-scene) YouTube documentaries
+    # Smooth monotonic scene-count & word-budget formula across ALL durations (0.5m..20m) — NO 8-11.9m explosion!
     if t_min >= 12.0:
-        n_scenes = 25
-        min_scene_words = 88
-        max_scene_words = 98
+        n_scenes = int(v3_nav.get("total_scenes_target", 25))
+        wps_range = v3_nav.get("words_per_scene_range") or [88, 98]
+        min_scene_words = int(wps_range[0]) if len(wps_range) >= 2 else 88
+        max_scene_words = int(wps_range[1]) if len(wps_range) >= 2 else 98
+    elif t_min >= 6.0:
+        n_scenes = max(12, min(20, int(round(t_min * 1.75))))
+        est_chapters = _estimate_chapter_count(n_scenes)
+        overhead_s = est_chapters * 1.65 + n_scenes * 0.42 + 1.25
+        spoken_budget_s = max(180.0, target_seconds - overhead_s)
+        total_target_words = int(round(spoken_budget_s * 2.25))
+        avg_w = total_target_words / float(n_scenes)
+        min_scene_words = max(45, int(math.floor(avg_w)) - 6)
+        max_scene_words = min(92, int(math.ceil(avg_w)) + 6)
+    elif t_min >= 2.0:
+        n_scenes = max(6, min(12, int(round(t_min * 2.2))))
+        est_chapters = _estimate_chapter_count(n_scenes)
+        overhead_s = est_chapters * 1.65 + n_scenes * 0.42 + 1.25
+        spoken_budget_s = max(60.0, target_seconds - overhead_s)
+        total_target_words = int(round(spoken_budget_s * 2.15))
+        avg_w = total_target_words / float(n_scenes)
+        min_scene_words = max(24, int(math.floor(avg_w)) - 5)
+        max_scene_words = min(68, int(math.ceil(avg_w)) + 5)
     else:
-        pace_wps = 2.05
-        rough_scenes = max(4, min(60, int(round(max(20.0, target_seconds - 4.5) / 11.5))))
-        est_chapters = _estimate_chapter_count(rough_scenes)
-        overhead_s = est_chapters * 1.65 + rough_scenes * 0.42 + 1.25
-        spoken_budget_s = max(14.0, target_seconds - overhead_s)
-        total_target_words = max(48, int(round(spoken_budget_s * pace_wps)))
-        words_per_sc_divisor = 25.0 if target_seconds >= 120.0 else 21.0
-        n_scenes = max(4, min(60, int(round(total_target_words / words_per_sc_divisor))))
+        n_scenes = max(4, min(7, int(round(t_min * 4.5))))
         est_chapters = _estimate_chapter_count(n_scenes)
         overhead_s = est_chapters * 1.65 + n_scenes * 0.42 + 1.25
         spoken_budget_s = max(14.0, target_seconds - overhead_s)
-        total_target_words = max(48, int(round(spoken_budget_s * pace_wps)))
-        avg_words_per_scene = total_target_words / float(n_scenes)
-        if avg_words_per_scene >= 19.0:
-            min_scene_words = max(14, int(math.floor(avg_words_per_scene)) - 4)
-            max_scene_words = min(28, int(math.floor(avg_words_per_scene)) + 1)
-        else:
-            min_scene_words = max(11, int(round(avg_words_per_scene)) - 2)
-            max_scene_words = min(24, int(round(avg_words_per_scene)) + 2)
-    voice_id = "en-US-AndrewMultilingualNeural" if is_en else "Charon"
+        total_target_words = max(48, int(round(spoken_budget_s * 2.05)))
+        avg_w = total_target_words / float(n_scenes)
+        min_scene_words = max(11, int(math.floor(avg_w)) - 3)
+        max_scene_words = min(30, int(math.ceil(avg_w)) + 3)
+
+    voice_id = "en-US-AndrewMultilingualNeural" if is_en else ("es-MX-JorgeNeural" if is_es else "Charon")
 
     matched_curated = _match_curated_dossier(topic)
     tokens_used = 0
@@ -3004,9 +3268,9 @@ def generate_netflix_doc_plan(
     topic_source = "curated"
 
     # =========================================================================
-    # PATH A: ONE OF THE 10 CURATED SIGNATURE FINANCIAL DOSSIERS
+    # PATH A: ONE OF THE 10 CURATED SIGNATURE FINANCIAL DOSSIERS (DeepSeek + Gemini)
     # =========================================================================
-    if matched_curated is not None:
+    if matched_curated is not None and not is_es:
         dossier = matched_curated
         mood = "corporate_thriller"
         channel_name = "Vault Files" if is_en else "Dossiê Capital"
@@ -3016,39 +3280,78 @@ def generate_netflix_doc_plan(
         base_narr = list(dossier["narr_en"] if is_en else dossier["narr_pt"])
         chapter_subs = _default_chapter_subtitles_for_mood(mood, is_en)
 
-        # Optional LLM expansion for longer mid-roll curated documentaries (> 0.6 min)
+        # Optional LLM expansion for longer mid-roll / long-form curated documentaries (supports BOTH DeepSeek & Gemini!)
         settings = get_settings() or {}
         dkey = str(settings.get("deepseek_api_key") or "").strip()
         gkey = str(settings.get("gemini_api_key") or "").strip()
         if n_scenes > len(base_narr) and (dkey or gkey):
             sys_p = (
                 f"You are an investigative documentary scriptwriter (Netflix / MagnatesMedia style) writing in {'American English' if is_en else 'Brazilian Portuguese'}. "
-                f"Write exactly {n_scenes} gripping, factual narration paragraphs (18-26 words each) about '{title}'. "
+                f"Write exactly {n_scenes} gripping, factual, strictly chronological narration paragraphs ({min_scene_words}-{max_scene_words} words EACH) about '{title}'. "
+                "Zero robotic AI clichés, zero YouTube CTAs on the final scene. "
                 'Return ONLY valid JSON: {"lines":["..."]}'
             )
-            try:
-                if dkey:
+            expanded_ok = False
+            if dkey:
+                try:
                     from openai import OpenAI
 
-                    cli = OpenAI(api_key=dkey, base_url="https://api.deepseek.com", timeout=35.0)
+                    cli = OpenAI(api_key=dkey, base_url="https://api.deepseek.com", timeout=65.0)
                     resp = cli.chat.completions.create(
                         model="deepseek-chat",
                         messages=[{"role": "system", "content": sys_p}, {"role": "user", "content": f"TOPIC: {title}"}],
                         temperature=0.7,
-                        max_tokens=min(4000, n_scenes * 75),
+                        max_tokens=min(8192, max(1600, n_scenes * max_scene_words * 3)),
                         response_format={"type": "json_object"},
                     )
                     data = _extract_clean_json(resp.choices[0].message.content or "{}")
-                    if isinstance(data.get("lines"), list) and len(data["lines"]) >= 5:
-                        base_narr = [str(x).strip() for x in data["lines"][:n_scenes]]
+                    if isinstance(data.get("lines"), list) and len(data["lines"]) >= max(5, int(n_scenes * 0.7)):
+                        base_narr = [str(x).strip() for x in data["lines"][:n_scenes] if str(x).strip()]
                         u = resp.usage
                         pt = int(getattr(u, "prompt_tokens", 500))
-                        ct = int(getattr(u, "completion_tokens", 500))
+                        ct = int(getattr(u, "completion_tokens", 800))
                         tokens_used = pt + ct
-                        cost_usd = 0.0002
+                        cost_usd = round((pt * 0.14 + ct * 0.28) / 1_000_000.0, 6)
                         record_token_usage("deepseek", "deepseek-chat", pt, ct, 0, cost_usd)
-            except Exception:
-                pass
+                        expanded_ok = True
+                except Exception:
+                    pass
+            if not expanded_ok and gkey:
+                for gm in ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-lite-latest"):
+                    try:
+                        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent"
+                        r = httpx.post(
+                            url,
+                            headers={"Content-Type": "application/json", "x-goog-api-key": gkey},
+                            json={
+                                "system_instruction": {"parts": [{"text": sys_p}]},
+                                "contents": [{"role": "user", "parts": [{"text": f"TOPIC: {title}"}]}],
+                                "generationConfig": {
+                                    "temperature": 0.7,
+                                    "maxOutputTokens": min(12000, max(1800, n_scenes * max_scene_words * 3)),
+                                    "responseMimeType": "application/json",
+                                },
+                            },
+                            timeout=75.0,
+                        )
+                        if r.status_code != 200:
+                            continue
+                        j = r.json()
+                        parts = j.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                        txt = "".join(str(p.get("text") or "") for p in parts if not p.get("thought"))
+                        data = _extract_clean_json(txt)
+                        if isinstance(data.get("lines"), list) and len(data["lines"]) >= max(5, int(n_scenes * 0.7)):
+                            base_narr = [str(x).strip() for x in data["lines"][:n_scenes] if str(x).strip()]
+                            meta = j.get("usageMetadata", {})
+                            pt = int(meta.get("promptTokenCount", 500))
+                            ct = int(meta.get("candidatesTokenCount", 900))
+                            tokens_used = pt + ct
+                            cost_usd = round((pt * 0.075 + ct * 0.30) / 1_000_000.0, 6)
+                            record_token_usage("gemini", gm, pt, ct, 0, cost_usd)
+                            expanded_ok = True
+                            break
+                    except Exception:
+                        continue
 
         while len(base_narr) < n_scenes:
             idx_add = len(base_narr)
@@ -3073,6 +3376,7 @@ def generate_netflix_doc_plan(
 
         for idx, line_txt in enumerate(base_narr):
             vmode: VisualModeType = _select_visual_mode_for_scene(idx, len(base_narr))
+            act_id, sc_cadence, sc_pi = _assign_act_metadata_for_index(idx, len(base_narr))
             chap_card: Optional[str] = None
             chap_sub: Optional[str] = None
             if idx == 0:
@@ -3096,20 +3400,31 @@ def generate_netflix_doc_plan(
             if pip_q.lower() == broll_q.lower() and len(pip_pool) > 1:
                 pip_q = pip_pool[(idx + 1) % len(pip_pool)]
             photo_q = photo_pool[idx % len(photo_pool)]
-            extra_photos = [photo_pool[(idx + off) % len(photo_pool)] for off in range(4)]
+            extra_photos = [photo_pool[(idx + off) % len(photo_pool)] for off in range(1, min(5, len(photo_pool) + 1))]
+            shot_prompts = [
+                f"dramatic 35mm cinema still of {photo_q} ({lt_title}), chiaroscuro lighting, no text",
+                *[
+                    f"cinematic 35mm investigative documentary frame of {eq} ({lt_title}), no text"
+                    for eq in extra_photos[:4]
+                ],
+            ]
 
             scenes.append(
                 NetflixDocScene(
                     scene_id=f"doc_sc_{idx + 1:02d}",
+                    act_id=act_id,
                     act_label=act_lbl,
                     chapter_card=chap_card,
                     chapter_subtitle=chap_sub,
                     visual_mode=vmode,
+                    visual_category=_resolve_visual_category(vmode, is_broll_shot=False),
+                    cut_cadence_s=sc_cadence,
+                    pattern_interrupt=sc_pi,
                     mood=mood,
                     narration=_clean_doc_text(line_txt),
                     lower_third_title=_normalize_upper(_clean_doc_text(lt_title)),
                     lower_third_subtitle=_normalize_upper(_clean_doc_text(lt_sub)),
-                    highlight_color="#FFD166" if idx % 2 == 0 else "#FF2E93",
+                    highlight_color="#EAB308" if idx % 2 == 0 else "#D9381E",
                     evidence_headline=_clean_doc_text(dossier["headline"]),
                     evidence_quote=_clean_doc_text(dossier["quote_en"] if is_en else dossier["quote_pt"]),
                     map_origin=_clean_doc_text(dossier["origin"]),
@@ -3118,12 +3433,13 @@ def generate_netflix_doc_plan(
                     timeline_points=[TimelinePoint(**pt) for pt in dossier["timeline"]],
                     board_nodes=[BoardNode(**nd) for nd in dossier["nodes"]],
                     image_prompt_en=photo_q,
-                    bespoke_image_prompt_en="",
+                    bespoke_image_prompt_en=shot_prompts[0],
                     prefer_gemini_photo=False,
                     broll_query_en=broll_q,
                     pip_broll_query_en=pip_q,
                     photo_query_en=photo_q,
                     extra_photo_queries_en=extra_photos,
+                    shot_prompts_en=shot_prompts,
                     transition_type=_select_transition_for_scene(idx, vmode, chap_card is not None),
                 )
             )
@@ -3144,6 +3460,7 @@ def generate_netflix_doc_plan(
             topic_source=topic_source,
             tokens_used=tokens_used,
             cost_usd=cost_usd,
+            pattern_interrupt_times=v3_pi_triggers if t_min >= 12.0 else [],
             scenes=scenes,
             hashtags=["#documentario", "#investigacao", "#financas", "#dossiecapital" if not is_en else "#vaultfiles"],
         )
@@ -3163,6 +3480,7 @@ def generate_netflix_doc_plan(
         min_scene_words=min_scene_words,
         max_scene_words=max_scene_words,
         target_seconds=target_seconds,
+        skill_id=skill_id,
     )
 
     if llm_res is not None:
@@ -3343,12 +3661,16 @@ def generate_netflix_doc_plan(
                     ep_c = _safe_field(ep, "")
                     if ep_c and ep_c.lower() not in {x.lower() for x in extra_photos}:
                         extra_photos.append(ep_c)
-            for off_i in range(len(topic_photo_pool)):
+            # Derive missing per-scene archival queries from THIS scene's chronological shot_prompts_en
+            # (NEVER pull queries from other centuries/scenes via global topic_photo_pool!)
+            for raw_sp_q in (rs.get("shot_prompts_en") or []):
                 if len(extra_photos) >= 4:
                     break
-                cand = topic_photo_pool[(idx + off_i) % len(topic_photo_pool)]
-                if cand.lower() not in {x.lower() for x in extra_photos}:
-                    extra_photos.append(cand)
+                dq = _derive_archival_query_from_shot_prompt(str(raw_sp_q or ""), fallback_query="")
+                if dq and dq.lower() not in {x.lower() for x in extra_photos}:
+                    extra_photos.append(dq)
+            if not extra_photos and photo_q:
+                extra_photos.append(photo_q)
 
             default_bespoke = (
                 f"Vertical full-bleed 9:16 35mm dark documentary still of {photo_q}, dramatic chiaroscuro lighting, no text"
@@ -3468,7 +3790,7 @@ def generate_netflix_doc_plan(
             topic_source=topic_source,
             tokens_used=tokens_used,
             cost_usd=cost_usd,
-            pattern_interrupt_times=[240.0, 480.0, 720.0] if t_min >= 12.0 else [],
+            pattern_interrupt_times=v3_pi_triggers if t_min >= 12.0 else [],
             scenes=scenes,
             hashtags=hashtags,
         )
@@ -3708,6 +4030,52 @@ def _resolve_scene_acting_direction(act_id: str, mood: str, lang: str, text: str
     return f"{base} {act_hint}".strip()
 
 
+_GEMINI_LOCKED_RETRY_BACKOFFS_S: Tuple[float, ...] = (8.0, 15.0, 25.0, 35.0)
+
+
+def _invoke_gemini_tts_sync(
+    spoken_text: str,
+    raw_wav: Path,
+    gem_voice: str,
+    acting_dir: str,
+    gem_key: str,
+    lang: str,
+    thermal_limit_c: float,
+    pinned_tts_model: Optional[str] = None,
+) -> Tuple[Path, float, str]:
+    """Call `synthesize_gemini_tts_line_with_meta` (Cinema v8) when available, else `synthesize_gemini_tts_line`,
+    forwarding `pinned_model` / `allowed_models` defensively so pre- and post-merge modules work identically.
+    """
+    fn = synthesize_gemini_tts_line_with_meta or synthesize_gemini_tts_line
+    kwargs: Dict[str, Any] = {
+        "text": spoken_text,
+        "out_wav": raw_wav,
+        "voice_name": gem_voice,
+        "acting_direction": acting_dir,
+        "api_key": gem_key,
+        "lang": lang,
+        "thermal_limit_c": thermal_limit_c,
+    }
+    try:
+        params = inspect.signature(fn).parameters
+        accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if pinned_tts_model:
+            if "pinned_model" in params or accepts_varkw:
+                kwargs["pinned_model"] = pinned_tts_model
+            elif "allowed_models" in params:
+                kwargs["allowed_models"] = (pinned_tts_model,)
+        filtered_kwargs = {k: v for k, v in kwargs.items() if (k in params or accepts_varkw)}
+    except Exception:
+        filtered_kwargs = kwargs
+
+    res = fn(**filtered_kwargs)
+    if isinstance(res, tuple) and len(res) >= 3:
+        return Path(res[0]), float(res[1]), str(res[2] or pinned_tts_model or "gemini-2.5-flash-preview-tts")
+    if isinstance(res, tuple) and len(res) == 2:
+        return Path(res[0]), float(res[1]), str(pinned_tts_model or "gemini-2.5-flash-preview-tts")
+    return raw_wav, _probe_wav_duration_s(raw_wav), str(pinned_tts_model or "gemini-2.5-flash-preview-tts")
+
+
 async def _synthesize_doc_scene_narration(
     text: str,
     voice_id: str,
@@ -3722,38 +4090,109 @@ async def _synthesize_doc_scene_narration(
     voice_engine: str = "auto",
     mood: str = "dark_horror",
     act_id: str = "ACT_1_WORLD_BUILDING",
+    pinned_tts_model: Optional[str] = None,
+    allow_edge_fallback: bool = True,
+    force_regen: bool = False,
+    meta_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Path, List[Dict[str, Any]], float]:
-    """Synthesize natural human-acting cinema documentary narration (Gemini Expressive TTS primary,
-    natural pause-preserving edge-tts fallback, checkpoint/resume aware).
+    """Synthesize natural human-acting cinema documentary narration (Gemini Expressive TTS primary
+    with single-model lock across all scenes, Kokoro neural option, natural pause-preserving Edge-TTS
+    only when Scene 0 starts on Edge-TTS, checkpoint/resume aware).
     """
     raw_mp3 = work_dir / f"{tag}_raw.mp3"
     raw_wav = work_dir / f"{tag}_raw.wav"
     vad_wav = work_dir / f"{tag}_vad.wav"
     words_json = work_dir / f"{tag}_words.json"
+    meta_json = work_dir / f"{tag}_tts_meta.json"
 
-    if resume and vad_wav.exists() and vad_wav.stat().st_size > 4096:
+    def _record_meta(engine_name: str, model_name: str, voice_used: str, cached: bool = False) -> None:
+        info = {
+            "engine": str(engine_name),
+            "model": str(model_name),
+            "voice": str(voice_used),
+            "cached": bool(cached),
+        }
+        if meta_out is not None:
+            meta_out.clear()
+            meta_out.update(info)
+        if not cached:
+            try:
+                meta_json.write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+
+    if resume and (not force_regen) and vad_wav.exists() and vad_wav.stat().st_size > 4096:
         cached_dur = _probe_wav_duration_s(vad_wav)
         if cached_dur > 0.3:
+            cached_meta: Dict[str, Any] = {}
+            if meta_json.exists():
+                try:
+                    cached_meta = json.loads(meta_json.read_text(encoding="utf-8"))
+                except Exception:
+                    cached_meta = {}
             if words_json.exists():
                 try:
                     cached_words = json.loads(words_json.read_text(encoding="utf-8"))
                     if isinstance(cached_words, list):
+                        _record_meta(
+                            cached_meta.get("engine") or ("gemini_tts" if pinned_tts_model else "cached"),
+                            cached_meta.get("model") or (pinned_tts_model or ""),
+                            cached_meta.get("voice") or voice_id,
+                            cached=True,
+                        )
                         return vad_wav, cached_words, cached_dur
                 except Exception:
                     pass
             if reuse_existing_wav_if_no_words:
                 est_words = _estimate_word_timestamps(text, cached_dur)
+                _record_meta(
+                    cached_meta.get("engine") or ("gemini_tts" if pinned_tts_model else "cached"),
+                    cached_meta.get("model") or (pinned_tts_model or ""),
+                    cached_meta.get("voice") or voice_id,
+                    cached=True,
+                )
                 return vad_wav, est_words, cached_dur
 
     spoken_text = normalize_narration_for_speech(text, lang=lang)
-    is_en = str(lang).lower().startswith("en")
+    lang_low = str(lang or "pt_br").strip().lower()
+    is_en = lang_low.startswith("en")
+    is_es = lang_low.startswith("es")
     eff_engine = str(voice_engine or "auto").strip().lower()
     if voice_id in _GEMINI_VOICE_NAMES and eff_engine in ("auto", "gemini_tts", "gemini"):
         eff_engine = "gemini_tts"
+    audio_targets = _get_v3_audio_targets()
+    max_internal_silence_s = float(audio_targets.get("max_internal_silence_s", 0.35))
 
-    # 1. PRIORITY 1: Google Gemini Native Expressive TTS (Real human breathing, emotion, pauses & diction!)
+    # 0. Optional local Kokoro neural TTS engine (when explicitly requested)
+    if eff_engine == "kokoro" and _dsp_generate_narration is not None:
+        try:
+            k_wav, k_words, k_dur = await asyncio.to_thread(
+                _dsp_generate_narration,
+                spoken_text,
+                vad_wav,
+                voice_id,
+                "kokoro",
+                lang,
+                rate,
+                pitch,
+                thermal_limit_c,
+            )
+            if k_wav is not None and Path(k_wav).exists() and float(k_dur or 0.0) > 0.3:
+                try:
+                    words_json.write_text(json.dumps(k_words, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+                _record_meta("kokoro", "kokoro_local", voice_id)
+                return Path(k_wav), list(k_words or []), float(k_dur)
+        except Exception as exc_k:
+            if not allow_edge_fallback:
+                raise RuntimeError(f"Kokoro TTS failed on {tag} (locked engine): {exc_k}") from exc_k
+            print(f"[NetflixDoc] Kokoro TTS fallback ({str(exc_k)[:110]})", flush=True)
+
+    # 1. PRIORITY 1: Google Gemini Native Expressive TTS (Single-Model Lock across entire documentary!)
     gem_ok, gem_key = has_valid_gemini_key()
-    if gem_ok and eff_engine in ("auto", "gemini_tts", "gemini"):
+    use_gemini = gem_ok and (eff_engine in ("auto", "gemini_tts", "gemini") or (pinned_tts_model is not None and not allow_edge_fallback))
+    if use_gemini:
         default_gem_voice = {
             "dark_horror": "Charon",
             "epic_history": "Charon",
@@ -3763,37 +4202,46 @@ async def _synthesize_doc_scene_narration(
         gem_voice = voice_id if voice_id in _GEMINI_VOICE_NAMES else default_gem_voice
         acting_dir = _resolve_scene_acting_direction(act_id=act_id, mood=str(mood or "dark_horror"), lang=lang, text=spoken_text)
         max_sane_dur = max(7.0, len(spoken_text.split()) * 0.68)
-        for gem_try in range(2):
+        max_gem_attempts = (len(_GEMINI_LOCKED_RETRY_BACKOFFS_S) + 1) if (not allow_edge_fallback) else 2
+        last_gem_exc: Optional[Exception] = None
+
+        for gem_try in range(max_gem_attempts):
             try:
-                await asyncio.to_thread(
-                    synthesize_gemini_tts_line,
+                cur_acting = acting_dir if gem_try == 0 else (acting_dir + " Speak briskly with zero long pauses.")
+                _, _, used_model = await asyncio.to_thread(
+                    _invoke_gemini_tts_sync,
                     spoken_text,
                     raw_wav,
                     gem_voice,
-                    acting_dir if gem_try == 0 else (acting_dir + " Speak briskly with zero long pauses."),
+                    cur_acting,
                     gem_key,
                     lang,
                     thermal_limit_c,
+                    pinned_tts_model,
                 )
                 raw_dur = _probe_wav_duration_s(raw_wav)
-                # Trim dead leading/trailing room-tone hiss AND cap >0.35s internal gaps cleanly
+                # Trim dead leading/trailing room-tone hiss AND cap >max_internal_silence_s internal gaps cleanly
                 out_wav, _, out_dur = await asyncio.to_thread(
                     trim_silence_vad,
                     raw_wav,
                     vad_wav,
                     [],
-                    0.35,
+                    max_internal_silence_s,
                     0.10,
                     thermal_limit_c,
                     False,
                 )
                 had_hiss_tail_glitch = (raw_dur > out_dur * 1.85) and ((raw_dur - out_dur) > 8.0)
                 min_sane_dur = max(1.6, len(spoken_text.split()) * 0.24)
-                if (out_dur > max_sane_dur or had_hiss_tail_glitch or out_dur < min_sane_dur) and gem_try == 0:
+                if (out_dur > max_sane_dur or had_hiss_tail_glitch or out_dur < min_sane_dur) and gem_try < (max_gem_attempts - 1):
                     print(
-                        f"[NetflixDoc] Gemini TTS anomaly (raw={raw_dur:.1f}s, trim={out_dur:.1f}s, words={len(spoken_text.split())}) on {tag}, retrying cleanly...",
+                        f"[NetflixDoc] Gemini TTS anomaly (model={used_model}, raw={raw_dur:.1f}s, trim={out_dur:.1f}s, words={len(spoken_text.split())}) on {tag}, retrying on locked model...",
                         flush=True,
                     )
+                    if not allow_edge_fallback and gem_try < len(_GEMINI_LOCKED_RETRY_BACKOFFS_S):
+                        wait_s = float(_GEMINI_LOCKED_RETRY_BACKOFFS_S[gem_try])
+                        if wait_s > 0.0:
+                            await asyncio.sleep(wait_s)
                     continue
                 if out_dur > max_sane_dur * 1.45:
                     raise RuntimeError(f"Gemini TTS duration glitch ({out_dur:.1f}s for {len(spoken_text.split())} words)")
@@ -3810,16 +4258,42 @@ async def _synthesize_doc_scene_narration(
                     words_json.write_text(json.dumps(aligned_words, ensure_ascii=False), encoding="utf-8")
                 except Exception:
                     pass
+                _record_meta("gemini_tts", used_model, gem_voice)
                 return out_wav, aligned_words, out_dur
             except Exception as exc:
-                if gem_try == 0:
+                last_gem_exc = exc
+                if gem_try < (max_gem_attempts - 1):
+                    if not allow_edge_fallback and gem_try < len(_GEMINI_LOCKED_RETRY_BACKOFFS_S):
+                        wait_s = float(_GEMINI_LOCKED_RETRY_BACKOFFS_S[gem_try])
+                        print(
+                            f"[NetflixDoc] Gemini locked model '{pinned_tts_model or 'auto'}' transient error on {tag} "
+                            f"(attempt {gem_try + 1}/{max_gem_attempts}): {str(exc)[:110]} -> waiting {wait_s:.1f}s...",
+                            flush=True,
+                        )
+                        if wait_s > 0.0:
+                            await asyncio.sleep(wait_s)
                     continue
-                print(f"[NetflixDoc] Gemini Expressive TTS fallback -> edge-tts ({str(exc)[:110]})", flush=True)
+                if not allow_edge_fallback:
+                    raise RuntimeError(
+                        f"Gemini TTS locked model '{pinned_tts_model or 'auto'}' failed on {tag} after {max_gem_attempts} "
+                        f"attempts — refusing silent Edge-TTS speaker swap: {last_gem_exc}"
+                    ) from last_gem_exc
+                print(f"[NetflixDoc] Gemini Expressive TTS fallback on Scene 0 -> edge-tts ({str(exc)[:110]})", flush=True)
+    elif not allow_edge_fallback and eff_engine in ("gemini_tts", "gemini"):
+        raise RuntimeError(f"Gemini TTS locked on {tag} but GEMINI_API_KEY is unavailable — refusing Edge-TTS speaker swap.")
 
-    # 2. PRIORITY 2: Natural pause-preserving Edge-TTS (never rushed +8% unless explicitly desired)
-    default_v = "en-US-AndrewMultilingualNeural" if is_en else "pt-BR-AntonioNeural"
+    # 2. PRIORITY 2: Natural pause-preserving Edge-TTS (ONLY if Scene 0 started on Edge-TTS or explicitly requested)
+    if is_en:
+        default_v = "en-US-AndrewMultilingualNeural"
+    elif is_es:
+        default_v = "es-MX-JorgeNeural"
+    else:
+        default_v = "pt-BR-AntonioNeural"
     edge_voice_id = voice_id if (voice_id and "Neural" in voice_id) else default_v
-    candidates = [edge_voice_id, default_v, "pt-BR-AntonioNeural", "en-US-AndrewMultilingualNeural"]
+    if pinned_tts_model and "Neural" in str(pinned_tts_model):
+        candidates = [str(pinned_tts_model)]
+    else:
+        candidates = [edge_voice_id, default_v, "pt-BR-AntonioNeural", "en-US-AndrewMultilingualNeural"]
     # Keep documentary speech natural (avoid robotic fast-forward when default "+8%" came from viral shorts UI)
     eff_rate = "+0%" if str(rate or "").strip() in ("", "+8%", "+5%") else str(rate).strip()
     eff_pitch = "-4Hz" if str(pitch or "").strip() in ("", "+0Hz") else str(pitch).strip()
@@ -3848,7 +4322,7 @@ async def _synthesize_doc_scene_narration(
                     raw_mp3,
                     vad_wav,
                     words,
-                    max_pause_s=0.45,
+                    max_pause_s=max(0.35, max_internal_silence_s),
                     consonant_pad_s=0.11,
                     thermal_limit_c=thermal_limit_c,
                     trim_edges_only=True,
@@ -3857,6 +4331,7 @@ async def _synthesize_doc_scene_narration(
                     words_json.write_text(json.dumps(trimmed_words, ensure_ascii=False), encoding="utf-8")
                 except Exception:
                     pass
+                _record_meta("edge_tts", v_try, v_try)
                 return out_wav, trimmed_words, out_dur
         except Exception:
             continue
@@ -3869,6 +4344,7 @@ async def _synthesize_doc_scene_narration(
             words_json.write_text(json.dumps(trimmed_words, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
+        _record_meta("espeak", "espeak_ng", "espeak_ng")
         return out_wav, trimmed_words, out_dur
     except Exception:
         import numpy as np
@@ -3900,6 +4376,7 @@ async def _synthesize_doc_scene_narration(
             words_json.write_text(json.dumps(words, ensure_ascii=False), encoding="utf-8")
         except Exception:
             pass
+        _record_meta("synthetic_fallback", "harmonic_fallback", "synthetic")
         return vad_wav, words, dur_est
 
 
@@ -4925,6 +5402,103 @@ def _draw_fallback_depth_title_behind_subject(
     canvas.drawString(stamp, cx, cy, font, fill_p)
 
 
+_SENTENCE_END_PUNCT_RE = re.compile(r"[.?!…]+[\"”’'\)\]]*$")
+_CLAUSE_END_PUNCT_RE = re.compile(r"[,;:—–]+[\"”’'\)\]]*$")
+
+
+def _compute_sentence_layer_boundaries(
+    scene_words: Optional[List[Dict[str, Any]]],
+    chapter_intro_s: float,
+    slice_start_body_t: float,
+    slice_dur: float,
+    n_layers: int,
+    min_shot_s: float = 1.2,
+) -> List[Tuple[float, float]]:
+    """Compute contiguous `[(t0, t1), ...]` shot boundaries of length `n_layers` covering `[0.0, slice_dur]`,
+    snapping cuts to spoken sentence endings (`.`, `?`, `!`, `…`) or natural inter-word pauses (`>= 0.28s`)
+    inside `scene_words` instead of slicing mid-phrase with blind `slice_dur / n_layers`.
+    """
+    n = max(1, int(n_layers))
+    dur = max(0.4, float(slice_dur))
+    if n == 1:
+        return [(0.0, round(dur, 4))]
+
+    eff_min = min(float(min_shot_s), dur / float(n) * 0.72)
+    ideal_step = dur / float(n)
+
+    # Extract slice-local sentence-end and clause/pause-end cut candidates
+    sentence_cuts: List[float] = []
+    clause_cuts: List[float] = []
+    words_list = list(scene_words or [])
+    offset_s = float(chapter_intro_s) + float(slice_start_body_t)
+    for idx_w, wd in enumerate(words_list):
+        try:
+            w_end = float(wd.get("end", 0.0)) - offset_s
+            w_txt = str(wd.get("word") or "").strip()
+        except Exception:
+            continue
+        if w_end <= eff_min * 0.8 or w_end >= (dur - eff_min * 0.8):
+            continue
+        next_start = None
+        if idx_w + 1 < len(words_list):
+            try:
+                next_start = float(words_list[idx_w + 1].get("start", 0.0)) - offset_s
+            except Exception:
+                next_start = None
+        gap_after = (next_start - w_end) if (next_start is not None) else 0.0
+        cut_t = round(w_end + min(0.08, max(0.0, gap_after * 0.35)), 4)
+        if _SENTENCE_END_PUNCT_RE.search(w_txt):
+            sentence_cuts.append(cut_t)
+        elif _CLAUSE_END_PUNCT_RE.search(w_txt) or gap_after >= 0.28:
+            clause_cuts.append(cut_t)
+
+    cuts: List[float] = [0.0]
+    sent_tol = max(1.6, ideal_step * 0.48)
+    clause_tol = max(1.1, ideal_step * 0.34)
+    for k in range(1, n):
+        prev_t = cuts[-1]
+        lo = prev_t + eff_min
+        hi = dur - float(n - k) * eff_min
+        if hi <= lo:
+            cuts.append(round(min(dur, k * ideal_step), 4))
+            continue
+        ideal_t = max(lo, min(hi, k * ideal_step))
+        chosen: Optional[float] = None
+        valid_sent = [c for c in sentence_cuts if lo <= c <= hi and abs(c - ideal_t) <= sent_tol]
+        if valid_sent:
+            chosen = min(valid_sent, key=lambda c: abs(c - ideal_t))
+        else:
+            valid_clause = [c for c in clause_cuts if lo <= c <= hi and abs(c - ideal_t) <= clause_tol]
+            if valid_clause:
+                chosen = min(valid_clause, key=lambda c: abs(c - ideal_t))
+        cuts.append(round(chosen if chosen is not None else ideal_t, 4))
+    cuts.append(round(dur, 4))
+
+    return [(cuts[i], max(cuts[i] + 0.05, cuts[i + 1])) for i in range(n)]
+
+
+def _resolve_layer_slice_state(
+    n_shots: int,
+    slice_t: float,
+    slice_dur: float,
+    layer_boundaries_s: Optional[List[Tuple[float, float]]] = None,
+) -> Tuple[int, float, float]:
+    """Return `(shot_idx, shot_local_t, shot_dur)` using sentence-aligned `layer_boundaries_s` when provided,
+    falling back to uniform `slice_dur / n_shots` cleanly.
+    """
+    n = max(1, int(n_shots))
+    t_clamped = max(0.0, float(slice_t))
+    if layer_boundaries_s and len(layer_boundaries_s) == n:
+        for idx_b, (b0, b1) in enumerate(layer_boundaries_s):
+            if t_clamped < b1 or idx_b == (n - 1):
+                seg_dur = max(0.25, float(b1) - float(b0))
+                return idx_b, max(0.0, t_clamped - float(b0)), seg_dur
+    shot_dur = max(0.8, float(slice_dur) / float(n))
+    shot_idx = min(n - 1, max(0, int(t_clamped / shot_dur)))
+    shot_local_t = max(0.0, t_clamped - shot_idx * shot_dur)
+    return shot_idx, shot_local_t, shot_dur
+
+
 def _draw_fullbleed_parallax_shot(
     canvas: skia.Canvas,
     w: int,
@@ -4939,11 +5513,13 @@ def _draw_fullbleed_parallax_shot(
     shot_local_t: float = 0.0,
     stamp_text: Optional[str] = None,
     allow_depth_title: bool = True,
+    depth_title_delay_s: float = 0.0,
 ) -> None:
     """Render an unobstructed full-bleed edge-to-edge 2.5D parallax cinema shot (Schema v3.0.0):
       - Counter-directional depth motion: Background `1.06 -> 1.00`, Foreground `1.00 -> 1.14`
-      - Unified `master_color_grade` C++ Skia ColorMatrix applied pre-UI
+      - Pre-graded C++ Skia plates (`_pregrade_skia_image`)
       - 3D Depth Title rendered strictly on Shot 0 (`allow_depth_title=True`) BETWEEN `bg_img` and `fg_img`,
+        delayed by `depth_title_delay_s` (`+0.40s` on non-chapter scenes `s_idx > 0` so xfade never slices it!),
         passing `fg_img` for alpha-aware rule-of-thirds placement (>=88% unoccluded legibility)!
     """
     global _CACHED_FALLBACK_TITLE_TF
@@ -4951,7 +5527,6 @@ def _draw_fullbleed_parallax_shot(
     canvas.clear(skia.ColorSetARGB(255, 11, 14, 21))
     eff_mood = str(getattr(scene, "mood", "dark_horror") or "dark_horror") if scene is not None else "dark_horror"
     p_clamped = max(0.0, min(1.0, float(shot_prog)))
-    grade_paint = _get_master_color_grade_paint()
 
     if bg_img is not None:
         # Counter-directional 2.5D parallax: Background pulls gently 1.06 -> 1.00 while Foreground pushes 1.00 -> 1.14
@@ -4972,8 +5547,8 @@ def _draw_fullbleed_parallax_shot(
             my_m = (mi * 131 - t * (16 + (mi % 3) * 6)) % h
             canvas.drawCircle(mx_m, my_m, 1.8 + (mi % 3) * 1.1, mote_p)
 
-        # Giant 3D Depth Title strictly on Shot 0 (NEVER repeating on Shot 1/2!) right BETWEEN bg_img and fg_img
-        if fg_img is not None and allow_depth_title:
+        # Giant 3D Depth Title strictly on Shot 0 (NEVER repeating on Shot 1/2!), delayed past xfade when requested
+        if fg_img is not None and allow_depth_title and (shot_local_t >= float(depth_title_delay_s or 0.0)):
             resolved_stamp = str(stamp_text or _extract_depth_stamp_text(scene)).strip()
             eff_tf = title_tf
             if eff_tf is None:
@@ -5025,6 +5600,7 @@ def _draw_single_unique_shot_layer(
     title_tf: Optional[skia.Typeface] = None,
     shot_local_t: float = 0.0,
     allow_depth_title: bool = True,
+    depth_title_delay_s: float = 0.0,
 ) -> None:
     """Render one single unique visual shot (moving B-roll, 2.5D u2netp parallax, or Ken Burns bespoke still)."""
     kind, payload = layer
@@ -5069,6 +5645,7 @@ def _draw_single_unique_shot_layer(
             title_tf=title_tf,
             shot_local_t=shot_local_t,
             allow_depth_title=allow_depth_title,
+            depth_title_delay_s=depth_title_delay_s,
         )
     elif kind == "photo_still" and payload is not None:
         _draw_fullbleed_parallax_shot(
@@ -5084,6 +5661,7 @@ def _draw_single_unique_shot_layer(
             title_tf=title_tf,
             shot_local_t=shot_local_t,
             allow_depth_title=False,
+            depth_title_delay_s=0.0,
         )
     else:
         _draw_video_backdrop_layer(
@@ -5115,9 +5693,12 @@ def _draw_unique_shot_slice(
     scene: Optional[NetflixDocScene] = None,
     title_tf: Optional[skia.Typeface] = None,
     allow_scene_depth_title: bool = True,
+    layer_boundaries_s: Optional[List[Tuple[float, float]]] = None,
+    depth_title_delay_s: float = 0.0,
 ) -> None:
     """Step strictly 1-to-1 across `layers` with ZERO modulo wrap-around (`min(n-1, ...)`),
-    firing 3D Depth Title strictly on Shot 0 (`shot_idx == 0 and allow_scene_depth_title`)!
+    aligning cuts to spoken sentence boundaries (`layer_boundaries_s`) when provided and firing
+    3D Depth Title strictly on Shot 0 (`shot_idx == 0 and allow_scene_depth_title`)!
     """
     if not layers:
         _draw_video_backdrop_layer(
@@ -5126,10 +5707,13 @@ def _draw_unique_shot_slice(
         )
         return
     n_shots = len(layers)
-    shot_dur = max(0.8, slice_dur / float(n_shots))
-    shot_idx = min(n_shots - 1, max(0, int(slice_t / shot_dur)))
-    shot_local_t = max(0.0, slice_t - shot_idx * shot_dur)
-    shot_prog = min(1.0, shot_local_t / shot_dur)
+    shot_idx, shot_local_t, shot_dur = _resolve_layer_slice_state(
+        n_shots,
+        slice_t,
+        slice_dur,
+        layer_boundaries_s=layer_boundaries_s,
+    )
+    shot_prog = min(1.0, shot_local_t / max(0.25, shot_dur))
     pan_dir = 1.0 if (shot_idx + s_idx) % 2 == 0 else -1.0
 
     _draw_single_unique_shot_layer(
@@ -5146,6 +5730,7 @@ def _draw_unique_shot_slice(
         title_tf=title_tf,
         shot_local_t=shot_local_t,
         allow_depth_title=(allow_scene_depth_title and shot_idx == 0),
+        depth_title_delay_s=depth_title_delay_s if shot_idx == 0 else 0.0,
     )
 
     if (shot_idx > 0 or cut_flash_on_first) and shot_local_t < 0.11:
@@ -5173,14 +5758,22 @@ def _draw_mode_2d_schematic_over_realism(
 ) -> None:
     """Layer 2 (`2D_Infographic_Over_Realism` — Vox / Johnny Harris):
     Delegates to `engine.pro_motion_graphics.draw_2d_schematic_over_realism` when available,
-    else renders animated 2D tactical reticles, dashed callout vectors, and breakdown bars in
-    `#EAB308`, `#D9381E`, `#F8FAFC` over a 65% brightness desaturated realistic backdrop.
+    passing `body_t`, `is_en`, and `extra_photos` defensively.
     """
     eff_bg = backdrop_img or media.parallax_bg or media.primary_photo
     if draw_2d_schematic_over_realism is not None:
         try:
+            params = inspect.signature(draw_2d_schematic_over_realism).parameters
+            accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            kw: Dict[str, Any] = {}
+            if "body_t" in params or accepts_varkw:
+                kw["body_t"] = body_t
+            if "is_en" in params or accepts_varkw:
+                kw["is_en"] = is_en
+            if "extra_photos" in params or accepts_varkw:
+                kw["extra_photos"] = media.extra_photos
             draw_2d_schematic_over_realism(
-                canvas, w, h, scene, prog, t, title_tf, ui_tf, eff_bg
+                canvas, w, h, scene, prog, t, title_tf, ui_tf, eff_bg, **kw
             )
             return
         except Exception:
@@ -5277,8 +5870,7 @@ def _draw_mode_video_over_video_collage(
 ) -> None:
     """Layer 3 (`Video_Over_Video_PiP` — Floating Archival PiP Collage):
     Delegates to `engine.pro_motion_graphics.draw_video_over_video_collage` when available,
-    else renders dark blurred B-roll/grid (`40%` opacity) with 1-3 floating tilted archival PiP cards
-    (`2px solid rgba(255,255,255,0.18)`, drop shadow, `#FFD700` multiply highlighter wipe).
+    passing `body_t` and `is_en` defensively.
     """
     eff_bg = backdrop_img or media.parallax_bg or media.primary_photo
     pip_cards: List[skia.Image] = []
@@ -5292,8 +5884,15 @@ def _draw_mode_video_over_video_collage(
 
     if draw_video_over_video_collage is not None:
         try:
+            params = inspect.signature(draw_video_over_video_collage).parameters
+            accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            kw: Dict[str, Any] = {}
+            if "body_t" in params or accepts_varkw:
+                kw["body_t"] = body_t
+            if "is_en" in params or accepts_varkw:
+                kw["is_en"] = is_en
             draw_video_over_video_collage(
-                canvas, w, h, scene, prog, t, title_tf, ui_tf, eff_bg, pip_cards
+                canvas, w, h, scene, prog, t, title_tf, ui_tf, eff_bg, pip_cards, **kw
             )
             return
         except Exception:
@@ -5325,7 +5924,6 @@ def _draw_mode_video_over_video_collage(
             for idx in range(n_cards)
         ]
 
-    grade_paint = _get_master_color_grade_paint()
     for c_i, (cx, cy, cw, ch, rot_deg) in enumerate(slots):
         ent = _ease_out_back(max(0.0, min(1.0, (body_t - c_i * 0.14) / 0.42)))
         slide_y = (1.0 - ent) * 48.0
@@ -5400,13 +5998,19 @@ def _draw_mode_fern_3d_reconstruction(
 ) -> None:
     """Layer 4 (`Dark_3D_Reconstruction` — Fern Minimalist 3D Spatial Wireframe & Backlit Silhouette):
     Delegates to `engine.pro_motion_graphics.draw_fern_3d_reconstruction` when available,
-    else renders a `#121417` slate void with orbiting perspective 3D architectural grid, volumetric
-    spotlight cone, backlit subject silhouette, and `#D9381E`/`#EAB308`/`#38BDF8` forensic rings.
+    passing `body_t` and `is_en` defensively.
     """
     if draw_fern_3d_reconstruction is not None:
         try:
+            params = inspect.signature(draw_fern_3d_reconstruction).parameters
+            accepts_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            kw: Dict[str, Any] = {"backdrop_img": backdrop_img, "fg_img": fg_img}
+            if "body_t" in params or accepts_varkw:
+                kw["body_t"] = body_t
+            if "is_en" in params or accepts_varkw:
+                kw["is_en"] = is_en
             draw_fern_3d_reconstruction(
-                canvas, w, h, scene, prog, t, title_tf, ui_tf, backdrop_img=backdrop_img, fg_img=fg_img
+                canvas, w, h, scene, prog, t, title_tf, ui_tf, **kw
             )
             return
         except Exception:
@@ -5489,9 +6093,12 @@ def _draw_mode_cinema_multishot(
     cut_cadence_s: float = 2.6,
     s_idx: int = 0,
     title_tf: Optional[skia.Typeface] = None,
+    layer_boundaries_s: Optional[List[Tuple[float, float]]] = None,
+    depth_title_delay_s: float = 0.0,
 ) -> None:
-    """Cinema v7 Primary Visual Mode: clean, unobstructed FULL-SCREEN ZERO-REPETITION multi-shot storytelling!
-    Always opens on hero 2.5D parallax plate (Shot 0) with 3D Depth Title strictly on Shot 0!
+    """Cinema v8 Primary Visual Mode: clean, unobstructed FULL-SCREEN ZERO-REPETITION multi-shot storytelling!
+    Always opens on hero 2.5D parallax plate (Shot 0) with 3D Depth Title strictly on Shot 0 and
+    sentence-synced visual cuts (`layer_boundaries_s`)!
     """
     layers = list(media.shot_layers or [])
     if not layers:
@@ -5519,6 +6126,8 @@ def _draw_mode_cinema_multishot(
         scene=scene,
         title_tf=title_tf,
         allow_scene_depth_title=True,
+        layer_boundaries_s=layer_boundaries_s,
+        depth_title_delay_s=depth_title_delay_s,
     )
 
 
@@ -5537,10 +6146,12 @@ def _draw_mode_parallax_25d_photo(
     is_en: bool = False,
     body_dur: float = 10.0,
     s_idx: int = 0,
+    layer_boundaries_s: Optional[List[Tuple[float, float]]] = None,
+    depth_title_delay_s: float = 0.0,
 ) -> None:
-    """Mode 4 (Cinema v6): Multi-shot 2.5D u2netp Parallax & Bespoke Cinema cuts across BOTH 16:9 and 9:16!
+    """Mode 4 (Cinema v8): Multi-shot 2.5D u2netp Parallax & Bespoke Cinema cuts across BOTH 16:9 and 9:16!
     NEVER freezes 18s on a single photo and NEVER stretches into a mismatched matte — cuts smoothly across
-    all unique shots in `media.shot_layers` with 3D Depth Titles behind 2.5D subjects!
+    all unique shots in `media.shot_layers` aligned to spoken sentences with 3D Depth Titles behind 2.5D subjects!
     """
     is_wide = w >= h
     if media.shot_layers:
@@ -5558,6 +6169,8 @@ def _draw_mode_parallax_25d_photo(
             cut_flash_on_first=False,
             scene=scene,
             title_tf=title_tf,
+            layer_boundaries_s=layer_boundaries_s,
+            depth_title_delay_s=depth_title_delay_s,
         )
         return
 
@@ -5574,6 +6187,7 @@ def _draw_mode_parallax_25d_photo(
             scene=scene,
             title_tf=title_tf,
             shot_local_t=body_t,
+            depth_title_delay_s=depth_title_delay_s,
         )
         return
 
@@ -6731,6 +7345,20 @@ def _draw_sleek_lower_third(
         _draw_safe_string(canvas, s_str, bx + 26.0, by + 81.0, s_font, skia.Paint(AntiAlias=True, Color=skia.ColorSetARGB(alpha, 244, 239, 230)))
 
 
+def _draw_bottom_legibility_scrim(canvas: skia.Canvas, w: int, h: int) -> None:
+    """Subtle bottom cinema legibility gradient drawn BEFORE lower-third and captions so text stays crisp
+    without dimming the lower-third card itself (Cinema v8 Z-order fix).
+    """
+    scrim = skia.Paint()
+    scrim.setShader(
+        skia.GradientShader.MakeLinear(
+            [(0, h * 0.80), (0, h)],
+            [skia.ColorSetARGB(0, 11, 7, 19), skia.ColorSetARGB(195, 11, 7, 19)],
+        )
+    )
+    canvas.drawRect(skia.Rect.MakeXYWH(0, h * 0.80, w, h * 0.20), scrim)
+
+
 def _draw_doc_subtitles(
     canvas: skia.Canvas,
     w: int,
@@ -6740,10 +7368,15 @@ def _draw_doc_subtitles(
     caption_tf: skia.Typeface,
     caption_style: str = "cinema_minimal",
     mood: str = "dark_horror",
+    lower_third_active: bool = False,
+    lower_third_title: Optional[str] = None,
+    scene_local_t: Optional[float] = None,
+    draw_scrim: bool = False,
 ) -> None:
     """Render studio-grade kinetic documentary subtitles via `engine.kinetic_captions.draw_kinetic_captions`
     using `DARK_CINEMA_PILL_PALETTE` (`#9E1B24` crimson, `#FFD166` gold, `#D97706` amber) when
-    `mood in ('dark_horror', 'epic_history', 'investigative_crime')`.
+    `mood in ('dark_horror', 'epic_history', 'investigative_crime')`, forwarding lower-third awareness
+    (`lower_third_active`, `lower_third_title`, `scene_local_t`) and v3 config font size!
     """
     resolved_style = (
         resolve_caption_style(caption_style)
@@ -6760,34 +7393,40 @@ def _draw_doc_subtitles(
         if norm_mood in ("dark_horror", "epic_history", "investigative_crime")
         else ACTIVE_PILL_PALETTE
     )
+    v3_font_size = _get_v3_caption_font_size(is_wide)
 
-    # Contrast lower-third cinema scrim so kinetic captions stay razor-sharp over moving footage
-    scrim = skia.Paint()
-    scrim.setShader(
-        skia.GradientShader.MakeLinear(
-            [(0, h * 0.80), (0, h)],
-            [skia.ColorSetARGB(0, 11, 7, 19), skia.ColorSetARGB(210, 11, 7, 19)],
-        )
-    )
-    canvas.drawRect(skia.Rect.MakeXYWH(0, h * 0.80, w, h * 0.20), scrim)
+    if draw_scrim:
+        _draw_bottom_legibility_scrim(canvas, w, h)
 
     if draw_kinetic_captions is not None:
-        draw_kinetic_captions(
-            canvas=canvas,
-            chunks=chunks,
-            t=t,
-            w=w,
-            h=h,
-            typeface=caption_tf,
-            style=resolved_style,
-            y_ratio=0.905 if is_wide else 0.84,
-            font_size=58.0 if is_wide else 72.0,
-            palette=active_palette,
-        )
+        kc_kwargs: Dict[str, Any] = {
+            "canvas": canvas,
+            "chunks": chunks,
+            "t": t,
+            "w": w,
+            "h": h,
+            "typeface": caption_tf,
+            "style": resolved_style,
+            "y_ratio": 0.905 if is_wide else 0.84,
+            "font_size": v3_font_size,
+            "palette": active_palette,
+        }
+        try:
+            kc_params = inspect.signature(draw_kinetic_captions).parameters
+            kc_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in kc_params.values())
+            if "lower_third_active" in kc_params or kc_varkw:
+                kc_kwargs["lower_third_active"] = bool(lower_third_active)
+            if "lower_third_title" in kc_params or kc_varkw:
+                kc_kwargs["lower_third_title"] = lower_third_title
+            if "scene_local_t" in kc_params or kc_varkw:
+                kc_kwargs["scene_local_t"] = scene_local_t
+        except Exception:
+            pass
+        draw_kinetic_captions(**kc_kwargs)
         return
 
     # Built-in fallback if kinetic_captions module is unavailable
-    base_size = 58.0 if is_wide else 72.0
+    base_size = v3_font_size
     cap_font = skia.Font(caption_tf, base_size)
     space_w = max(24.0, float(cap_font.measureText(" ")) * 1.42)
     fm = cap_font.getMetrics()
@@ -6865,7 +7504,7 @@ def _compute_bookended_graphic_window(
     cut_cadence_s: float = 2.6,
 ) -> Optional[Tuple[float, float, int]]:
     """Return `(g_start, g_end, pre_count)` when a graphic mode bookends its centerpiece with cinema shots, else `None`.
-    Shared between `_render_single_doc_scene_to_disk` and SFX scheduling so graphic foley aligns to the exact frame!
+    Shared between `_render_single_doc_scene_to_disk`, `_build_edl_timeline_json`, and SFX scheduling!
     """
     if visual_mode not in GRAPHIC_BOOKEND_MODES or body_dur <= 7.2 or n_shot_layers < 2:
         return None
@@ -6875,21 +7514,64 @@ def _compute_bookended_graphic_window(
     pre_dur = max(2.4, min(7.5, (body_dur - g_dur) * 0.36))
     g_start = pre_dur
     g_end = min(body_dur - 2.0, g_start + g_dur)
-    pre_count = max(1, min(n_shot_layers - 1, int(round(pre_dur / max(2.0, float(cut_cadence_s or 2.6))))))
+    raw_pre = int(round(pre_dur / max(2.0, float(cut_cadence_s or 2.6))))
+    max_pre = min(2, n_shot_layers - 2) if n_shot_layers >= 3 else (n_shot_layers - 1)
+    pre_count = max(1, min(max_pre, raw_pre))
     return g_start, g_end, pre_count
+
+
+def _split_bookend_layers(
+    visual_mode: str,
+    layers: List[Any],
+    g_start: float,
+    eff_cadence: float,
+    pre_count: int,
+    card_photo_idx: Optional[int] = None,
+) -> Tuple[List[Any], List[Any]]:
+    """Split `layers` into `(pre_layers, post_layers)` around a bookended centerpiece graphic.
+    Shared by `_render_single_doc_scene_to_disk` and `_build_edl_timeline_json`!
+    Fixes `newspaper_highlighter` post-graphic freeze by NEVER dropping `card_photo_idx` when
+    doing so would leave `len(post_layers) < 2`, and by capping `pre_layers` so `post_layers`
+    keeps at least 2 distinct shots whenever `len(layers) >= 3`.
+    """
+    if not layers:
+        return [], []
+    if len(layers) == 1:
+        return list(layers), list(layers)
+
+    eff_pre = max(1, min(len(layers) - 1, int(pre_count)))
+    if len(layers) >= 3:
+        eff_pre = min(eff_pre, 2, len(layers) - 2)
+
+    if visual_mode == "newspaper_highlighter" and card_photo_idx is not None and 0 <= card_photo_idx < len(layers):
+        non_card = [lyr for i_l, lyr in enumerate(layers) if i_l != card_photo_idx]
+        if len(non_card) >= 3:
+            nc_pre = max(1, min(2, len(non_card) - 2, int(round(g_start / max(2.0, eff_cadence)))))
+            cand_pre = non_card[:nc_pre]
+            cand_post = non_card[nc_pre:]
+            if len(cand_post) >= 2:
+                return cand_pre, cand_post
+        # Never starve post_layers below 2 shots by dropping card_photo_idx!
+    pre_layers = list(layers[:eff_pre])
+    post_layers = list(layers[eff_pre:]) or list(layers[-1:])
+    return pre_layers, post_layers
 
 
 def _active_slice_layer(
     layers: List[Tuple[str, Any]],
     slice_t: float,
     slice_dur: float,
+    layer_boundaries_s: Optional[List[Tuple[float, float]]] = None,
 ) -> Optional[Tuple[str, Any]]:
     """Return the exact layer tuple active at `slice_t` inside `_draw_unique_shot_slice`."""
     if not layers:
         return None
-    n_shots = len(layers)
-    shot_dur = max(0.8, slice_dur / float(n_shots))
-    shot_idx = min(n_shots - 1, max(0, int(slice_t / shot_dur)))
+    shot_idx, _, _ = _resolve_layer_slice_state(
+        len(layers),
+        slice_t,
+        slice_dur,
+        layer_boundaries_s=layer_boundaries_s,
+    )
     return layers[shot_idx]
 
 
@@ -7105,11 +7787,35 @@ def _render_single_doc_scene_to_disk(
     else:
         frame_mv = memoryview(frame_buf)
 
-    chunks = group_words_into_chunks(scene_words, max_words=3)
+    resolved_cap_style = (
+        resolve_caption_style(caption_style)
+        if resolve_caption_style is not None
+        else str(caption_style or "selective_emphasis").strip().lower()
+    )
+    if _kc_group_words_into_chunks is not None:
+        try:
+            kc_grp_params = inspect.signature(_kc_group_words_into_chunks).parameters
+            if "selective" in kc_grp_params:
+                chunks = _kc_group_words_into_chunks(
+                    scene_words,
+                    max_words=3,
+                    selective=(resolved_cap_style == "selective_emphasis"),
+                )
+            else:
+                chunks = _kc_group_words_into_chunks(scene_words, max_words=3)
+        except Exception:
+            chunks = group_words_into_chunks(scene_words, max_words=3)
+    else:
+        chunks = group_words_into_chunks(scene_words, max_words=3)
+
     total_frames = max(1, int(round(scene_dur * fps)))
     exact_dur = total_frames / float(fps)
     body_dur = max(0.5, exact_dur - chapter_intro_s)
     eff_cadence = float(getattr(scene, "cut_cadence_s", None) or cut_cadence_s or 2.6)
+    unifier_cfg = _get_v3_unifier_params()
+    vig_intensity = float(unifier_cfg.get("vignette_intensity", 0.35))
+    grain_op = float(unifier_cfg.get("grain_opacity", 0.14))
+    dust_op = float(unifier_cfg.get("dust_opacity", 0.16))
 
     # Precompute bookended graphic window & non-repeating pre/post layers ONCE before frame loop
     bookend_win = _compute_bookended_graphic_window(
@@ -7123,6 +7829,9 @@ def _render_single_doc_scene_to_disk(
     g_end = 0.0
     pre_layers: List[Tuple[str, Any]] = []
     post_layers: List[Tuple[str, Any]] = []
+    pre_bounds: Optional[List[Tuple[float, float]]] = None
+    post_bounds: Optional[List[Tuple[float, float]]] = None
+    full_bounds: Optional[List[Tuple[float, float]]] = None
     chapter_backdrop_layer: Optional[Tuple[str, Any]] = None
     graphic_backdrop_layer: Optional[Tuple[str, Any]] = None
     if chapter_intro_s > 0.0 and len(loaded_media.shot_layers) >= 2:
@@ -7136,25 +7845,14 @@ def _render_single_doc_scene_to_disk(
                 if k_l in ("photo_25d", "photo_still"):
                     card_photo_idx = i_l
                     break
-        if scene.visual_mode == "newspaper_highlighter" and card_photo_idx is not None:
-            non_card_layers = [
-                lyr for i_l, lyr in enumerate(loaded_media.shot_layers)
-                if i_l != card_photo_idx
-            ]
-            if len(non_card_layers) >= 2:
-                eff_pre = max(1, min(len(non_card_layers) - 1, int(round(g_start / max(2.0, eff_cadence)))))
-                pre_layers = non_card_layers[:eff_pre]
-                post_layers = non_card_layers[eff_pre:] or non_card_layers[-1:]
-            elif len(non_card_layers) == 1:
-                pre_layers = loaded_media.shot_layers[:pre_count]
-                post_layers = non_card_layers
-            else:
-                pre_layers = loaded_media.shot_layers[:pre_count]
-                post_layers = loaded_media.shot_layers[pre_count:] or loaded_media.shot_layers[-1:]
-        else:
-            pre_layers = loaded_media.shot_layers[:pre_count]
-            post_layers = loaded_media.shot_layers[pre_count:] or loaded_media.shot_layers[-1:]
-
+        pre_layers, post_layers = _split_bookend_layers(
+            scene.visual_mode,
+            loaded_media.shot_layers,
+            g_start,
+            eff_cadence,
+            pre_count,
+            card_photo_idx=card_photo_idx,
+        )
         if len(loaded_media.shot_layers) >= 2:
             if chapter_intro_s > 0.0 and not pre_layers:
                 pre_layers = [loaded_media.shot_layers[0]]
@@ -7168,6 +7866,16 @@ def _render_single_doc_scene_to_disk(
                     if cand_lyr is not pre_first:
                         graphic_backdrop_layer = cand_lyr
                         break
+        pre_bounds = _compute_sentence_layer_boundaries(
+            scene_words, chapter_intro_s, 0.0, max(0.4, g_start), len(pre_layers), min_shot_s=1.2
+        )
+        post_bounds = _compute_sentence_layer_boundaries(
+            scene_words, chapter_intro_s, g_end, max(0.4, body_dur - g_end), len(post_layers), min_shot_s=1.2
+        )
+    elif loaded_media.shot_layers:
+        full_bounds = _compute_sentence_layer_boundaries(
+            scene_words, chapter_intro_s, 0.0, body_dur, len(loaded_media.shot_layers), min_shot_s=1.2
+        )
 
     # Show sleek Lower-Third on Scene 0, Chapter Starts, ANY Location/Era Change, or every 4th scene
     cur_lt_norm = _normalize_upper(_clean_doc_text(scene.lower_third_title))
@@ -7179,6 +7887,8 @@ def _render_single_doc_scene_to_disk(
         or location_changed
         or (s_idx % 4 == 0)
     )
+    # Offset Depth Title & Lower-Third start by +0.40s (xfade_dur) on non-chapter scenes s_idx > 0
+    xfade_ui_offset = CINEMA_XFADE_DURATION_S if (s_idx > 0 and chapter_intro_s <= 0.0) else 0.0
 
     # Direct VAAPI hardware suffix (zero CPU lut3d+blend and zero CPU noise bottleneck -> 65-160+ FPS!)
     # Master color grade (+12% contrast, -22% sat, #0D1B2A/#E0C097), 35mm grain & vignette run inside C++ Skia!
@@ -7238,7 +7948,7 @@ def _render_single_doc_scene_to_disk(
             global_t = global_t_offset + local_t
             c = surface.getCanvas()
 
-            # ACT_4_ABRUPT_ENDING: Hard cut to black cleanly after final spoken beat + 0.50s
+            # ACT_4_ABRUPT_ENDING: Hard cut to pure black cleanly after final spoken word + 0.50s hold
             if abrupt_cut_black_at_local_t is not None and local_t >= abrupt_cut_black_at_local_t:
                 c.clear(skia.ColorBLACK)
                 proc.stdin.write(frame_mv if frame_mv is not None else surface.makeImageSnapshot().tobytes())
@@ -7254,11 +7964,11 @@ def _render_single_doc_scene_to_disk(
                 need_primary_video = _layer_needs_primary_video(chapter_backdrop_layer) if chapter_backdrop_layer is not None else True
             elif use_bookended_graphic:
                 if body_t < g_start:
-                    active_lyr = _active_slice_layer(pre_layers, body_t, g_start)
+                    active_lyr = _active_slice_layer(pre_layers, body_t, g_start, layer_boundaries_s=pre_bounds)
                     need_primary_video = _layer_needs_primary_video(active_lyr)
                     need_pip_video = (active_lyr is not None and active_lyr[0] == "video_secondary")
                 elif body_t >= g_end:
-                    active_lyr = _active_slice_layer(post_layers, body_t - g_end, max(0.4, body_dur - g_end))
+                    active_lyr = _active_slice_layer(post_layers, body_t - g_end, max(0.4, body_dur - g_end), layer_boundaries_s=post_bounds)
                     need_primary_video = _layer_needs_primary_video(active_lyr)
                     need_pip_video = (active_lyr is not None and active_lyr[0] == "video_secondary")
                 else:
@@ -7266,7 +7976,7 @@ def _render_single_doc_scene_to_disk(
                     need_pip_video = scene.visual_mode in ("dark_map_route", "video_over_video_collage")
             elif scene.visual_mode in ("cinema_multishot", "parallax_25d_photo"):
                 if loaded_media.shot_layers:
-                    active_lyr = _active_slice_layer(loaded_media.shot_layers, body_t, body_dur)
+                    active_lyr = _active_slice_layer(loaded_media.shot_layers, body_t, body_dur, layer_boundaries_s=full_bounds)
                     need_primary_video = _layer_needs_primary_video(active_lyr)
                     need_pip_video = (active_lyr is not None and active_lyr[0] == "video_secondary")
                 else:
@@ -7308,8 +8018,9 @@ def _render_single_doc_scene_to_disk(
                     ken_burns_zoom=0.04,
                     show_grid=False,
                     show_dust=False,
+                    apply_master_grade=(chapter_backdrop is primary_frame),
                 )
-                _draw_visual_cohesion_unifier_overlay(c, w, h, fi, global_t, vignette_intensity=0.35, grain_opacity=0.14, dust_opacity=0.16)
+                _draw_visual_cohesion_unifier_overlay(c, w, h, fi, global_t, vignette_intensity=vig_intensity, grain_opacity=grain_op, dust_opacity=dust_op)
                 _draw_chapter_card_overlay(
                     c,
                     w,
@@ -7334,12 +8045,14 @@ def _render_single_doc_scene_to_disk(
                         _draw_unique_shot_slice(
                             c, w, h, pre_layers, body_t, g_start, global_t, primary_frame, pip_frame,
                             s_idx=s_idx, scene=scene, title_tf=title_tf, allow_scene_depth_title=True,
+                            layer_boundaries_s=pre_bounds, depth_title_delay_s=xfade_ui_offset,
                         )
                     elif body_t >= g_end:
                         _draw_unique_shot_slice(
                             c, w, h, post_layers, body_t - g_end, max(0.4, body_dur - g_end), global_t,
                             primary_frame, pip_frame, s_idx=s_idx + 1, cut_flash_on_first=True,
                             scene=scene, title_tf=title_tf, allow_scene_depth_title=False,
+                            layer_boundaries_s=post_bounds, depth_title_delay_s=0.0,
                         )
                     else:
                         g_t = body_t - g_start
@@ -7365,6 +8078,7 @@ def _render_single_doc_scene_to_disk(
                     _draw_mode_cinema_multishot(
                         c, w, h, scene, prog, body_t, body_dur, global_t, primary_frame, pip_frame, loaded_media,
                         cut_cadence_s=eff_cadence, s_idx=s_idx, title_tf=title_tf,
+                        layer_boundaries_s=full_bounds, depth_title_delay_s=xfade_ui_offset,
                     )
                 elif scene.visual_mode == "broll_video_pip":
                     _draw_mode_broll_video_pip(c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, pip_frame, loaded_media, is_en=is_en)
@@ -7388,14 +8102,47 @@ def _render_single_doc_scene_to_disk(
                     _draw_mode_parallax_25d_photo(
                         c, w, h, scene, prog, body_t, global_t, title_tf, ui_tf, fallback_backdrop, loaded_media,
                         is_en=is_en, body_dur=body_dur, s_idx=s_idx,
+                        layer_boundaries_s=full_bounds, depth_title_delay_s=xfade_ui_offset,
                     )
 
-                # Visual Cohesion Unifier Stack (vignette 0.35 + 35mm film grain 0.14 + dust motes 0.16)
-                _draw_visual_cohesion_unifier_overlay(c, w, h, fi, global_t, vignette_intensity=0.35, grain_opacity=0.14, dust_opacity=0.16)
+                # Visual Cohesion Unifier Stack (config-driven vignette 0.35 + 35mm film grain 0.14 + dust motes 0.16)
+                _draw_visual_cohesion_unifier_overlay(c, w, h, fi, global_t, vignette_intensity=vig_intensity, grain_opacity=grain_op, dust_opacity=dust_op)
 
-                if show_lower_third:
-                    _draw_sleek_lower_third(c, w, h, scene, body_t, body_dur, title_tf, ui_tf, max_display_s=3.8)
-                _draw_doc_subtitles(c, w, h, chunks, local_t, caption_tf, caption_style=caption_style, mood=scene.mood)
+                # Cinema v8 Z-order: bottom legibility scrim BEFORE lower-third, drawn ONLY when lower-third or caption is visible!
+                lt_t = body_t - xfade_ui_offset
+                lt_visible = bool(show_lower_third and 0.0 <= lt_t < 3.8)
+                caption_visible = (resolved_cap_style != "none") and any(
+                    float(ch.get("start", 0.0)) <= local_t <= float(ch.get("end", 0.0))
+                    for ch in chunks
+                )
+                if lt_visible or caption_visible:
+                    _draw_bottom_legibility_scrim(c, w, h)
+                if lt_visible:
+                    _draw_sleek_lower_third(
+                        c,
+                        w,
+                        h,
+                        scene,
+                        lt_t,
+                        max(0.5, body_dur - xfade_ui_offset),
+                        title_tf,
+                        ui_tf,
+                        max_display_s=3.8,
+                    )
+                _draw_doc_subtitles(
+                    c,
+                    w,
+                    h,
+                    chunks,
+                    local_t,
+                    caption_tf,
+                    caption_style=resolved_cap_style,
+                    mood=scene.mood,
+                    lower_third_active=lt_visible,
+                    lower_third_title=scene.lower_third_title,
+                    scene_local_t=body_t,
+                    draw_scrim=False,
+                )
 
             # Subtle 3px archival crimson-gold progress thread (#D9381E -> #EAB308, alpha 170)
             bar_w = max(6.0, w * min(1.0, global_t / max(0.1, total_est_dur)))
@@ -7569,10 +8316,12 @@ def _prefetch_scene_media_sync(
             "cinematic overhead archival mystery frame of",
         )
 
-    # Long-Form Hybrid Archival + Bespoke AI Matrix (v3.0.0):
-    # When len(scenes) >= 15, cap n_seq_photos to 5 per scene (~4.4s avg shot length with B-roll + 11.5s graphic),
-    # route Slot 0 (Hero 2.5D Parallax Opener) to ONE fast Google Flow Pro (Nano Banana 2.1, 16:9) batch (25 prompts),
-    # and route Slots 1..4 to Priority 1 Wikimedia Commons Public Domain / CC0 historical paintings & engravings!
+    # Long-Form Hybrid Archival + Bespoke AI Matrix (Cinema v8):
+    # - Exempt `ACT_0_COLD_OPEN_HOOK` from the 5-shot cap so Cold Open achieves fast 2.2-2.8s cuts!
+    # - Route Hero Slot 0 + Slot 1 narrative/action beats (~2 plates/scene = ~50 plates across rotated projects,
+    #   and Slots 0..3 in Cold Open) to batched Google Flow Pro 16:9!
+    # - Route archival beats to strict-Vision Wikimedia Commons with per-beat queries derived from `shot_prompts_en[sh_i]`,
+    #   failing over to batched Google Flow Pro instead of off-topic stock!
     is_long_form = len(scenes) >= 15
 
     for s_idx, sc in enumerate(scenes):
@@ -7582,16 +8331,17 @@ def _prefetch_scene_media_sync(
         item = assets_list[s_idx]
         sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
         mood_defaults = _OPEN_TOPIC_FALLBACK_MEDIA.get(sc_mood, _OPEN_TOPIC_FALLBACK_MEDIA["epic_history"])
+        is_cold_open = str(getattr(sc, "act_id", "") or "") == "ACT_0_COLD_OPEN_HOOK"
         target_shots = (
             max(3, min(12, int(scene_shot_counts[s_idx])))
             if (scene_shot_counts and s_idx < len(scene_shot_counts))
             else 4
         )
-        n_seq_photos = max(3, target_shots - (1 if item.primary_broll_mp4 else 0))
+        n_seq_photos = max(3, target_shots - (1 if (item.primary_broll_mp4 and sc.visual_mode not in GRAPHIC_BOOKEND_MODES) else 0))
         if is_long_form:
-            n_seq_photos = min(5, n_seq_photos)
+            n_seq_photos = min(10, n_seq_photos) if is_cold_open else min(5, n_seq_photos)
 
-        # Build an ordered list of rich, chronological, scene-specific English visual prompts
+        # Preserve exact chronological `shot_prompts_en[0..N]` order (Slot 0 = opening beat, Slot 1 = beat 2, etc.)
         prompt_candidates: List[str] = []
         for sp in list(getattr(sc, "shot_prompts_en", None) or []):
             sp_c = str(sp or "").strip()
@@ -7604,7 +8354,10 @@ def _prefetch_scene_media_sync(
             if is_vertical:
                 bp_c = _enforce_vertical_prompt_framing(bp_c)
             if bp_c and bp_c.lower() not in {x.lower() for x in prompt_candidates}:
-                prompt_candidates.insert(0, bp_c)
+                if not prompt_candidates:
+                    prompt_candidates.append(bp_c)
+                else:
+                    prompt_candidates.insert(0, bp_c)
 
         fallback_queries = [q for q in [sc.photo_query_en, *(sc.extra_photo_queries_en or [])] if str(q or "").strip()]
         if not fallback_queries:
@@ -7626,10 +8379,10 @@ def _prefetch_scene_media_sync(
             prompt_candidates.append(p_gen)
 
         specs_for_scene: List[Dict[str, Any]] = []
+        flow_slots_limit = 4 if is_cold_open else 2  # Hero Slot 0 + Slot 1 in normal long-form scenes (~50 plates total)
         for sh_i in range(n_seq_photos):
-            p_txt = prompt_candidates[sh_i]
-            if is_vertical:
-                p_txt = _enforce_vertical_prompt_framing(p_txt)
+            raw_beat_prompt = prompt_candidates[sh_i]
+            p_txt = _enforce_vertical_prompt_framing(raw_beat_prompt) if is_vertical else raw_beat_prompt
             # Mandatory Historical Era-Lock before Google Flow generation (blocks modern police/cars/hoodies/LEDs!)
             if sc_mood in ("dark_horror", "epic_history"):
                 p_txt = _enforce_historical_era_prompt_lock(p_txt, sc.lower_third_title, sc.lower_third_subtitle)
@@ -7639,13 +8392,12 @@ def _prefetch_scene_media_sync(
 
             slot_key = f"sc{s_idx:02d}_shot{sh_i:02d}"
             out_p = work_dir / f"flow_{slot_key}.jpg"
-            # In long-form hybrid allocation, Slot 0 = bespoke Flow Hero and Slots 1..4 map 1-to-1
-            # onto all 4 unique historical archival queries [photo_query_en, extra_0, extra_1, extra_2]!
-            is_flow_hero_slot = (not is_long_form) or (sh_i == 0)
-            fb_q = (
-                fallback_queries[(sh_i - 1) % len(fallback_queries)]
-                if (is_long_form and sh_i >= 1)
-                else fallback_queries[sh_i % len(fallback_queries)]
+            is_flow_hero_slot = (not is_long_form) or (sh_i < flow_slots_limit)
+            base_fb_q = fallback_queries[sh_i % len(fallback_queries)]
+            # Derive clean beat-matched archival query from this shot's own chronological prompt!
+            beat_archival_q = _derive_archival_query_from_shot_prompt(
+                raw_beat_prompt,
+                fallback_query=base_fb_q,
             )
             cached_p = _find_cached_slot_photo(work_dir, slot_key, min_bytes=12_000) if resume else None
             spec = {
@@ -7654,8 +8406,8 @@ def _prefetch_scene_media_sync(
                 "source_tier": "flow_hero" if is_flow_hero_slot else "wikimedia_archival",
                 "role": "shot",
                 "prompt_en": p_txt,
-                "fallback_query": fb_q,
-                "alt_query": fallback_queries[0],
+                "fallback_query": beat_archival_q or base_fb_q,
+                "alt_query": base_fb_q if (beat_archival_q and beat_archival_q != base_fb_q) else fallback_queries[0],
                 "out_path": out_p,
                 "cached": cached_p,
             }
@@ -7665,10 +8417,10 @@ def _prefetch_scene_media_sync(
 
         scene_slot_specs.append(specs_for_scene)
 
-    # Execute ONE single Google Flow Pro (`Nano Banana 2.1`) batch session for ALL bespoke hero shots!
+    # Execute ONE single Google Flow Pro (`Nano Banana 2.1`) batch session for ALL bespoke hero beats!
     flow_results: Dict[str, Path] = {}
     if batch_items:
-        mode_lbl = "Long-Form Hybrid Hero Opener (Slot 0)" if is_long_form else "Full Bespoke"
+        mode_lbl = "Long-Form Hybrid Hero Slots 0+1" if is_long_form else "Full Bespoke"
         print(
             f"[NetflixDoc] [{mode_lbl}] Generating {len(batch_items)} unique era-locked {aspect_ratio} cinema stills via Google Flow Pro (Nano Banana 2.1)...",
             flush=True,
@@ -7684,56 +8436,61 @@ def _prefetch_scene_media_sync(
         )
 
     # -------------------------------------------------------------------------
-    # PHASE C: Assemble strictly UNIQUE, NON-REPEATING `shot_sequence` per scene
-    # - Slot 0 (`flow_hero`): Screen Flow plates for historical anachronisms
-    # - Slots 1..4 (`wikimedia_archival` in long-form): Priority 1 Wikimedia Commons
-    #   Public Domain / CC0 archival paintings & portraits first, falling back to
-    #   `fetch_doc_hero_or_archival_photo` if Wikimedia yields < 2 plates for the scene!
+    # PHASE C: Strict-Vision Screening + Wikimedia Archival + Flow Pro Failover
+    # - ALWAYS pass `strict_vision=True` (zero fail-open bypass!).
+    # - Unlink Vision-rejected `flow_sc*_shot*.jpg` files so resume runs never reload them!
+    # - Collect slots that fail strict-Vision Wikimedia into a batched Flow Pro failover pass
+    #   instead of polluting historical scenes with off-topic stock!
     # -------------------------------------------------------------------------
     anachronism_rejections = 0
     wikimedia_archival_count = 0
+    scene_slot_resolved: List[List[Optional[Path]]] = []
+    flow_failover_items: List[Dict[str, Any]] = []
+    flow_failover_refs: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+
     for s_idx, sc in enumerate(scenes):
         if s_idx in skip_set:
+            scene_slot_resolved.append([])
             continue
-        item = assets_list[s_idx]
         sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
-        scene_photos: List[Path] = []
-        wiki_hits_for_scene = 0
         _, is_pre_modern = _extract_historical_era_lock(sc.lower_third_title, sc.lower_third_subtitle, sc.narration)
+        resolved_slots: List[Optional[Path]] = [None] * len(scene_slot_specs[s_idx])
 
-        for spec in scene_slot_specs[s_idx]:
+        for slot_pos, spec in enumerate(scene_slot_specs[s_idx]):
             key = spec["key"]
             is_archival_slot = spec.get("source_tier") == "wikimedia_archival"
             ppath: Optional[Path] = spec["cached"] or flow_results.get(key)
             if ppath is not None and Path(ppath).exists():
                 flow_ok = True
                 if (not is_archival_slot) and sc_mood in ("dark_horror", "epic_history") and is_pre_modern:
-                    # Gemini Vision anachronism screening on bespoke Flow plates (rejects modern police/vans/hoodies!)
+                    # STRICT Vision anachronism screening on bespoke Flow plates (rejects modern police/vans/hoodies!)
                     ok_ana, ana_sc, ana_why = verify_historical_anachronism_vision(
                         Path(ppath),
                         query=spec["prompt_en"],
                         lower_third_title=sc.lower_third_title,
                         lower_third_subtitle=sc.lower_third_subtitle,
                         mood=sc_mood,
-                        strict_vision=False,
+                        strict_vision=True,
                     )
                     if not ok_ana and ana_why != "no_vision_key":
                         anachronism_rejections += 1
                         flow_ok = False
                         print(
                             f"[NetflixDoc] Vision REJECTED anachronistic Flow plate {Path(ppath).name} "
-                            f"({ana_sc}/10: {ana_why}) -> replacing via Wikimedia Commons!",
+                            f"({ana_sc}/10: {ana_why}) -> unlinking & replacing cleanly!",
                             flush=True,
                         )
+                        try:
+                            if Path(ppath).name.startswith("flow_"):
+                                Path(ppath).unlink(missing_ok=True)
+                        except Exception:
+                            pass
                 if flow_ok and _register_dhash(Path(ppath)):
-                    scene_photos.append(Path(ppath))
+                    resolved_slots[slot_pos] = Path(ppath)
                     photos_used.append(str(ppath))
                     continue
 
-            # Priority 1 Free Archival Source: Wikimedia Commons API (PD/CC0 historical paintings first!)
-            # For long-form archival slots (sh_i >= 1), use fast PD-first mode (`strict_vision=False`, which still
-            # runs anachronism Vision on any non-PD CC-BY photo!) to avoid 200 sequential Vision/Flow bottlenecks.
-            wiki_strict = not is_archival_slot
+            # Priority 1 Free Archival Source: Wikimedia Commons API — ALWAYS `strict_vision=True`!
             wiki_path = fetch_wikimedia_commons_archival_photo(
                 query_en=spec["fallback_query"],
                 out_dir=work_dir,
@@ -7743,9 +8500,9 @@ def _prefetch_scene_media_sync(
                 mood=sc_mood,
                 used_urls=used_photo_urls,
                 used_dhashes=used_dhashes,
-                strict_vision=wiki_strict,
+                strict_vision=True,
             )
-            if (wiki_path is None) and is_archival_slot and spec.get("alt_query") and spec["alt_query"] != spec["fallback_query"]:
+            if (wiki_path is None) and spec.get("alt_query") and spec["alt_query"] != spec["fallback_query"]:
                 wiki_path = fetch_wikimedia_commons_archival_photo(
                     query_en=spec["alt_query"],
                     out_dir=work_dir,
@@ -7755,22 +8512,80 @@ def _prefetch_scene_media_sync(
                     mood=sc_mood,
                     used_urls=used_photo_urls,
                     used_dhashes=used_dhashes,
-                    strict_vision=False,
+                    strict_vision=True,
                 )
             if wiki_path is not None and wiki_path.exists():
                 wikimedia_archival_count += 1
-                wiki_hits_for_scene += 1
-                scene_photos.append(wiki_path)
+                resolved_slots[slot_pos] = wiki_path
                 photos_used.append(str(wiki_path))
                 continue
 
-            # Secondary Vision-verified archival fallback:
-            # Always run for Hero Slot 0 or short-form; in long-form archival slots, run whenever Wikimedia returned < 2 results!
-            if (not is_archival_slot) or (wiki_hits_for_scene < 2) or (len(scene_photos) < 3):
+            # Queue unresolved slot for batched Google Flow Pro failover instead of off-topic stock!
+            fail_key = f"{key}_retry"
+            fail_out = work_dir / f"flow_{key}.jpg"
+            flow_failover_items.append({"key": fail_key, "prompt_en": spec["prompt_en"], "out_path": fail_out})
+            flow_failover_refs[fail_key] = (s_idx, slot_pos, spec)
+
+        scene_slot_resolved.append(resolved_slots)
+
+    # PHASE C2: Batched Google Flow Pro failover for Wikimedia/Vision misses
+    if flow_failover_items:
+        print(
+            f"[NetflixDoc] [Flow Failover] Generating {len(flow_failover_items)} strict era-locked {aspect_ratio} replacement plates via Google Flow Pro...",
+            flush=True,
+        )
+        failover_results = generate_flow_batch_images_sync(
+            flow_failover_items,
+            aspect_ratio=aspect_ratio,
+            mood=mood,
+        )
+        for fail_key, (s_idx, slot_pos, spec) in flow_failover_refs.items():
+            sc = scenes[s_idx]
+            sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
+            _, is_pre_modern = _extract_historical_era_lock(sc.lower_third_title, sc.lower_third_subtitle, sc.narration)
+            fpath = failover_results.get(fail_key)
+            if fpath is not None and Path(fpath).exists():
+                f_ok = True
+                if sc_mood in ("dark_horror", "epic_history") and is_pre_modern:
+                    ok_ana, ana_sc, ana_why = verify_historical_anachronism_vision(
+                        Path(fpath),
+                        query=spec["prompt_en"],
+                        lower_third_title=sc.lower_third_title,
+                        lower_third_subtitle=sc.lower_third_subtitle,
+                        mood=sc_mood,
+                        strict_vision=True,
+                    )
+                    if not ok_ana and ana_why != "no_vision_key":
+                        anachronism_rejections += 1
+                        f_ok = False
+                        try:
+                            Path(fpath).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                if f_ok and _register_dhash(Path(fpath)):
+                    scene_slot_resolved[s_idx][slot_pos] = Path(fpath)
+                    flow_results[fail_key] = Path(fpath)
+                    photos_used.append(str(fpath))
+
+    # Assemble chronological `shot_sequence` per scene (Slot 0 & Slot 1 protected; B-roll NEVER blindly injected at seq[1]!)
+    for s_idx, sc in enumerate(scenes):
+        if s_idx in skip_set:
+            continue
+        item = assets_list[s_idx]
+        sc_mood = str(getattr(sc, "mood", None) or mood or "corporate_thriller")
+        scene_photos: List[Path] = [p for p in scene_slot_resolved[s_idx] if p is not None and p.exists()]
+
+        # Last-resort strict-Vision archival fallback ONLY if a scene still has fewer than 3 resolved plates
+        if len(scene_photos) < 3:
+            for slot_pos, spec in enumerate(scene_slot_specs[s_idx]):
+                if len(scene_photos) >= 3:
+                    break
+                if scene_slot_resolved[s_idx][slot_pos] is not None:
+                    continue
                 fb_path = fetch_doc_hero_or_archival_photo(
                     spec["fallback_query"],
                     work_dir,
-                    key,
+                    spec["key"],
                     min_width=640,
                     used_urls=used_photo_urls,
                     mood=sc_mood,
@@ -7794,18 +8609,13 @@ def _prefetch_scene_media_sync(
             else:
                 item.extra_photo_paths = list(scene_photos[1:])
 
-        # ALWAYS open every scene on its strongest hero 2.5D parallax plate (Shot 0 = hero photo, NEVER weak stock B-roll!)
-        seq: List[Tuple[str, Path]] = []
-        if item.primary_broll_mp4 is not None and scene_photos:
-            seq.append(("photo", scene_photos[0]))
-            seq.append(("video", item.primary_broll_mp4))
-            for p_rem in scene_photos[1:]:
-                seq.append(("photo", p_rem))
-        elif scene_photos:
-            for p_rem in scene_photos:
-                seq.append(("photo", p_rem))
-        elif item.primary_broll_mp4 is not None:
-            seq.append(("video", item.primary_broll_mp4))
+        # ALWAYS preserve chronological hero plates (Slot 0, Slot 1, ...) — NEVER blindly splice primary_broll_mp4 at seq[1]!
+        seq: List[Tuple[str, Path]] = [("photo", p_item) for p_item in scene_photos]
+        if item.primary_broll_mp4 is not None:
+            if not seq:
+                seq.append(("video", item.primary_broll_mp4))
+            elif sc.visual_mode not in GRAPHIC_BOOKEND_MODES or len(seq) < 3:
+                seq.append(("video", item.primary_broll_mp4))
 
         item.shot_sequence = seq
         print(
@@ -7816,8 +8626,8 @@ def _prefetch_scene_media_sync(
 
     # -------------------------------------------------------------------------
     # PHASE D: Era-Matched Global Hero Plates for `sliding_timeline` & `red_string_board`
-    # Guarantees Saturnalia gets the Saturnalia plate, Sol Invictus gets 274/336 AD,
-    # São Nicolau gets Myra, Krampus gets Krampus — NEVER duplicating King Charles II!
+    # Binds matching historical hero plates into BOTH `extra_photo_paths` AND sequential
+    # `shot_sequence` `post_layers` (e.g. S23/S24 recaps) — NEVER duplicating off-era stills!
     # -------------------------------------------------------------------------
     global_hero_photos_by_scene: List[Optional[Path]] = []
     for s_idx, sc in enumerate(scenes):
@@ -7858,8 +8668,9 @@ def _bind_global_era_matched_board_and_timeline_photos(
     assets_list: List[SceneMediaAssets],
     global_hero_photos_by_scene: List[Optional[Path]],
 ) -> None:
-    """Populate `item.extra_photo_paths` for every `sliding_timeline` and `red_string_board` scene
-    with the ACTUAL matching historical scene hero plates corresponding to each milestone/node!
+    """Populate `item.extra_photo_paths` AND bind sequential era-matched hero plates into `item.shot_sequence`
+    (for `post_layers` in recap scenes like S23 `sliding_timeline` and S24 `red_string_board`) with the ACTUAL
+    matching historical scene hero plates corresponding to each milestone/node!
     """
     available_pairs: List[Tuple[int, Path, str]] = []
     for idx_s, (sc, hero_p) in enumerate(zip(scenes, global_hero_photos_by_scene)):
@@ -7927,6 +8738,21 @@ def _bind_global_era_matched_board_and_timeline_photos(
                 matched_paths.append(picked)
         if matched_paths:
             item.extra_photo_paths = matched_paths
+            # Bind era-matched hero plates sequentially into recap `shot_sequence` (preserving Slot 0 hero plate,
+            # feeding post_layers with chronological historical milestone plates instead of off-era fillers!)
+            new_seq: List[Tuple[str, Path]] = []
+            seen_seq_keys: Set[str] = set()
+            if item.primary_photo_path is not None and Path(item.primary_photo_path).exists():
+                hero0 = Path(item.primary_photo_path)
+                new_seq.append(("photo", hero0))
+                seen_seq_keys.add(str(hero0.resolve()))
+            for mp in matched_paths:
+                mp_key = str(mp.resolve()) if mp.exists() else str(mp)
+                if mp_key not in seen_seq_keys:
+                    new_seq.append(("photo", mp))
+                    seen_seq_keys.add(mp_key)
+            if len(new_seq) >= 2:
+                item.shot_sequence = new_seq
 
 
 def _pick_sfx(sfx_dir: Path, *names: str) -> Optional[Path]:
@@ -7947,6 +8773,12 @@ def _select_doc_music_bed(
     if isinstance(music_mp3, str) and music_mp3.strip().lower() == "none":
         return None
 
+    # Always honor an explicitly forced music file if it exists on disk!
+    if music_mp3 is not None and str(music_mp3).strip().lower() not in ("", "auto"):
+        p_forced = Path(music_mp3)
+        if p_forced.exists() and p_forced.is_file():
+            return p_forced
+
     music_dir = ASSETS_DIR / "music"
     mood = str(plan_obj.mood or _classify_topic_mood(plan_obj.title)).strip().lower()
 
@@ -7959,10 +8791,6 @@ def _select_doc_music_bed(
                     upgraded_path = Path(got)
             except Exception as exc:
                 print(f"[NetflixDoc] ensure_upgraded_dark_horror_music fallback: {exc}", flush=True)
-        if music_mp3 is not None and str(music_mp3).strip().lower() not in ("", "auto"):
-            p_forced = Path(music_mp3)
-            if p_forced.exists() and p_forced.name not in ("epic_doc.mp3", "dark_pulse.mp3", "dark_mystery_horror.mp3"):
-                return p_forced
         if upgraded_path is not None:
             return upgraded_path
         cand = music_dir / "dark_mystery_horror.mp3"
@@ -7974,11 +8802,6 @@ def _select_doc_music_bed(
             except Exception:
                 pass
         return music_dir / "dark_pulse.mp3"
-
-    if music_mp3 is not None and str(music_mp3).strip().lower() not in ("", "auto"):
-        p_forced = Path(music_mp3)
-        if p_forced.exists():
-            return p_forced
 
     if mood == "corporate_thriller":
         cand = music_dir / "dark_pulse.mp3"
@@ -8231,17 +9054,46 @@ def _build_edl_timeline_json(
             else ("Slower reflective coda fading out abruptly 0.50s after final word" if sc.act_id == "ACT_4_ABRUPT_ENDING" else "Evolving 4-movement documentary score (-23 dB base, auto-ducked to -28 dB under voice)")
         )
 
-        # Build shot-level EDL entries across pre-graphic, centerpiece graphic, and post-graphic slices (or multi-shot)
+        # Build shot-level EDL entries using the EXACT same `_split_bookend_layers` and
+        # sentence-synced `_compute_sentence_layer_boundaries` as `_render_single_doc_scene_to_disk`!
+        local_words = list(rec.get("local_words") or [])
         slices: List[Tuple[float, float, str, str, str, str, str, str]] = []
         if bookend_w is not None:
             g_start, g_end, pre_cnt = bookend_w
-            pre_shots = seq[:pre_cnt] or [("photo", Path("hero"))]
-            post_shots = seq[pre_cnt:] or seq[-1:] or [("photo", Path("still"))]
-            # Pre-graphic shots
-            pre_sd = max(0.4, g_start / float(len(pre_shots)))
+            card_idx = None
+            if sc.visual_mode == "newspaper_highlighter":
+                for i_s0, (k_s0, p_s0) in enumerate(seq):
+                    if k_s0 == "photo" and assets.primary_photo_path is not None:
+                        try:
+                            if Path(p_s0).resolve() == Path(assets.primary_photo_path).resolve():
+                                card_idx = i_s0
+                                break
+                        except Exception:
+                            if Path(p_s0) == Path(assets.primary_photo_path):
+                                card_idx = i_s0
+                                break
+                if card_idx is None:
+                    for i_s0, (k_s0, _) in enumerate(seq):
+                        if k_s0 == "photo":
+                            card_idx = i_s0
+                            break
+            pre_shots, post_shots = _split_bookend_layers(
+                sc.visual_mode,
+                seq or [("photo", Path("hero"))],
+                g_start,
+                cad,
+                pre_cnt,
+                card_photo_idx=card_idx,
+            )
+            pre_shots = pre_shots or [("photo", Path("hero"))]
+            post_shots = post_shots or [("photo", Path("still"))]
+            pre_bnds = _compute_sentence_layer_boundaries(
+                local_words, ch_intro, 0.0, max(0.4, g_start), len(pre_shots), min_shot_s=1.2
+            )
             for i_p, (k_p, _) in enumerate(pre_shots):
-                t0 = body_start + i_p * pre_sd
-                t1 = body_start + (i_p + 1) * pre_sd
+                b0, b1 = pre_bnds[i_p]
+                t0 = body_start + b0
+                t1 = body_start + b1
                 vcat = "Atmospheric_B_Roll" if k_p == "video" else "2.5D_Parallax"
                 cam = "0.85x slow-motion push-in 1.00->1.09" if k_p == "video" else "Counter-directional 2.5D parallax (BG 1.06->1.00, FG 1.00->1.14)"
                 slices.append((
@@ -8268,10 +9120,13 @@ def _build_edl_timeline_json(
             ))
             # Post-graphic shots
             post_dur = max(0.4, body_dur - g_end)
-            post_sd = max(0.4, post_dur / float(len(post_shots)))
+            post_bnds = _compute_sentence_layer_boundaries(
+                local_words, ch_intro, g_end, post_dur, len(post_shots), min_shot_s=1.2
+            )
             for i_q, (k_q, _) in enumerate(post_shots):
-                t0 = body_start + g_end + i_q * post_sd
-                t1 = body_start + g_end + (i_q + 1) * post_sd
+                b0, b1 = post_bnds[i_q]
+                t0 = body_start + g_end + b0
+                t1 = body_start + g_end + b1
                 vcat = "Atmospheric_B_Roll" if k_q == "video" else "2.5D_Parallax"
                 cam = "0.85x slow-motion drift" if k_q == "video" else "Slow Ken Burns push 1.00->1.07"
                 slices.append((
@@ -8282,11 +9137,14 @@ def _build_edl_timeline_json(
                     cam, "Light leak" if i_q == 0 else "Hard cut",
                 ))
         else:
-            sd = max(0.5, body_dur / float(n_shots))
+            full_bnds = _compute_sentence_layer_boundaries(
+                local_words, ch_intro, 0.0, body_dur, n_shots, min_shot_s=1.2
+            )
             for i_s in range(n_shots):
                 k_s = seq[i_s][0] if i_s < len(seq) else "photo"
-                t0 = body_start + i_s * sd
-                t1 = body_start + (i_s + 1) * sd
+                b0, b1 = full_bnds[i_s]
+                t0 = body_start + b0
+                t1 = body_start + b1
                 vcat = "Atmospheric_B_Roll" if k_s == "video" else _resolve_visual_category(sc.visual_mode, is_broll_shot=False)
                 cam = (
                     "0.85x slow-motion drift 1.00->1.09"
@@ -8296,7 +9154,7 @@ def _build_edl_timeline_json(
                 slices.append((
                     t0, t1, vcat,
                     "0.85x slow-motion B-roll (master_color_grade)" if k_s == "video" else "3px-DOF inpainted historical plate (master_color_grade)",
-                    f"3D Depth Title behind subject (Shot 0)" if (i_s == 0 and vcat == "2.5D_Parallax") else f"{sc.visual_mode} motion layer",
+                    "3D Depth Title behind subject (Shot 0)" if (i_s == 0 and vcat == "2.5D_Parallax") else f"{sc.visual_mode} motion layer",
                     f"Date/Location Stamp ({sc.lower_third_title}) + Selective-Emphasis Captions",
                     cam,
                     tr_in if i_s == 0 else "Hard cut",

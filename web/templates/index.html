@@ -264,11 +264,13 @@
             <div>
               <label for="doc-minutes" class="block text-xs font-bold text-frimelilac uppercase mb-1.5">Escala Documental Rápida</label>
               <select id="doc-minutes" class="fr-input" onchange="syncDurationFromDocMinutes()">
-                <option value="0.5" selected>⚡ Demo Rápido (~30s • Cold Open + Capítulos Skia)</option>
+                <option value="0.5">⚡ Demo Rápido (~30s • Cold Open + Capítulos Skia)</option>
                 <option value="1.0">🎯 Curto Investigativo (1 min)</option>
                 <option value="3.0">🎬 Mini-Documentário (3 min • Pacing MagnatesMedia)</option>
                 <option value="8.0">🍿 Documentário Mid-Roll Alto RPM (8 min)</option>
                 <option value="15.0">🏆 Especial Cinema Longo (15 min)</option>
+                <option value="17.0" selected>👑 Cinema Long-Form v3.0.0 (17 min • 25 Cenas Ideal)</option>
+                <option value="20.0">🎥 Especial Estendido (20 min)</option>
               </select>
             </div>
             <div class="sm:col-span-2 flex flex-wrap items-center gap-2 text-[11px] text-[#B6A9D4]">
@@ -349,12 +351,14 @@
                   <button type="button" class="dur-pill-btn" data-seconds="180" onclick="setFactoryDuration(180)">3 min</button>
                   <button type="button" class="dur-pill-btn" data-seconds="480" onclick="setFactoryDuration(480)">8 min</button>
                   <button type="button" class="dur-pill-btn" data-seconds="900" onclick="setFactoryDuration(900)">15 min</button>
+                  <button type="button" class="dur-pill-btn" data-seconds="1020" onclick="setFactoryDuration(1020)">17 min</button>
+                  <button type="button" class="dur-pill-btn" data-seconds="1200" onclick="setFactoryDuration(1200)">20 min</button>
                 </div>
               </div>
               <div class="flex items-center gap-3">
-                <input id="fac-duration-range" type="range" min="15" max="900" step="5" value="30" class="w-full fr-range" aria-label="Duração alvo em segundos (slider)" oninput="setFactoryDuration(this.value, 'range')" />
+                <input id="fac-duration-range" type="range" min="15" max="1200" step="5" value="30" class="w-full fr-range" aria-label="Duração alvo em segundos (slider)" oninput="setFactoryDuration(this.value, 'range')" />
                 <div class="flex items-center gap-1 shrink-0">
-                  <input id="fac-duration-s" type="number" min="10" max="900" step="5" value="30" class="fr-input !w-24 !py-1.5 text-xs text-center font-extrabold text-frimelime" oninput="setFactoryDuration(this.value, 'number')" />
+                  <input id="fac-duration-s" type="number" min="10" max="1200" step="5" value="30" class="fr-input !w-24 !py-1.5 text-xs text-center font-extrabold text-frimelime" oninput="setFactoryDuration(this.value, 'number')" />
                   <span class="text-xs font-bold text-[#B6A9D4]">seg</span>
                 </div>
               </div>
@@ -397,6 +401,7 @@
                   <option value="hormozi_neon" selected>🔥 Hormozi Pílula Neon (CapCut Spring Bounce + Tilt)</option>
                   <option value="karaoke_glow">✨ Karaokê Neon Glow (Varredura Gradiente)</option>
                   <option value="word_slam">💥 Word Slam 3D (Impacto Metálico + Shake)</option>
+                  <option value="selective_emphasis">🎯 Selective Emphasis (Doc 16:9 Keyword Stamp)</option>
                   <option value="cinema_minimal">🎬 Cinema Minimalista (Netflix Blur-Reveal)</option>
                   <option value="typewriter_highlight">🕵️ Dossiê Typewriter (Marca-Texto Investigativo)</option>
                   <option value="none">🚫 Sem Legendas (Clean Feed)</option>
@@ -593,9 +598,13 @@
             </label>
             <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.18)] cursor-pointer hover:border-frimelilac/50">
               <input id="opt-ab" type="checkbox" class="fr-check w-4 h-4" checked />
-              <span class="text-xs font-bold text-white">Teste A/B + Cascata 5 Shorts 9:16</span>
+              <span class="text-xs font-bold text-white">🧪 Teste A/B (Dual-Hook A vs B)</span>
             </label>
-            <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/90 border border-frimegold/45 cursor-pointer hover:border-frimegold">
+            <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/80 border border-[rgba(179,136,255,0.18)] cursor-pointer hover:border-frimelime/50">
+              <input id="opt-shorts-cascade" type="checkbox" class="fr-check w-4 h-4" />
+              <span class="text-xs font-bold text-white">⚡ Cascata 5 Shorts 9:16 (Extrair do 16:9)</span>
+            </label>
+            <label class="flex items-center gap-2.5 p-3 rounded-xl bg-[#0B0713]/90 border border-frimegold/45 cursor-pointer hover:border-frimegold sm:col-span-2">
               <input id="opt-clone-langs" type="checkbox" class="fr-check w-4 h-4" />
               <span class="text-xs font-extrabold text-frimegold">🌎 Clonar Idiomas: Inglês (US) + Espanhol</span>
             </label>
@@ -745,6 +754,22 @@
                 <a id="dl-hookb" href="#" class="btn-ghost px-4 py-3 text-xs font-bold flex items-center justify-between no-underline">
                   <span>🧪 Master Versão B (A/B)</span><span>↓</span>
                 </a>
+                <a id="dl-edl" href="#" class="btn-ghost px-4 py-3 text-xs font-bold flex items-center justify-between no-underline">
+                  <span>📐 EDL Timeline (.json)</span><span>↓</span>
+                </a>
+                <a id="dl-script" href="#" class="btn-ghost px-4 py-3 text-xs font-bold flex items-center justify-between no-underline">
+                  <span>📜 Roteiro Completo (.json)</span><span>↓</span>
+                </a>
+                <a id="dl-qc" href="#" class="btn-ghost px-4 py-3 text-xs font-bold flex items-center justify-between no-underline">
+                  <span>✅ Relatório QC Broadcast (.json)</span><span>↓</span>
+                </a>
+                <a id="vip-drive-link" href="#" target="_blank" rel="noopener" class="hidden btn-lime px-4 py-3 text-xs font-black flex items-center justify-between no-underline">
+                  <span>☁️ Abrir Master no Google Drive</span><span>↗</span>
+                </a>
+              </div>
+              <div id="vip-drive-bar" class="flex flex-wrap items-center justify-between gap-2 p-3 rounded-xl bg-[#0B0713]/85 border border-frimegold/30 text-[11px]">
+                <span id="vip-drive-status" class="text-[#B6A9D4]">☁️ Google Drive: aguardando seleção</span>
+                <button type="button" id="btn-vip-gdrive-upload" onclick="uploadVipJobToGdrive()" class="btn-ghost px-3 py-1.5 text-[11px] font-bold hover:border-frimegold">☁️ Enviar ao Google Drive</button>
               </div>
             </div>
 
@@ -1087,8 +1112,8 @@
           <div>
             <label for="set-llm" class="block text-xs font-bold text-frimepink mb-1">Motor IA Padrão (&lt; 1.800 tokens/vídeo)</label>
             <select id="set-llm" class="fr-input">
-              <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite (Context Caching)</option>
-              <option value="gemini-3.8-flash">Gemini 3.8 Flash (Context Caching)</option>
+              <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash-Lite (Context Caching • Rápido)</option>
+              <option value="gemini-2.5-flash">Gemini 2.5 Flash (Context Caching • Premium)</option>
               <option value="deepseek-flash">DeepSeek Flash (Ultra Econômico)</option>
               <option value="ollama">Ollama Local (100% Offline Gratuito)</option>
             </select>

@@ -170,16 +170,28 @@ function selectEngineStyle(style) {
       const match = Array.from(sk.options).find((o) => o.value.includes('09_cartoon'));
       if (match) sk.value = match.value;
     } else if (style === 'netflix_doc') {
-      const match = Array.from(sk.options).find((o) => o.value.includes('10_netflix') || o.value.includes('02_curiosity'));
+      const match = Array.from(sk.options).find((o) => o.value.includes('10_netflix'));
       if (match) sk.value = match.value;
       syncDocChannelSelection(false);
     }
   }
 
-  // Sync universal aspect ratio, FPS, and default library mix sensibly when user switches Master Engine
+  // Sync universal aspect ratio, FPS, duration, caption style, and default library mix sensibly when switching Master Engine
   if (style === 'netflix_doc') {
     const docAsp = document.getElementById('doc-aspect')?.value || '16:9';
     syncUniversalAspectFrom(docAsp);
+    // Auto-select 17 min (1020s) Cinema v3.0.0 long-form default when coming from short default <= 60s
+    const curDur = Number(document.getElementById('fac-duration-s')?.value || 30);
+    if (curDur <= 60) {
+      setFactoryDuration(1020, 'engine');
+    }
+    const capEl = document.getElementById('fac-caption-style');
+    if (capEl) {
+      const targetCap = docAsp === '16:9' ? 'selective_emphasis' : 'cinema_minimal';
+      if (Array.from(capEl.options).some((o) => o.value === targetCap)) {
+        capEl.value = targetCap;
+      }
+    }
     if (!STATE.userCustomizedLibs) {
       applyLibraryMixValues(['real_broll', 'photos_25d', 'video_over_video', 'skia_graphics', 'cinema_35mm_sfx'], false);
     }
@@ -322,6 +334,9 @@ function resolveEffectiveFactoryVoice() {
     if (pools.kokoro.some((v) => v.id === voiceRaw)) return { voice_engine: 'kokoro', voice_id: voiceRaw };
     return { voice_engine: 'edge', voice_id: voiceRaw };
   }
+  if (STATE.activeStyle === 'netflix_doc' && STATE.settings?.gemini_api_key) {
+    return { voice_engine: 'gemini_tts', voice_id: 'Charon' };
+  }
   return {
     voice_engine: client?.voice_engine || 'edge',
     voice_id: client?.voice_id || 'pt-BR-AntonioNeural',
@@ -392,19 +407,19 @@ function onFactoryClientChange() {
 }
 
 function formatDurationLabel(seconds) {
-  const s = Math.max(10, Math.min(900, Math.round(Number(seconds) || 30)));
+  const s = Math.max(10, Math.min(1200, Math.round(Number(seconds) || 30)));
   if (s <= 20) return `${s}s • Gancho Relâmpago`;
   if (s <= 45) return `${s}s • Viral Curto`;
   if (s <= 90) return `${s}s • Shorts / Reels Completo`;
   const mins = Number((s / 60).toFixed(1));
   if (s <= 240) return `${mins} min • YouTube Mini-Doc`;
   if (s <= 600) return `${mins} min • Mid-Roll Alto RPM`;
-  return `${mins} min • Documentário Cinema`;
+  return `${mins} min • Documentário Cinema v3`;
 }
 
 function setFactoryDuration(val, source = 'pill') {
   const parsed = Number(val);
-  const clamped = Number.isFinite(parsed) ? Math.max(10, Math.min(900, Math.round(parsed))) : 30;
+  const clamped = Number.isFinite(parsed) ? Math.max(10, Math.min(1200, Math.round(parsed))) : 30;
   const numEl = document.getElementById('fac-duration-s');
   const rngEl = document.getElementById('fac-duration-range');
   const lblEl = document.getElementById('fac-duration-label');
@@ -414,7 +429,7 @@ function setFactoryDuration(val, source = 'pill') {
     rngEl.value = String(Math.max(15, clamped));
   }
   if (rngEl) {
-    const pct = Math.max(0, Math.min(100, ((Math.max(15, clamped) - 15) / (900 - 15)) * 100));
+    const pct = Math.max(0, Math.min(100, ((Math.max(15, clamped) - 15) / (1200 - 15)) * 100));
     rngEl.style.setProperty('--progress', `${pct.toFixed(1)}%`);
   }
   if (lblEl) {
@@ -437,7 +452,7 @@ function setFactoryDuration(val, source = 'pill') {
 }
 
 function syncDurationFromDocMinutes() {
-  const mins = Number(document.getElementById('doc-minutes')?.value || 0.5);
+  const mins = Number(document.getElementById('doc-minutes')?.value || 17.0);
   setFactoryDuration(Math.round(mins * 60), 'doc');
 }
 
@@ -447,6 +462,15 @@ function onUniversalAspectChange() {
   const dAsp = document.getElementById('doc-aspect');
   if (cAsp && Array.from(cAsp.options).some((o) => o.value === ratio)) cAsp.value = ratio;
   if (dAsp && Array.from(dAsp.options).some((o) => o.value === ratio)) dAsp.value = ratio;
+  if (STATE.activeStyle === 'netflix_doc') {
+    const capEl = document.getElementById('fac-caption-style');
+    if (capEl) {
+      const targetCap = ratio === '16:9' ? 'selective_emphasis' : 'cinema_minimal';
+      if (Array.from(capEl.options).some((o) => o.value === targetCap)) {
+        capEl.value = targetCap;
+      }
+    }
+  }
   updateRecipeSummary();
 }
 
@@ -646,6 +670,7 @@ function updateRecipeSummary() {
     hormozi_neon: 'Hormozi Neon Spring',
     karaoke_glow: 'Karaokê Glow',
     word_slam: 'Word Slam 3D',
+    selective_emphasis: 'Selective Emphasis (Doc 16:9)',
     cinema_minimal: 'Cinema Minimalista',
     typewriter_highlight: 'Dossiê Typewriter',
     none: 'Sem Legendas',
@@ -894,12 +919,14 @@ function renderDocQueue() {
 
 async function launchDocQueueEpisode(episodeId, target = 'both') {
   try {
+    const docAspect = document.getElementById('doc-aspect')?.value || '16:9';
     const payload = {
       episode_id: Number(episodeId),
       target,
-      aspect_ratio: document.getElementById('doc-aspect')?.value || '16:9',
-      target_minutes: Number(document.getElementById('doc-minutes')?.value || 0.5),
-      auto_shorts_cascade: true,
+      aspect_ratio: docAspect,
+      target_minutes: Number(document.getElementById('doc-minutes')?.value || 17.0),
+      caption_style: docAspect === '16:9' ? 'selective_emphasis' : 'cinema_minimal',
+      auto_shorts_cascade: Boolean(document.getElementById('opt-shorts-cascade')?.checked),
       flow_mode: document.getElementById('fac-flow-mode')?.value || 'economico_pro',
       max_credits_cap: Number(document.getElementById('fac-flow-cap')?.value || 45),
       use_flow_music: Boolean(document.getElementById('opt-flow-music')?.checked),
@@ -1277,7 +1304,7 @@ document.getElementById('btn-manufacture').addEventListener('click', async () =>
       .map((s) => s.trim())
       .filter(Boolean);
 
-    const durSec = Math.max(10, Math.min(900, Math.round(Number(document.getElementById('fac-duration-s')?.value || 30))));
+    const durSec = Math.max(10, Math.min(1200, Math.round(Number(document.getElementById('fac-duration-s')?.value || 30))));
     const aspectRatio = document.getElementById('fac-aspect-universal')?.value
       || (STATE.activeStyle === 'netflix_doc'
         ? (document.getElementById('doc-aspect')?.value || '16:9')
@@ -1318,10 +1345,10 @@ document.getElementById('btn-manufacture').addEventListener('click', async () =>
       flow_mode: document.getElementById('fac-flow-mode')?.value || 'economico_pro',
       max_credits_cap: Number(document.getElementById('fac-flow-cap')?.value || 45),
       use_flow_music: useFlowMusic,
-      doc_lang: language === 'en_us' ? 'en_us' : (document.getElementById('doc-lang')?.value || 'pt_br'),
+      doc_lang: language,
       target_minutes: Number((durSec / 60).toFixed(2)),
       thumb_3words: (document.getElementById('doc-thumb-hook')?.value || '').trim() || null,
-      auto_shorts_cascade: Boolean(document.getElementById('opt-ab')?.checked),
+      auto_shorts_cascade: Boolean(document.getElementById('opt-shorts-cascade')?.checked),
       topic: document.getElementById('fac-topic').value.trim(),
       batch_topics: batchLines,
       source_url: document.getElementById('fac-url').value.trim(),
@@ -1386,6 +1413,20 @@ function renderJobs() {
         : 'text-frimegold border-frimegold/40 bg-frimegold/10';
       const eng = (j.quality_report && j.quality_report.engine_style) || '';
       const engTag = eng === 'netflix_doc' ? '🎞️ Doc Cinema' : (eng === 'cartoon_2d' ? '🎭 Cartoon 2D' : '🎬 Viral 2.5D');
+      const gd = j.gdrive_backup || (j.quality_report && j.quality_report.gdrive_backup) || {};
+      const driveBadge = gd.status === 'uploaded'
+        ? (j.drive_url
+            ? `<a href="${j.drive_url}" target="_blank" rel="noopener" class="text-[10px] font-bold text-frimelime underline">☁️ Drive ↗</a>`
+            : `<span class="text-[10px] font-bold text-frimelime">☁️ No Drive</span>`)
+        : '';
+      const actionHtml = j.status === 'completed'
+        ? `<button type="button" onclick="openInVip('${j.id}')" class="btn-gold w-full py-1.5 text-[11px]">👑 Abrir na Central VIP</button>`
+        : (j.status === 'error'
+            ? `<div class="flex gap-2">
+                 <button type="button" onclick="resumeJob('${j.id}')" class="btn-lime flex-1 py-1.5 text-[11px] font-black">♻️ Retomar Job</button>
+                 <button type="button" onclick="openInVip('${j.id}')" class="btn-ghost px-2.5 py-1.5 text-[11px]">Logs</button>
+               </div>`
+            : `<div class="lime-progress-track"><div class="lime-progress-fill" style="width:${j.progress}%"></div></div>`);
       return `
         <div class="p-3.5 rounded-xl bg-[#0B0713]/85 border border-[rgba(179,136,255,0.2)] space-y-2">
           <div class="flex items-start justify-between gap-2">
@@ -1394,9 +1435,9 @@ function renderJobs() {
           </div>
           <div class="flex items-center justify-between text-[11px] text-[#B6A9D4]">
             <span>${j.client_name || 'FrimeRise'} • ${engTag} • ${j.duration_s || 0}s</span>
-            <span class="text-frimegold font-bold">${j.views_count || 0} views</span>
+            <span class="flex items-center gap-2">${driveBadge}<span class="text-frimegold font-bold">${j.views_count || 0} views</span></span>
           </div>
-          ${j.status === 'completed' ? `<button type="button" onclick="openInVip('${j.id}')" class="btn-gold w-full py-1.5 text-[11px]">👑 Abrir na Central VIP</button>` : `<div class="lime-progress-track"><div class="lime-progress-fill" style="width:${j.progress}%"></div></div>`}
+          ${actionHtml}
         </div>
       `;
     }).join('');
@@ -1432,14 +1473,60 @@ function openInVip(jobId) {
   renderVipJob(jobId);
 }
 
+async function resumeJob(jobId) {
+  try {
+    await api(`/api/jobs/${jobId}/resume`, { method: 'POST' });
+    showToast(`♻️ Job ${jobId} recolocado na fila de retomada!`);
+    await refreshAll();
+  } catch (e) {
+    showToast(`Erro ao retomar job: ${e.message}`, true);
+  }
+}
+
+async function uploadVipJobToGdrive() {
+  const jobId = STATE.selectedVipJobId;
+  if (!jobId) return showToast('Selecione um vídeo primeiro.', true);
+  const btn = document.getElementById('btn-vip-gdrive-upload');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '⏳ Enviando ao Drive...';
+  }
+  try {
+    const res = await api(`/api/jobs/${jobId}/gdrive-upload`, { method: 'POST' });
+    if (res.status === 'uploaded') {
+      showToast(`☁️ Enviado ao Google Drive (${res.files_uploaded || 0} arquivos • ${res.total_mb || 0} MB)!`);
+    } else {
+      showToast(`Google Drive: ${res.detail || res.status}`, true);
+    }
+    await refreshAll();
+  } catch (e) {
+    showToast(`Erro no upload Drive: ${e.message}`, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '☁️ Enviar ao Google Drive';
+    }
+  }
+}
+
 function renderVipJob(jobId) {
   const job = STATE.jobs.find((j) => j.id === jobId);
   if (!job) return;
 
+  const avail = job.artifacts_available || {};
+  const qr = job.quality_report || {};
+  const gd = job.gdrive_backup || qr.gdrive_backup || {};
+  const driveUrl = job.drive_url || gd.drive_url || '';
+
   const pA = document.getElementById('player-hook-a');
   const pB = document.getElementById('player-hook-b');
-  const srcA = job.hook_a_path ? `/${job.hook_a_path}` : (job.master_path ? `/${job.master_path}` : '');
-  const srcB = job.hook_b_path ? `/${job.hook_b_path}` : srcA;
+  // Use real master if still on SSD, otherwise fall back cleanly to 540p preview for browser playback (never blank!)
+  const srcA = (avail.master && job.master_path)
+    ? `/${job.master_path}`
+    : (job.hook_a_path && !job.hook_a_path.endsWith('preview_540p.mp4')
+        ? `/${job.hook_a_path}`
+        : (job.preview_path ? `/${job.preview_path}` : ''));
+  const srcB = (avail.hook_b && job.hook_b_path) ? `/${job.hook_b_path}` : srcA;
 
   if (pA.getAttribute('data-src') !== srcA) {
     pA.setAttribute('data-src', srcA);
@@ -1450,21 +1537,66 @@ function renderVipJob(jobId) {
     pB.src = srcB;
   }
 
-  document.getElementById('dl-master').href = `/api/download/${job.id}/master`;
-  document.getElementById('dl-capcut').href = `/api/download/${job.id}/capcut`;
-  document.getElementById('dl-preview').href = `/api/download/${job.id}/preview`;
-  document.getElementById('dl-otio').href = `/api/download/${job.id}/otio`;
-  document.getElementById('dl-cover').href = `/api/download/${job.id}/cover`;
-  document.getElementById('dl-hookb').href = job.hook_b_path ? `/api/download/${job.id}/hook_b` : `/api/download/${job.id}/master`;
-  document.getElementById('dl-tiktok').href = `/api/download/${job.id}/tiktok`;
-  document.getElementById('dl-reels').href = `/api/download/${job.id}/reels`;
-  document.getElementById('dl-shorts').href = `/api/download/${job.id}/shorts`;
+  const _bindDl = (id, url, isAvailable, fallbackText = null) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (isAvailable) {
+      el.href = url;
+      el.classList.remove('opacity-40', 'pointer-events-none');
+      el.removeAttribute('aria-disabled');
+      el.removeAttribute('title');
+    } else {
+      el.href = '#';
+      el.classList.add('opacity-40', 'pointer-events-none');
+      el.setAttribute('aria-disabled', 'true');
+      if (fallbackText) el.title = fallbackText;
+    }
+  };
+
+  const drivePrunedNote = gd.status === 'uploaded' ? 'Arquivado no Google Drive (podado do SSD local)' : 'Artefato indisponível no SSD';
+  _bindDl('dl-master', `/api/download/${job.id}/master`, Boolean(avail.master ?? job.master_path), drivePrunedNote);
+  _bindDl('dl-capcut', `/api/download/${job.id}/capcut`, Boolean(avail.capcut ?? job.capcut_zip_path), drivePrunedNote);
+  _bindDl('dl-preview', `/api/download/${job.id}/preview`, Boolean(avail.preview ?? job.preview_path), 'Prévia 540p indisponível');
+  _bindDl('dl-otio', `/api/download/${job.id}/otio`, Boolean(avail.otio ?? job.otio_path), 'Timeline OTIO indisponível');
+  _bindDl('dl-cover', `/api/download/${job.id}/cover`, Boolean(avail.cover ?? job.cover_path), 'Capa HD indisponível');
+  _bindDl('dl-hookb', `/api/download/${job.id}/hook_b`, Boolean(avail.hook_b ?? job.hook_b_path), 'Sem versão B neste job');
+  _bindDl('dl-edl', `/api/download/${job.id}/edl`, Boolean(avail.edl), 'EDL não gerado para este motor');
+  _bindDl('dl-script', `/api/download/${job.id}/script`, Boolean(avail.script ?? true), 'Roteiro indisponível');
+  _bindDl('dl-qc', `/api/download/${job.id}/qc`, Boolean(avail.qc), 'QC Broadcast não disponível');
+  _bindDl('dl-tiktok', `/api/download/${job.id}/tiktok`, Boolean(avail.tiktok), drivePrunedNote);
+  _bindDl('dl-reels', `/api/download/${job.id}/reels`, Boolean(avail.reels), drivePrunedNote);
+  _bindDl('dl-shorts', `/api/download/${job.id}/shorts`, Boolean(avail.shorts), drivePrunedNote);
+
+  const driveLinkEl = document.getElementById('vip-drive-link');
+  const driveStatusEl = document.getElementById('vip-drive-status');
+  if (driveLinkEl) {
+    if (driveUrl) {
+      driveLinkEl.href = driveUrl;
+      driveLinkEl.classList.remove('hidden');
+    } else {
+      driveLinkEl.classList.add('hidden');
+    }
+  }
+  if (driveStatusEl) {
+    if (gd.status === 'uploaded') {
+      const prunedTag = gd.pruned_local ? ' • SSD podado (Prévia 540p local)' : ' • Cópia local mantida';
+      const pathLbl = gd.remote_path ? `<code>${gd.remote_path}</code>` : 'Google Drive';
+      driveStatusEl.innerHTML = `<span class="text-frimelime font-bold">☁️ Salvo no Google Drive</span> (${pathLbl}${prunedTag})`;
+    } else if (gd.status === 'error') {
+      driveStatusEl.innerHTML = `<span class="text-frimepink font-bold">⚠️ Erro Drive:</span> ${gd.detail || 'falha no envio'}`;
+    } else {
+      driveStatusEl.textContent = '☁️ Google Drive: ainda não enviado (Master local no SSD)';
+    }
+  }
 
   if (job.cover_path) {
     document.getElementById('vip-cover-img').src = `/${job.cover_path}`;
   }
-  const qr = job.quality_report || {};
   const cc = qr.creative_config || {};
+  const qc = job.qc_report || qr.qc_summary || {};
+  const qcBadge = qc.metrics
+    ? ` • QC: <span class="${qc.passed ? 'text-frimelime' : 'text-frimepink'} font-bold">${qc.passed ? 'PASS' : 'FAIL'}${qc.metrics.integrated_lufs ? ` (${qc.metrics.integrated_lufs} LUFS / ${qc.metrics.true_peak_dbtp ?? '?'} dBTP)` : ''}</span>`
+    : '';
   const ccMix = Array.isArray(cc.visual_libraries) && cc.visual_libraries.length
     ? ` • 🧩 Mix: <span class="text-white font-semibold">${cc.visual_libraries.join(', ')}</span>`
     : '';
@@ -1473,7 +1605,7 @@ function renderVipJob(jobId) {
     : '';
   document.getElementById('vip-job-meta').innerHTML = `
     <strong class="text-white block text-sm mb-1">${job.topic}</strong>
-    Motor: <span class="text-frimepink font-bold">${qr.engine_style || 'cinematic_broll'}</span> • Duração: <span class="text-frimelime font-bold">${job.duration_s}s</span> • Formato: <span class="text-frimelilac font-bold">${qr.aspect_ratio || '9:16'}</span> • Custo: <span class="text-frimegold font-bold">$${Number(job.cost_usd || 0).toFixed(5)}</span>${ccVoice}${ccMix}
+    Motor: <span class="text-frimepink font-bold">${qr.engine_style || 'cinematic_broll'}</span> • Duração: <span class="text-frimelime font-bold">${job.duration_s}s</span> • Formato: <span class="text-frimelilac font-bold">${qr.aspect_ratio || '9:16'}</span> • Custo: <span class="text-frimegold font-bold">$${Number(job.cost_usd || 0).toFixed(5)}</span>${qcBadge}${ccVoice}${ccMix}
   `;
 
   const ra = qr.retention_audit || {};
@@ -1702,7 +1834,12 @@ function renderSettingsForm() {
   document.getElementById('set-deepseek').value = s.deepseek_api_key || '';
   document.getElementById('set-pexels').value = s.pexels_api_key || '';
   document.getElementById('set-pixabay').value = s.pixabay_api_key || '';
-  document.getElementById('set-llm').value = s.default_llm || 'gemini-3.5-flash-lite';
+  const llmAliases = {
+    'gemini-3.5-flash-lite': 'gemini-2.5-flash-lite',
+    'gemini-3.8-flash': 'gemini-2.5-flash',
+  };
+  const normLlm = llmAliases[s.default_llm] || s.default_llm || 'gemini-2.5-flash-lite';
+  document.getElementById('set-llm').value = normLlm;
   document.getElementById('set-ollama').value = s.ollama_url || 'http://localhost:11434';
   document.getElementById('set-thermal').value = s.thermal_limit_c || '85';
 }

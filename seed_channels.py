@@ -213,26 +213,8 @@ def seed_twin_channels_and_queue() -> Dict[str, Any]:
             ).fetchone()
             blend_json = json.dumps(ch["voice_blend"])
             if existing:
+                # Preserve existing user customizations (voice, LUT, watermark, proxy); NEVER overwrite on restart!
                 cid = int(existing["id"])
-                conn.execute(
-                    """
-                    UPDATE clients SET
-                        niche=?, preset_id=?, lut_file=?, voice_engine=?, voice_id=?,
-                        voice_blend=?, logo_path=?, watermark_text=?
-                    WHERE id=?
-                    """,
-                    (
-                        ch["niche"],
-                        ch["preset_id"],
-                        ch["lut_file"],
-                        ch["voice_engine"],
-                        ch["voice_id"],
-                        blend_json,
-                        ch["logo_path"],
-                        ch["watermark_text"],
-                        cid,
-                    ),
-                )
             else:
                 cur = conn.execute(
                     """
