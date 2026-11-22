@@ -51,7 +51,7 @@ SAMPLE_RATE = 48000
 # ---------------------------------------------------------------------------
 _DARK_HORROR_PROFILE: Dict[str, Any] = {
     "bpm": 66.0,
-    "key": "D Minor / Phrygian (Gothic Horror, Cello Ostinato & Macabre Celesta)",
+    "key": "D Minor / D Dorian (4-Movement Evolving Score: Clockwork, Bowed Cello & Lute, Muted Brass & Felt Piano)",
     "chords": [
         [146.83, 174.61, 220.00, 293.66],  # Dm (D3, F3, A3, D4)
         [116.54, 174.61, 233.08, 293.66],  # Bb (Bb2, F3, Bb3, D4)
@@ -479,8 +479,15 @@ def store_vault_asset(
 
 
 # ---------------------------------------------------------------------------
-# High-Craft Broadcast Stereo Music Synthesizer (48kHz, Vocal-Pocket EQ)
+# High-Craft Broadcast Stereo Music Synthesizer (48kHz, 4-Movement Evolving Score)
 # ---------------------------------------------------------------------------
+DARK_SCORE_BPM = 66.0
+DARK_SCORE_BARS = 48
+DARK_SCORE_BAR_S = 240.0 / DARK_SCORE_BPM  # 3.6363636s per 4/4 bar @ 66 BPM
+DARK_SCORE_DURATION_S = round(DARK_SCORE_BARS * DARK_SCORE_BAR_S, 3)  # 174.545s (exact 48 bars)
+DARK_SCORE_VERSION = "v7_4movement_48bar"
+
+
 def _bandpass(x: np.ndarray, low: float, high: float, sr: int = SAMPLE_RATE, order: int = 3) -> np.ndarray:
     nyq = 0.5 * sr
     lo = max(20.0, min(low, nyq - 200.0)) / nyq
@@ -489,17 +496,43 @@ def _bandpass(x: np.ndarray, low: float, high: float, sr: int = SAMPLE_RATE, ord
     return signal.sosfilt(sos, x)
 
 
+def _lowpass(x: np.ndarray, cutoff: float, sr: int = SAMPLE_RATE, order: int = 2) -> np.ndarray:
+    nyq = 0.5 * sr
+    wn = max(30.0, min(cutoff, nyq - 150.0)) / nyq
+    sos = signal.butter(order, wn, btype="low", output="sos")
+    return signal.sosfilt(sos, x)
+
+
+def _highpass(x: np.ndarray, cutoff: float, sr: int = SAMPLE_RATE, order: int = 2) -> np.ndarray:
+    nyq = 0.5 * sr
+    wn = max(15.0, min(cutoff, nyq - 200.0)) / nyq
+    sos = signal.butter(order, wn, btype="high", output="sos")
+    return signal.sosfilt(sos, x)
+
+
+def _pink_noise_score(n: int, rng: np.random.Generator, sr: int = SAMPLE_RATE) -> np.ndarray:
+    n_fft = max(2, n)
+    w = rng.standard_normal(n_fft)
+    spec = np.fft.rfft(w)
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+    scale = np.zeros_like(freqs)
+    mask = freqs >= 20.0
+    scale[mask] = 1.0 / np.sqrt(freqs[mask])
+    y = np.fft.irfft(spec * scale, n=n_fft)[:n]
+    rms = float(np.sqrt(np.mean(y * y) + 1e-12))
+    return y / max(1e-9, rms)
+
+
 def _save_stereo_wav(path: Path, stereo: np.ndarray, sr: int = SAMPLE_RATE) -> None:
+    """Save 48kHz stereo float array as PCM-16 WAV preserving full natural dynamic range (no brickwall squash)."""
     if stereo.ndim == 1:
         stereo = np.column_stack([stereo, stereo])
-    # Target -16.0 LUFS (~0.158 RMS) with soft saturation ceiling at -1.5 dBFS (0.84)
-    rms = float(np.sqrt(np.mean(stereo * stereo) + 1e-12))
-    if rms > 1e-6:
-        scaled = stereo * (0.175 / rms)
-        norm = np.tanh(scaled / 0.84) * 0.84
+    peak = float(np.max(np.abs(stereo)))
+    if peak > 1e-9:
+        # Leave generous headroom (-2.0 dBFS peak) so linear LUFS calibration preserves macro dynamics
+        norm = stereo * (0.79 / peak)
     else:
-        peak = float(np.max(np.abs(stereo))) + 1e-9
-        norm = np.clip((stereo / peak) * 0.84, -1.0, 1.0)
+        norm = stereo
     pcm = (np.clip(norm, -1.0, 1.0) * 32767.0).astype(np.int16)
     with wave.open(str(path), "wb") as wf:
         wf.setnchannels(2)
@@ -508,44 +541,594 @@ def _save_stereo_wav(path: Path, stereo: np.ndarray, sr: int = SAMPLE_RATE) -> N
         wf.writeframes(pcm.tobytes())
 
 
+def _measure_lufs_flow(audio_path: Path) -> Optional[float]:
+    try:
+        res = subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "info",
+                "-i",
+                str(audio_path),
+                "-af",
+                "loudnorm=I=-16.0:TP=-1.5:LRA=11:print_format=json",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        m = re.findall(r"\{[^{}]*\"input_i\"[^{}]*\}", res.stderr or "", re.S)
+        if m:
+            mi = float(json.loads(m[-1]).get("input_i", "-inf"))
+            if math.isfinite(mi) and -70.0 <= mi <= 0.0:
+                return mi
+    except Exception:
+        pass
+    return None
+
+
+def _acoustic_warm_string(
+    freq: float,
+    t_arr: np.ndarray,
+    detune: float = 1.0,
+    vib_hz: float = 4.4,
+    vib_depth: float = 0.0028,
+    phase_offset: float = 0.0,
+    brightness: float = 0.55,
+) -> np.ndarray:
+    """Natural acoustic bowed Cello / Contrabass / Viola string voice with steep 1/k^1.6 harmonic
+    rolloff and delayed human vibrato onset — warm orchestral wood resonance, NEVER harsh 90s MIDI organ.
+    """
+    vib_onset = 1.0 - np.exp(-t_arr / 0.48)
+    vib = 1.0 + (vib_depth * vib_onset) * np.sin(2.0 * np.pi * vib_hz * t_arr + phase_offset)
+    inst_f = (freq * detune) * vib
+    ph = 2.0 * np.pi * np.cumsum(inst_f) / float(SAMPLE_RATE) + phase_offset
+    b = max(0.25, min(1.0, float(brightness)))
+    return (
+        1.00 * np.sin(ph)
+        + (0.42 * b) * np.sin(2.0 * ph + 0.18)
+        + (0.20 * (b ** 1.2)) * np.sin(3.0 * ph + 0.42)
+        + (0.09 * (b ** 1.4)) * np.sin(4.0 * ph + 0.70)
+        + (0.035 * (b ** 1.6)) * np.sin(5.0 * ph + 1.05)
+    )
+
+
 def _bowed_string_voice(
     freq: float,
     t_arr: np.ndarray,
     detune: float = 1.0,
     vib_hz: float = 4.6,
-    vib_depth: float = 0.0036,
+    vib_depth: float = 0.0030,
     phase_offset: float = 0.0,
 ) -> np.ndarray:
-    """Synthesize a rich bowed Cello/Viola string voice with expressive vibrato and strong 250-2,200Hz harmonics."""
-    vib = 1.0 + vib_depth * np.sin(2.0 * np.pi * vib_hz * t_arr + phase_offset)
-    inst_f = (freq * detune) * vib
-    ph = 2.0 * np.pi * np.cumsum(inst_f) / float(SAMPLE_RATE) + phase_offset
-    # Fundamental + rich 2nd, 3rd, 4th, 5th, 6th overtones placing body right in 250-2,200 Hz
-    return (
-        0.48 * np.sin(ph)
-        + 0.68 * np.sin(2.0 * ph + 0.15)
-        + 0.52 * np.sin(3.0 * ph + 0.35)
-        + 0.38 * np.sin(4.0 * ph + 0.55)
-        + 0.24 * np.sin(5.0 * ph + 0.80)
-        + 0.14 * np.sin(6.0 * ph + 1.05)
+    """Backward-compatible warm acoustic bowed string helper."""
+    return _acoustic_warm_string(
+        freq, t_arr, detune=detune, vib_hz=vib_hz, vib_depth=vib_depth, phase_offset=phase_offset, brightness=0.65
     )
+
+
+def _scoring_hall_convolve_loop(
+    stereo: np.ndarray,
+    decay_s: float = 2.35,
+    predelay_ms: float = 22.0,
+    damp_hz: float = 2100.0,
+    mix: float = 0.34,
+    seed: int = 71042,
+) -> np.ndarray:
+    """Warm stereo scoring-stage convolution reverb with circular tail-wrap so bar-locked loops
+    wrap seamlessly from Bar N back into Bar 1 with zero boundary click or gap.
+    """
+    n = len(stereo)
+    rng = np.random.default_rng(seed)
+    ir_len = max(int(0.5 * SAMPLE_RATE), min(n // 2, int(decay_s * SAMPLE_RATE)))
+    t_ir = np.arange(ir_len, dtype=np.float64) / float(SAMPLE_RATE)
+    pre = int(predelay_ms * SAMPLE_RATE / 1000.0)
+
+    ir = np.zeros((ir_len, 2), dtype=np.float64)
+    er_ms = [13, 19, 27, 34, 43, 52, 64, 77, 91, 108]
+    for i, ms in enumerate(er_ms):
+        idx = int(ms * SAMPLE_RATE / 1000.0)
+        if idx < ir_len:
+            g = 0.48 * (0.82 ** i) * (1.0 if i % 2 == 0 else -1.0)
+            ir[idx, i % 2] += g
+            ir[min(ir_len - 1, idx + 17), 1 - (i % 2)] += g * 0.32
+
+    bloom = 1.0 - np.exp(-t_ir / 0.038)
+    env_lo = bloom * np.exp(-6.9 * t_ir / max(0.3, decay_s * 1.12))
+    env_mid = bloom * np.exp(-6.9 * t_ir / max(0.25, decay_s * 0.72))
+    env_hi = bloom * np.exp(-6.9 * t_ir / max(0.15, decay_s * 0.32))
+    for ch in range(2):
+        nr = rng.standard_normal(ir_len)
+        lo_b = _lowpass(nr, 380.0, order=2) * env_lo
+        mid_b = _bandpass(nr, 380.0, damp_hz, order=2) * env_mid
+        hi_b = _highpass(nr, damp_hz, order=2) * env_hi
+        diff = lo_b * 0.58 + mid_b * 0.44 + hi_b * 0.14
+        if pre < ir_len:
+            ir[pre:, ch] += diff[: ir_len - pre]
+
+    fade_ir = min(int(0.08 * SAMPLE_RATE), ir_len // 4)
+    if fade_ir > 0:
+        ir[-fade_ir:, :] *= np.linspace(1.0, 0.0, fade_ir)[:, None]
+    ir /= max(1e-6, float(np.sqrt(np.sum(ir * ir) * 0.5 + 1e-12)))
+
+    wet_l = signal.fftconvolve(stereo[:, 0], ir[:, 0], mode="full")
+    wet_r = signal.fftconvolve(stereo[:, 1], ir[:, 1], mode="full")
+    # Circularly wrap reverb tail past bar N back into bar 1 for an invisible bar-locked loop seam!
+    out_wet = np.column_stack([wet_l[:n].copy(), wet_r[:n].copy()])
+    tail_len = len(wet_l) - n
+    if tail_len > 0:
+        wrap_len = min(n, tail_len)
+        out_wet[:wrap_len, 0] += wet_l[n : n + wrap_len]
+        out_wet[:wrap_len, 1] += wet_r[n : n + wrap_len]
+
+    dry_rms = float(np.sqrt(np.mean(stereo * stereo) + 1e-12))
+    wet_rms = float(np.sqrt(np.mean(out_wet * out_wet) + 1e-12))
+    if wet_rms > 1e-9:
+        out_wet *= dry_rms / wet_rms
+
+    # Keep sub-110Hz mono-compatible
+    wet_sub_l = _lowpass(out_wet[:, 0], 110.0, order=2)
+    wet_sub_r = _lowpass(out_wet[:, 1], 110.0, order=2)
+    wet_sub_m = 0.5 * (wet_sub_l + wet_sub_r)
+    out_wet[:, 0] = (out_wet[:, 0] - wet_sub_l) + wet_sub_m
+    out_wet[:, 1] = (out_wet[:, 1] - wet_sub_r) + wet_sub_m
+
+    return stereo * (1.0 - mix * 0.35) + out_wet * mix
+
+
+def _synthesize_4movement_doc_score_stereo(
+    bars: int,
+    bpm: float,
+    rng: np.random.Generator,
+) -> Tuple[np.ndarray, float, int]:
+    """Synthesize a metric bar-locked (`66 BPM`, `1 bar = 3.63636s`, `48 bars = 174.55s`)
+    4-Movement Evolving Documentary Score matching JSON v3.0.0 `genre_progression`:
+      - Movement I  (Bars 1–8,  Cold Open Hook): Dark ticking clockwork escapement pulse + deep D1/A1 sub drone + rising string tension swell.
+      - Movement II (Bars 9–20, Historical World Building): Warm acoustic bowed cello & contrabass ensemble + sparse ancient Dorian lute/harp fifths.
+      - Movement III(Bars 21–36, Investigative Deep Mechanics): Minimalist investigative brushed pulse + muted low brass/horn swells + sparse suspense celesta.
+      - Movement IV (Bars 37–48, Climax & Philosophical Resolution): Dramatic layered orchestral string crescendo (Bars 37–44) -> haunting solo cello & melancholic felt-piano coda (Bars 45–48).
+    """
+    eff_bars = max(8, int(round(bars / 4.0)) * 4)
+    beat_s = 60.0 / float(bpm)
+    bar_s = beat_s * 4.0
+    total_s = eff_bars * bar_s
+    n = int(round(total_s * SAMPLE_RATE))
+
+    left = np.zeros(n, dtype=np.float64)
+    right = np.zeros(n, dtype=np.float64)
+    hall_send_l = np.zeros(n, dtype=np.float64)
+    hall_send_r = np.zeros(n, dtype=np.float64)
+
+    bar_samples = max(1, int(round(bar_s * SAMPLE_RATE)))
+    beat_samples = max(1, int(round(beat_s * SAMPLE_RATE)))
+
+    # Movement boundaries (exact 8 / 12 / 16 / 8 / 4 proportions -> exact 1..8, 9..20, 21..36, 37..44, 45..48 for 48 bars)
+    m1_end = max(2, int(round(eff_bars * (8.0 / 48.0))))
+    m2_end = max(m1_end + 2, int(round(eff_bars * (20.0 / 48.0))))
+    m3_end = max(m2_end + 2, int(round(eff_bars * (36.0 / 48.0))))
+    m4_peak_end = max(m3_end + 1, int(round(eff_bars * (44.0 / 48.0))))
+
+    # Helper to add stereo note safely with wrap-free bounds
+    def _add_pan(dst_l: np.ndarray, dst_r: np.ndarray, pos: int, sig: np.ndarray, pan: float = 0.0) -> None:
+        if pos >= n or len(sig) == 0:
+            return
+        end_p = min(n, pos + len(sig))
+        seg = sig[: end_p - pos]
+        ang = (max(-1.0, min(1.0, pan)) + 1.0) * (math.pi * 0.25)
+        dst_l[pos:end_p] += seg * math.cos(ang)
+        dst_r[pos:end_p] += seg * math.sin(ang)
+
+    # Pre-synthesized acoustic helpers
+    def _clockwork_tick(is_accent: bool, soft_ghost: bool = False) -> np.ndarray:
+        dur_tk = 0.095
+        nk = int(dur_tk * SAMPLE_RATE)
+        tk = np.arange(nk, dtype=np.float64) / float(SAMPLE_RATE)
+        if is_accent:
+            f_hi, f_mid, f_wood = 2050.0, 940.0, 260.0
+            amp = 0.14 if not soft_ghost else 0.055
+        else:
+            f_hi, f_mid, f_wood = 1620.0, 740.0, 215.0
+            amp = 0.105 if not soft_ghost else 0.045
+        wood = np.sin(2.0 * np.pi * f_wood * tk) * np.exp(-tk / 0.011) * 0.55
+        metal = (
+            np.sin(2.0 * np.pi * f_mid * tk) * np.exp(-tk / 0.0085) * 0.60
+            + np.sin(2.0 * np.pi * f_hi * tk) * np.exp(-tk / 0.0055) * 0.35
+        )
+        click = _bandpass(rng.standard_normal(nk), 900.0, 3600.0, order=2) * np.exp(-tk / 0.004) * 0.28
+        return _lowpass((wood + metal + click) * (1.0 - np.exp(-tk / 0.0008)), 4200.0, order=2) * amp
+
+    def _dorian_lute_pluck(freq: float, dur_p: float = 2.6, amp: float = 0.14) -> np.ndarray:
+        np_len = int(dur_p * SAMPLE_RATE)
+        tp = np.arange(np_len, dtype=np.float64) / float(SAMPLE_RATE)
+        atk = 1.0 - np.exp(-tp / 0.0045)
+        # Warm antique gut-string modal decay (upper harmonics damp quickly like wooden lute/harp)
+        body = (
+            1.00 * np.sin(2.0 * np.pi * freq * tp) * np.exp(-1.15 * tp)
+            + 0.42 * np.sin(2.0 * np.pi * (freq * 2.0006) * tp + 0.2) * np.exp(-2.45 * tp)
+            + 0.16 * np.sin(2.0 * np.pi * (freq * 3.0018) * tp + 0.5) * np.exp(-4.80 * tp)
+            + 0.06 * np.sin(2.0 * np.pi * (freq * 4.004) * tp + 0.9) * np.exp(-8.50 * tp)
+        ) * atk
+        # Soft finger-pluck wood thump
+        thump = _bandpass(rng.standard_normal(np_len), 180.0, 720.0, order=2) * np.exp(-tp / 0.009) * 0.12
+        return _lowpass(body + thump, 2400.0, order=2) * amp
+
+    def _felt_piano_note(freq: float, dur_n: float = 4.2, amp: float = 0.22) -> np.ndarray:
+        nn = int(dur_n * SAMPLE_RATE)
+        tn = np.arange(nn, dtype=np.float64) / float(SAMPLE_RATE)
+        atk = 1.0 - np.exp(-tn / 0.011)
+        # Nils Frahm / Olafur Arnalds warm felt-piano spectrum (fundamental-heavy, muted hammer)
+        B = 0.00032
+        sig = (
+            1.00 * np.sin(2.0 * np.pi * freq * tn) * np.exp(-tn / 2.65)
+            + 0.34 * np.sin(2.0 * np.pi * (freq * 2.0 * math.sqrt(1.0 + 4.0 * B)) * tn + 0.15) * np.exp(-tn / 1.40)
+            + 0.11 * np.sin(2.0 * np.pi * (freq * 3.0 * math.sqrt(1.0 + 9.0 * B)) * tn + 0.40) * np.exp(-tn / 0.72)
+            + 0.035 * np.sin(2.0 * np.pi * (freq * 4.0 * math.sqrt(1.0 + 16.0 * B)) * tn + 0.80) * np.exp(-tn / 0.38)
+            + 0.14 * np.sin(2.0 * np.pi * (freq * 0.5) * tn) * np.exp(-tn / 2.20)
+        ) * atk
+        felt_thump = _bandpass(_pink_noise_score(nn, rng), 120.0, 620.0, order=2) * np.exp(-tn / 0.022) * 0.10
+        return _lowpass(sig + felt_thump, 1750.0, order=2) * amp
+
+    def _sparse_celesta_note(freq: float, dur_c: float = 3.0, amp: float = 0.11) -> np.ndarray:
+        nc = int(dur_c * SAMPLE_RATE)
+        tc = np.arange(nc, dtype=np.float64) / float(SAMPLE_RATE)
+        atk = 1.0 - np.exp(-tc / 0.005)
+        sig = (
+            0.82 * np.sin(2.0 * np.pi * freq * tc) * np.exp(-tc / 1.55)
+            + 0.24 * np.sin(2.0 * np.pi * (freq * 2.002) * tc + 0.3) * np.exp(-tc / 0.75)
+            + 0.08 * np.sin(2.0 * np.pi * (freq * 3.012) * tc + 0.7) * np.exp(-tc / 0.28)
+            + 0.18 * np.sin(2.0 * np.pi * (freq * 0.5) * tc) * np.exp(-tc / 1.85)
+        ) * atk
+        return _lowpass(sig, 3100.0, order=2) * amp
+
+    # Harmonic tables across the 4 movements (D Minor / D Dorian / Phrygian)
+    # Movement II (Dorian Historical World Building): Dm -> C/D -> Bbmaj7 -> Am7 -> Gm7 -> Dm -> C -> A7sus4
+    m2_chords = [
+        (36.71, [73.42, 110.00, 146.83, 174.61]),  # Dm
+        (36.71, [65.41, 110.00, 130.81, 196.00]),  # C/D Dorian
+        (58.27, [58.27, 110.00, 146.83, 174.61]),  # Bbmaj7
+        (55.00, [55.00, 110.00, 130.81, 164.81]),  # Am7
+        (49.00, [73.42, 98.00, 146.83, 174.61]),   # Gm7
+        (36.71, [73.42, 110.00, 146.83, 174.61]),  # Dm
+    ]
+    m2_lute_fifths = [
+        (146.83, 220.00),  # D3-A3
+        (130.81, 196.00),  # C3-G3
+        (174.61, 261.63),  # F3-C4
+        (164.81, 246.94),  # E3-B3 (Dorian 6th color!)
+        (196.00, 293.66),  # G3-D4
+        (146.83, 220.00),  # D3-A3
+    ]
+
+    # Movement III (Investigative Deep Mechanics): Dm -> Bb/D -> Gm/D -> A7sus4
+    m3_brass_roots = [73.42, 58.27, 65.41, 55.00]  # D2, Bb1, C2, A1
+    m3_celesta_phrases = [
+        [(0.0, 587.33, -0.35), (1.5, 698.46, 0.32), (3.0, 659.25, -0.22)],  # D5, F5, E5
+        [(0.5, 440.00, 0.30), (2.0, 622.25, -0.38)],                        # A4, Eb5 (Phrygian chill!)
+        [(0.0, 587.33, -0.28), (2.0, 554.37, 0.34), (3.0, 440.00, -0.18)],  # D5, C#5, A4
+        [(1.0, 698.46, 0.25), (2.5, 587.33, -0.30)],                        # F5, D5
+    ]
+
+    # Movement IVa (Bars 37-44 Climax): Dramatic layered orchestral string crescendo
+    m4_climax_chords = [
+        (36.71, 73.42, 146.83, 220.00, 293.66, 349.23),  # Dm wide
+        (58.27, 58.27, 116.54, 174.61, 293.66, 349.23),  # Bbmaj7 wide
+        (49.00, 98.00, 146.83, 174.61, 233.08, 349.23),  # Gm7 wide
+        (55.00, 55.00, 110.00, 164.81, 220.00, 329.63),  # A5/A7 dramatic suspend
+        (36.71, 73.42, 146.83, 220.00, 349.23, 440.00),  # Dm soaring octave
+        (58.27, 58.27, 146.83, 233.08, 349.23, 466.16),  # Bb towering
+        (65.41, 65.41, 130.81, 196.00, 329.63, 392.00),  # C heroic tension
+        (55.00, 55.00, 110.00, 164.81, 277.18, 440.00),  # A major dominant crest -> resolves to Dm coda!
+    ]
+
+    # Movement IVb (Bars 45-48 Philosophical Resolution Coda): Solo Cello + Felt Piano
+    m4_coda_cello_notes = [
+        (174.61, 164.81),  # Bar 45: F3 -> E3 sigh
+        (146.83, 130.81),  # Bar 46: D3 -> C3 lament
+        (110.00, 146.83),  # Bar 47: A2 -> D3 yearning
+        (146.83, 146.83),  # Bar 48: D3 serene resolution
+    ]
+    m4_coda_piano_notes = [
+        [(0.0, 293.66, -0.18), (2.0, 440.00, 0.24)],   # D4, A4
+        [(0.0, 349.23, -0.22), (2.5, 329.63, 0.18)],   # F4, E4
+        [(0.0, 233.08, 0.22), (2.0, 220.00, -0.20)],   # Bb3, A3
+        [(0.0, 293.66, 0.00)],                         # D4 lingering final chord
+    ]
+
+    for b_idx in range(eff_bars):
+        start = b_idx * bar_samples
+        if start >= n:
+            break
+        end = min(n, start + bar_samples)
+        seg_len = end - start
+        if seg_len <= 64:
+            continue
+        seg_t = np.arange(seg_len, dtype=np.float64) / float(SAMPLE_RATE)
+        bar_dur = seg_len / float(SAMPLE_RATE)
+        # Smooth organic bar crossfade envelope
+        bar_env = np.minimum(1.0, seg_t / 0.38) * np.minimum(1.0, (bar_dur - seg_t + 1e-4) / 0.42)
+
+        # ------------------------------------------------------------------
+        # MOVEMENT I: Cold Open Hook (Bars 1-8) — Tense, lean clockwork & sub-bass build
+        # ------------------------------------------------------------------
+        if b_idx < m1_end:
+            m1_prog = (b_idx + seg_t / max(0.1, bar_dur)) / float(m1_end)
+            # 1. Deep D1/A1 Sub-Bass Contrabass Drone (restrained dark floor building across Bars 1-8)
+            sub_swell = 0.50 + 0.50 * m1_prog
+            d1_drone = (
+                0.76 * np.sin(2.0 * np.pi * 36.71 * seg_t + 0.2 * b_idx)
+                + 0.34 * np.sin(2.0 * np.pi * 55.00 * seg_t + 0.7)  # A1 dark fifth
+                + 0.26 * np.sin(2.0 * np.pi * 73.42 * seg_t + 0.3)  # D2 cello fundamental
+            ) * sub_swell * 0.165
+            left[start:end] += d1_drone * bar_env
+            right[start:end] += d1_drone * bar_env
+
+            # 2. Dark Ticking Clockwork Escapement Pulse (66 BPM)
+            for bt in range(4):
+                bt_pos = start + bt * beat_samples
+                tick = _clockwork_tick(is_accent=(bt % 2 == 0))
+                pan_tk = -0.18 if (bt % 2 == 0) else 0.18
+                _add_pan(left, right, bt_pos, tick * (0.72 + 0.40 * (b_idx / float(m1_end))), pan=pan_tk)
+                # Subtle 8th-note escapement double-tick in the second half of Movement I (bars 5-8)
+                if b_idx >= m1_end // 2 and bt in (1, 3):
+                    g_pos = bt_pos + beat_samples // 2
+                    gtick = _clockwork_tick(is_accent=False, soft_ghost=True)
+                    _add_pan(left, right, g_pos, gtick, pan=-pan_tk * 0.7)
+
+            # 3. Rising String Tension Swell (creeping from D3 -> Eb3 -> F3 -> A3 across Bars 1-8)
+            tens_notes = [146.83, 146.83, 155.56, 155.56, 174.61, 174.61, 207.65, 220.00]
+            tf = tens_notes[b_idx % len(tens_notes)]
+            swell_gain = 0.04 + 0.16 * (m1_prog ** 1.35)
+            st_l = _acoustic_warm_string(tf, seg_t, detune=0.997, vib_hz=4.1, phase_offset=0.3 * b_idx, brightness=0.52)
+            st_r = _acoustic_warm_string(tf, seg_t, detune=1.003, vib_hz=4.5, phase_offset=0.3 * b_idx + 1.1, brightness=0.52)
+            st_l = _lowpass(st_l, 820.0 + 520.0 * (b_idx / float(m1_end)), order=2)
+            st_r = _lowpass(st_r, 820.0 + 520.0 * (b_idx / float(m1_end)), order=2)
+            hall_send_l[start:end] += st_l * swell_gain * bar_env
+            hall_send_r[start:end] += st_r * swell_gain * bar_env
+
+        # ------------------------------------------------------------------
+        # MOVEMENT II: Historical World Building (Bars 9-20) — Warm acoustic cello & Dorian lute
+        # ------------------------------------------------------------------
+        elif b_idx < m2_end:
+            local_b = b_idx - m1_end
+            sub_f, cello_notes = m2_chords[(local_b // 2) % len(m2_chords)]
+
+            # 1. Warm Acoustic Bowed Cello & Contrabass Ensemble (natural wood warmth, zero organ buzz)
+            cb = (
+                0.85 * np.sin(2.0 * np.pi * sub_f * seg_t)
+                + 0.35 * np.sin(2.0 * np.pi * (sub_f * 2.0) * seg_t + 0.2)
+            ) * 0.205
+            left[start:end] += cb * bar_env
+            right[start:end] += cb * bar_env
+
+            ens_l = np.zeros(seg_len, dtype=np.float64)
+            ens_r = np.zeros(seg_len, dtype=np.float64)
+            bow_phrase = 0.74 + 0.26 * np.sin(np.pi * seg_t / max(0.1, bar_dur))
+            for vi, vf in enumerate(cello_notes):
+                v_l = _acoustic_warm_string(vf, seg_t, detune=0.9975 - 0.0005 * vi, vib_hz=4.2 + 0.22 * vi, phase_offset=vi * 0.9, brightness=0.54)
+                v_r = _acoustic_warm_string(vf, seg_t, detune=1.0025 + 0.0005 * vi, vib_hz=4.3 + 0.19 * vi, phase_offset=vi * 0.9 + 1.4, brightness=0.54)
+                pan_w = 0.62 if (vi % 2 == 0) else 0.38
+                ens_l += v_l * (0.105 * pan_w)
+                ens_r += v_r * (0.105 * (1.0 - pan_w))
+            # Soft bow rosin breath
+            rosin = _bandpass(_pink_noise_score(seg_len, rng), 520.0, 1450.0, order=2) * 0.010 * bow_phrase
+            ens_l = _lowpass(ens_l, 980.0, order=2) + rosin
+            ens_r = _lowpass(ens_r, 980.0, order=2) + rosin * 0.9
+            hall_send_l[start:end] += ens_l * bar_env * bow_phrase
+            hall_send_r[start:end] += ens_r * bar_env * bow_phrase
+
+            # 2. Sparse Ancient Dorian Lute / Archival Harp Open Fifths
+            f_root, f_fifth = m2_lute_fifths[local_b % len(m2_lute_fifths)]
+            # Beat 1 root pluck + Beat 2.5 open fifth pluck (spacious historical phrasing)
+            pl_root = _dorian_lute_pluck(f_root, dur_p=2.8, amp=0.175)
+            pl_fifth = _dorian_lute_pluck(f_fifth, dur_p=2.6, amp=0.150)
+            _add_pan(hall_send_l, hall_send_r, start, pl_root, pan=-0.34 if local_b % 2 == 0 else 0.34)
+            _add_pan(hall_send_l, hall_send_r, start + int(1.5 * beat_samples), pl_fifth, pan=0.36 if local_b % 2 == 0 else -0.36)
+            if local_b % 2 == 1:
+                pl_oct = _dorian_lute_pluck(f_root * 2.0, dur_p=2.0, amp=0.105)
+                _add_pan(hall_send_l, hall_send_r, start + int(3.0 * beat_samples), pl_oct, pan=-0.18)
+
+        # ------------------------------------------------------------------
+        # MOVEMENT III: Investigative Deep Mechanics (Bars 21-36) — Brushed pulse, muted brass & sparse celesta
+        # ------------------------------------------------------------------
+        elif b_idx < m3_end:
+            local_b = b_idx - m2_end
+            root_f = m3_brass_roots[(local_b // 2) % len(m3_brass_roots)]
+
+            # 1. Minimalist Investigative Brushed Pulse + Deep Muffled Frame-Drum Heartbeat
+            for bt in range(4):
+                bt_pos = start + bt * beat_samples
+                if bt == 0 or (bt == 2 and local_b % 2 == 1):
+                    # Soft muffled frame drum downbeat (58 -> 38 Hz)
+                    dl = min(n - bt_pos, int(0.38 * SAMPLE_RATE))
+                    if dl > 64:
+                        dt = np.arange(dl, dtype=np.float64) / float(SAMPLE_RATE)
+                        f_dr = 38.0 + 26.0 * np.exp(-dt / 0.032)
+                        drum = np.sin(2.0 * np.pi * np.cumsum(f_dr) / float(SAMPLE_RATE)) * (1.0 - np.exp(-dt / 0.008)) * np.exp(-dt / 0.14)
+                        amp_d = 0.28 if bt == 0 else 0.18
+                        left[bt_pos : bt_pos + dl] += drum * amp_d
+                        right[bt_pos : bt_pos + dl] += drum * amp_d
+                # Minimalist brushed parchment / wire pulse on off-beat 8ths
+                br_pos = bt_pos + beat_samples // 2
+                bl = min(n - br_pos, int(0.11 * SAMPLE_RATE))
+                if bl > 64:
+                    tb = np.arange(bl, dtype=np.float64) / float(SAMPLE_RATE)
+                    br = _bandpass(_pink_noise_score(bl, rng), 1900.0, 4600.0, order=2) * (1.0 - np.exp(-tb / 0.006)) * np.exp(-tb / 0.032) * 0.042
+                    _add_pan(left, right, br_pos, br, pan=-0.22 if bt % 2 == 0 else 0.22)
+
+            # 2. Pulsing Contrabass Anchor (quarter-note investigative tension)
+            pulse_env = 0.56 + 0.44 * (0.5 + 0.5 * np.sin(2.0 * np.pi * (bpm / 60.0) * seg_t - math.pi * 0.5))
+            bass_sig = (
+                0.82 * np.sin(2.0 * np.pi * root_f * seg_t)
+                + 0.34 * np.sin(2.0 * np.pi * (root_f * 0.5) * seg_t)
+                + 0.24 * np.sin(2.0 * np.pi * (root_f * 2.0) * seg_t)
+            ) * pulse_env * 0.275 * bar_env
+            left[start:end] += bass_sig
+            right[start:end] += bass_sig
+
+            # 3. Muted Low Brass / French Horn Swells (warm dark swells every 2 bars)
+            if local_b % 2 == 0:
+                swell_dur = min(n - start, bar_samples * 2)
+                st_h = np.arange(swell_dur, dtype=np.float64) / float(SAMPLE_RATE)
+                sd = swell_dur / float(SAMPLE_RATE)
+                # Smooth arch swell peaking at 55% of the 2-bar phrase
+                h_env = np.sin(np.pi * np.clip(st_h / max(0.2, sd), 0.0, 1.0)) ** 1.25
+                fifth_f = root_f * 1.4983  # open 5th brass voicing
+                h_l = (
+                    _acoustic_warm_string(root_f, st_h, detune=0.998, vib_hz=2.8, vib_depth=0.0018, brightness=0.76) * 0.68
+                    + _acoustic_warm_string(fifth_f, st_h, detune=1.002, vib_hz=3.1, vib_depth=0.0016, phase_offset=0.8, brightness=0.68) * 0.52
+                )
+                h_r = (
+                    _acoustic_warm_string(root_f, st_h, detune=1.002, vib_hz=2.9, vib_depth=0.0018, phase_offset=0.5, brightness=0.76) * 0.68
+                    + _acoustic_warm_string(fifth_f, st_h, detune=0.998, vib_hz=3.0, vib_depth=0.0016, phase_offset=1.3, brightness=0.68) * 0.52
+                )
+                # Warm muted brass lowpass (dark & noble, never piercing)
+                h_l = _lowpass(h_l, 640.0, order=2) * h_env * 0.36
+                h_r = _lowpass(h_r, 640.0, order=2) * h_env * 0.36
+                hall_send_l[start : start + swell_dur] += h_l
+                hall_send_r[start : start + swell_dur] += h_r
+
+            # 4. Subtle Suspense Celesta Motif (ONLY on sparse bars — NEVER every 8th note!)
+            if local_b % 4 in (1, 3):
+                phrase = m3_celesta_phrases[(local_b // 2) % len(m3_celesta_phrases)]
+                for beat_off, cf, cpan in phrase:
+                    cpos = start + int(round(beat_off * beat_samples))
+                    cnote = _sparse_celesta_note(cf, dur_c=2.8, amp=0.145)
+                    _add_pan(hall_send_l, hall_send_r, cpos, cnote, pan=cpan)
+
+        # ------------------------------------------------------------------
+        # MOVEMENT IVa: Dramatic Layered Orchestral String Crescendo (Bars 37-44)
+        # ------------------------------------------------------------------
+        elif b_idx < m4_peak_end:
+            local_b = b_idx - m3_end
+            cresc_len = max(1, m4_peak_end - m3_end)
+            cresc_prog = (local_b + seg_t / max(0.1, bar_dur)) / float(cresc_len)
+            # True soaring orchestral climax swell (0.88 -> 1.62), pulling back cleanly on final 2 beats of Bar 44
+            cresc_gain = 0.88 + 0.74 * (cresc_prog ** 1.12)
+            if local_b == cresc_len - 1:
+                cresc_gain = cresc_gain * np.where(seg_t > bar_dur * 0.68, np.maximum(0.28, 1.0 - (seg_t - bar_dur * 0.68) / (bar_dur * 0.32)), 1.0)
+
+            voicing = m4_climax_chords[local_b % len(m4_climax_chords)]
+            sub_f = voicing[0]
+            # Deep contrabass + timpani swell on bar downbeat
+            cb_sig = (
+                0.86 * np.sin(2.0 * np.pi * sub_f * seg_t)
+                + 0.42 * np.sin(2.0 * np.pi * (sub_f * 2.0) * seg_t + 0.25)
+            ) * 0.30 * cresc_gain * bar_env
+            left[start:end] += cb_sig
+            right[start:end] += cb_sig
+
+            # Warm orchestral timpani downbeat swell
+            tl = min(n - start, int(1.15 * SAMPLE_RATE))
+            if tl > 64:
+                tt = np.arange(tl, dtype=np.float64) / float(SAMPLE_RATE)
+                f_timp = sub_f * 1.5 + 32.0 * np.exp(-tt / 0.045)
+                timp = np.sin(2.0 * np.pi * np.cumsum(f_timp) / float(SAMPLE_RATE)) * (1.0 - np.exp(-tt / 0.014)) * np.exp(-tt / 0.36) * (0.22 + 0.18 * (local_b / float(cresc_len)))
+                left[start : start + tl] += timp
+                right[start : start + tl] += timp
+
+            # Layered Cello + Viola + High Violin Section
+            orch_l = np.zeros(seg_len, dtype=np.float64)
+            orch_r = np.zeros(seg_len, dtype=np.float64)
+            for vi, vf in enumerate(voicing[1:]):
+                w_voice = [0.28, 0.23, 0.19, 0.16, 0.13][min(vi, 4)]
+                bri = 0.58 + 0.24 * (local_b / float(cresc_len))
+                vl = _acoustic_warm_string(vf, seg_t, detune=0.9965 + 0.0007 * vi, vib_hz=4.5 + 0.25 * vi, vib_depth=0.0032, phase_offset=vi * 1.1, brightness=bri)
+                vr = _acoustic_warm_string(vf, seg_t, detune=1.0035 - 0.0007 * vi, vib_hz=4.6 + 0.21 * vi, vib_depth=0.0032, phase_offset=vi * 1.1 + 1.5, brightness=bri)
+                pan_l = 0.68 if (vi % 2 == 0) else 0.34
+                orch_l += vl * (w_voice * pan_l)
+                orch_r += vr * (w_voice * (1.02 - pan_l))
+
+            lp_cut = 1250.0 + 750.0 * (local_b / float(cresc_len))
+            orch_l = _lowpass(orch_l, lp_cut, order=2) * cresc_gain * bar_env
+            orch_r = _lowpass(orch_r, lp_cut, order=2) * cresc_gain * bar_env
+            hall_send_l[start:end] += orch_l
+            hall_send_r[start:end] += orch_r
+
+        # ------------------------------------------------------------------
+        # MOVEMENT IVb: Haunting Solo Cello & Melancholic Felt-Piano Coda (Bars 45-48)
+        # ------------------------------------------------------------------
+        else:
+            local_b = b_idx - m4_peak_end
+            coda_len = max(1, eff_bars - m4_peak_end)
+            # Intimate receding coda drop after the climax
+            coda_fade = 0.85 * (1.0 - 0.35 * (local_b / float(coda_len)))
+
+            # 1. Whisper-soft D1/D2 pedal cushion
+            pedal = (
+                0.70 * np.sin(2.0 * np.pi * 36.71 * seg_t)
+                + 0.28 * np.sin(2.0 * np.pi * 73.42 * seg_t)
+            ) * 0.085 * coda_fade * bar_env
+            left[start:end] += pedal
+            right[start:end] += pedal
+
+            # 2. Expressive Solo Bowed Cello Lament (2 legato half-bar notes per bar)
+            f_a, f_b = m4_coda_cello_notes[local_b % len(m4_coda_cello_notes)]
+            # Smooth portamento glide at mid-bar
+            glide = 1.0 / (1.0 + np.exp(-(seg_t - bar_dur * 0.50) / 0.085))
+            f_solo = f_a * (1.0 - glide) + f_b * glide
+            ph_s = 2.0 * np.pi * np.cumsum(f_solo * (1.0 + 0.0038 * (1.0 - np.exp(-seg_t / 0.5)) * np.sin(2.0 * np.pi * 4.7 * seg_t))) / float(SAMPLE_RATE)
+            solo_raw = (
+                1.00 * np.sin(ph_s)
+                + 0.44 * np.sin(2.0 * ph_s + 0.2)
+                + 0.18 * np.sin(3.0 * ph_s + 0.5)
+                + 0.07 * np.sin(4.0 * ph_s + 0.8)
+            )
+            solo_env = np.minimum(1.0, seg_t / 0.55) * np.minimum(1.0, (bar_dur - seg_t + 1e-4) / 0.65)
+            solo_cello = _lowpass(solo_raw, 1080.0, order=2) * solo_env * 0.145 * coda_fade
+            _add_pan(hall_send_l, hall_send_r, start, solo_cello, pan=-0.16)
+
+            # 3. Sparse Melancholic Felt-Piano Notes
+            for beat_off, pf, ppan in m4_coda_piano_notes[local_b % len(m4_coda_piano_notes)]:
+                ppos = start + int(round(beat_off * beat_samples))
+                pnote = _felt_piano_note(pf, dur_n=4.4, amp=0.175 * coda_fade)
+                _add_pan(hall_send_l, hall_send_r, ppos, pnote, pan=ppan)
+
+    # Combine dry foundation + hall-reverberated acoustic ensemble
+    hall_st = np.column_stack([hall_send_l, hall_send_r])
+    hall_wet = _scoring_hall_convolve_loop(hall_st, decay_s=2.40, predelay_ms=22.0, damp_hz=2050.0, mix=0.42, seed=71048)
+
+    mix_l = left + hall_wet[:, 0]
+    mix_r = right + hall_wet[:, 1]
+
+    # Balanced Broadcast Mastering EQ (NO vocal-masking mid boost! Respects 400-2500 Hz speech intelligibility)
+    mix_l = _highpass(mix_l, 26.0, order=2)
+    mix_r = _highpass(mix_r, 26.0, order=2)
+    mix_l = _lowpass(mix_l, 5200.0, order=2)
+    mix_r = _lowpass(mix_r, 5200.0, order=2)
+
+    # Gentle -2.5 dB courtesy dip across 750-2300 Hz so raw score sits harmoniously behind narration
+    dip_l = _bandpass(mix_l, 750.0, 2300.0, order=2)
+    dip_r = _bandpass(mix_r, 750.0, 2300.0, order=2)
+    mix_l = mix_l - 0.24 * dip_l
+    mix_r = mix_r - 0.24 * dip_r
+
+    # Micro 12ms boundary taper for click-free loop wrap (zero dead fade gap!)
+    xf_edge = min(int(0.012 * SAMPLE_RATE), n // 32)
+    if xf_edge > 4:
+        ramp_in = np.linspace(0.0, 1.0, xf_edge)
+        ramp_out = np.linspace(1.0, 0.0, xf_edge)
+        mix_l[:xf_edge] *= ramp_in
+        mix_r[:xf_edge] *= ramp_in
+        mix_l[-xf_edge:] *= ramp_out
+        mix_r[-xf_edge:] *= ramp_out
+
+    return np.column_stack([mix_l, mix_r]), total_s, eff_bars
 
 
 def _synthesize_procedural_track(
     out_mp3: Union[Path, str],
     mood_raw: Union[str, float, Path] = "dark_horror_cinema",
     profile_key: Optional[Union[str, float]] = None,
-    duration_s: float = 45.0,
+    duration_s: float = DARK_SCORE_DURATION_S,
 ) -> Dict[str, Any]:
-    """Synthesize a rich, original 48kHz stereo Netflix/A24 dark-cinema instrumental score
-    normalized to `-16.0 LUFS` with strong mid-range (`250-2,200 Hz`) instrumentation:
-      a) Tense Bowed Cello & Viola Ostinato in D Minor (`66 BPM`, `146.8 Hz D3`, `174.6 Hz F3`,
-         `220.0 Hz A3`, `233.1 Hz Bb3`, `207.6 Hz G#3` + bowed overtones & vibrato)
-      b) Haunting Macabre Music-Box / Celesta & Minor Piano Motif (`587 Hz D5`, `698 Hz F5`,
-         `880 Hz A5`, `932 Hz Bb5`, `830 Hz G#5`, `659 Hz E5`) with bell-like metallic attack,
-         exponential decay & dotted-8th stereo delay echo
-      c) Distant Cathedral Tubular Bells (`293.7 Hz D4` + inharmonic partials) on bar boundaries
-         + deep heartbeat sub-pulse (`55-90 Hz`).
+    """Synthesize a metric bar-locked (`66 BPM`, `48 bars = 174.55s`) 4-Movement Evolving
+    Documentary Score for dark-cinema / historical moods (or tailored procedural bed for other moods),
+    calibrated linearly to `-16.0 LUFS` while preserving full orchestral dynamic range (`LRA >= 4.5 LU`)
+    and balanced `400–2500 Hz` mid-range (zero vocal masking!).
     """
     # Flexible argument normalization for direct unit-test and internal callers
     if isinstance(out_mp3, Path) or str(out_mp3).endswith((".mp3", ".wav")):
@@ -592,146 +1175,75 @@ def _synthesize_procedural_track(
         "epic_cinema",
         "historical_epic",
     )
-    bpm = float(prof["bpm"]) if is_dark_cinema else (float(prof["bpm"]) + float((seed_int % 5) - 2) * 0.5)
-    beat_s = 60.0 / bpm
-    bar_s = beat_s * 4.0
-    bars = max(4, int(math.ceil(target_s / bar_s)))
-    total_s = target_s
-    n = int(round(total_s * SAMPLE_RATE))
 
-    left = np.zeros(n, dtype=np.float64)
-    right = np.zeros(n, dtype=np.float64)
-    celesta_l = np.zeros(n, dtype=np.float64)
-    celesta_r = np.zeros(n, dtype=np.float64)
+    if is_dark_cinema:
+        bpm = DARK_SCORE_BPM if prof_str in ("dark_horror_cinema", "dark_mystery") else float(prof["bpm"])
+        bar_s = 240.0 / bpm
+        req_bars = max(8, int(round(target_s / bar_s)))
+        stereo, total_s, eff_bars = _synthesize_4movement_doc_score_stereo(req_bars, bpm, rng)
+    else:
+        bpm = float(prof["bpm"]) + float((seed_int % 5) - 2) * 0.5
+        beat_s = 60.0 / bpm
+        bar_s = beat_s * 4.0
+        eff_bars = max(4, int(round(target_s / bar_s)))
+        total_s = eff_bars * bar_s
+        n = int(round(total_s * SAMPLE_RATE))
 
-    chords: List[List[float]] = prof["chords"]
-    bass_notes: List[float] = prof["bass_notes"]
-    motif_intervals: List[float] = prof["motif_intervals"]
-    ostinato_notes: List[float] = prof.get(
-        "ostinato_notes",
-        [146.83, 174.61, 220.00, 233.08, 220.00, 207.65, 220.00, 174.61],
-    )
-    celesta_notes: List[float] = prof.get(
-        "celesta_notes",
-        [587.33, 698.46, 880.00, 932.33, 880.00, 830.61, 698.46, 659.25],
-    )
-    bell_notes: List[float] = prof.get("bell_notes", [293.66, 233.08, 293.66, 220.00])
-    sub_drive = float(prof.get("sub_drive", 1.5))
-    perc_style = str(prof.get("perc_style", "investigative_pulse"))
+        left = np.zeros(n, dtype=np.float64)
+        right = np.zeros(n, dtype=np.float64)
+        chords: List[List[float]] = prof["chords"]
+        bass_notes: List[float] = prof["bass_notes"]
+        motif_intervals: List[float] = prof["motif_intervals"]
+        sub_drive = float(prof.get("sub_drive", 1.5))
+        perc_style = str(prof.get("perc_style", "investigative_pulse"))
 
-    bar_samples = max(1, int(round(bar_s * SAMPLE_RATE)))
-    beat_samples = max(1, int(round(beat_s * SAMPLE_RATE)))
-    step_samples = max(1, beat_samples // 2)  # 8th-note grid
+        bar_samples = max(1, int(round(bar_s * SAMPLE_RATE)))
+        beat_samples = max(1, int(round(beat_s * SAMPLE_RATE)))
+        step_samples = max(1, beat_samples // 2)
 
-    for b_idx in range(bars):
-        start = b_idx * bar_samples
-        if start >= n:
-            break
-        end = min(n, start + bar_samples)
-        seg_len = end - start
-        if seg_len <= 0:
-            continue
-        seg_t = np.linspace(0.0, seg_len / float(SAMPLE_RATE), seg_len, endpoint=False)
+        for b_idx in range(eff_bars):
+            start = b_idx * bar_samples
+            if start >= n:
+                break
+            end = min(n, start + bar_samples)
+            seg_len = end - start
+            if seg_len <= 0:
+                continue
+            seg_t = np.linspace(0.0, seg_len / float(SAMPLE_RATE), seg_len, endpoint=False)
+            chord = chords[b_idx % len(chords)]
+            bass_f = bass_notes[b_idx % len(bass_notes)]
 
-        chord = chords[b_idx % len(chords)]
-        bass_f = bass_notes[b_idx % len(bass_notes)]
-
-        # 1. Sustained Bowed Cello & Viola Ensemble Section (or Stereo Polysynth Pad)
-        pad_l = np.zeros(seg_len, dtype=np.float64)
-        pad_r = np.zeros(seg_len, dtype=np.float64)
-        lfo = 0.85 + 0.15 * np.sin(2.0 * np.pi * (0.24 + 0.03 * (b_idx % 3)) * seg_t)
-        for i, freq in enumerate(chord):
-            det_l = 1.0 + (0.0022 if i % 2 == 0 else -0.0017)
-            det_r = 1.0 + (-0.0022 if i % 2 == 0 else 0.0017)
-            pan_l = 0.68 if i % 2 == 0 else 0.36
-            pan_r = 0.36 if i % 2 == 0 else 0.68
-            if is_dark_cinema:
-                voice_l = _bowed_string_voice(freq, seg_t, detune=det_l, vib_hz=4.4 + 0.25 * i, phase_offset=0.5 * i)
-                voice_r = _bowed_string_voice(freq, seg_t, detune=det_r, vib_hz=4.5 + 0.22 * i, phase_offset=0.5 * i + 0.7)
-                pad_l += voice_l * (0.18 * pan_l)
-                pad_r += voice_r * (0.18 * pan_r)
-            else:
+            pad_l = np.zeros(seg_len, dtype=np.float64)
+            pad_r = np.zeros(seg_len, dtype=np.float64)
+            lfo = 0.85 + 0.15 * np.sin(2.0 * np.pi * (0.24 + 0.03 * (b_idx % 3)) * seg_t)
+            for i, freq in enumerate(chord):
+                det_l = 1.0 + (0.0022 if i % 2 == 0 else -0.0017)
+                det_r = 1.0 + (-0.0022 if i % 2 == 0 else 0.0017)
+                pan_l = 0.68 if i % 2 == 0 else 0.36
+                pan_r = 0.36 if i % 2 == 0 else 0.68
                 voice_l = np.sin(2.0 * np.pi * (freq * det_l) * seg_t) + 0.35 * np.sin(2.0 * np.pi * (freq * 2.0) * seg_t)
                 voice_r = np.sin(2.0 * np.pi * (freq * det_r) * seg_t) + 0.35 * np.sin(2.0 * np.pi * (freq * 2.0) * seg_t)
                 pad_l += voice_l * (0.15 * pan_l)
                 pad_r += voice_r * (0.15 * pan_r)
 
-        attack_s = min(0.20, max(0.04, seg_len / float(SAMPLE_RATE) * 0.12))
-        pad_env = np.minimum(1.0, seg_t / attack_s) * np.minimum(1.0, (seg_t[-1] - seg_t + 1e-4) / attack_s)
-        left[start:end] += pad_l * pad_env * lfo
-        right[start:end] += pad_r * pad_env * lfo
+            attack_s = min(0.20, max(0.04, seg_len / float(SAMPLE_RATE) * 0.12))
+            pad_env = np.minimum(1.0, seg_t / attack_s) * np.minimum(1.0, (seg_t[-1] - seg_t + 1e-4) / attack_s)
+            left[start:end] += pad_l * pad_env * lfo
+            right[start:end] += pad_r * pad_env * lfo
 
-        # 2. Controlled Deep Sub-Bass Foundation (55-90 Hz)
-        if perc_style == "horror_heartbeat":
-            swell = 0.55 + 0.45 * np.sin(np.pi * seg_t / max(0.1, seg_t[-1]))
-            eerie_det = 1.0 + 0.003 * np.sin(2.0 * np.pi * 0.35 * seg_t)
-            sub_wave = np.tanh(
-                sub_drive * (0.70 * np.sin(2.0 * np.pi * (bass_f * eerie_det) * seg_t) + 0.45 * np.sin(2.0 * np.pi * (bass_f * 2.0) * seg_t))
-            ) * 0.14 * swell
-        elif perc_style in ("investigative_pulse", "driving_viral"):
-            pulse_rate = (bpm / 60.0) * 2.0
-            pulse_env = 0.55 + 0.45 * np.sin(2.0 * np.pi * pulse_rate * seg_t)
-            sub_wave = np.tanh(sub_drive * np.sin(2.0 * np.pi * bass_f * seg_t)) * 0.16 * pulse_env
-        elif perc_style == "cinema_taiko":
-            swell = 0.60 + 0.40 * np.sin(np.pi * seg_t / max(0.1, seg_t[-1]))
-            sub_wave = np.tanh(sub_drive * (np.sin(2.0 * np.pi * bass_f * seg_t) + 0.40 * np.sin(2.0 * np.pi * (bass_f * 2.0) * seg_t))) * 0.16 * swell
-        elif perc_style == "bouncy_pizzicato":
-            bounce_env = np.exp(-5.5 * (seg_t % (beat_s * 0.5)))
-            sub_wave = np.sin(2.0 * np.pi * bass_f * seg_t) * 0.20 * bounce_env
-        else:
-            wobble = 1.0 + 0.0025 * np.sin(2.0 * np.pi * 1.4 * seg_t)
-            sub_wave = np.tanh(sub_drive * np.sin(2.0 * np.pi * (bass_f * wobble) * seg_t)) * 0.18
-
-        left[start:end] += sub_wave
-        right[start:end] += sub_wave
-
-        # 3a. Tense Bowed Cello & Viola 8th-Note Ostinato in D Minor (146.8-233.1 Hz + 2nd/3rd/4th/5th overtones)
-        # 3b. Haunting Macabre Music-Box / Celesta & Minor Piano Motif (587-932 Hz + stereo delay echo)
-        for st_idx in range(8):
-            st_pos = start + st_idx * step_samples
-            if st_pos >= end:
-                break
-
-            if is_dark_cinema:
-                # (a) Bowed Cello & Viola Ostinato stroke
-                ost_end = min(n, st_pos + int(step_samples * 1.25))
-                ost_len = ost_end - st_pos
-                if ost_len > 32:
-                    ot = np.linspace(0.0, ost_len / float(SAMPLE_RATE), ost_len, endpoint=False)
-                    ost_f = ostinato_notes[(st_idx + (b_idx % 2) * 2) % len(ostinato_notes)]
-                    bow_atk = 1.0 - np.exp(-ot / 0.024)
-                    bow_dec = np.exp(-2.35 * ot)
-                    bow_env = bow_atk * bow_dec
-                    # Cello fundamental (D3..Bb3) + Viola octave double (D4..Bb4) with rich mid-band harmonics
-                    cello_sig = _bowed_string_voice(ost_f, ot, detune=0.999, vib_hz=4.8, phase_offset=st_idx * 0.4)
-                    viola_sig = _bowed_string_voice(ost_f * 2.0, ot, detune=1.0015, vib_hz=5.1, phase_offset=st_idx * 0.6 + 0.5)
-                    rosin = _bandpass(rng.standard_normal(ost_len), 420.0, 1750.0, order=2) * np.exp(-6.5 * ot) * 0.08
-                    ost_accent = 1.18 if (st_idx % 2 == 0) else 0.88
-                    bow_wave_l = (cello_sig * 0.64 + viola_sig * 0.44 + rosin) * bow_env * 0.25 * ost_accent
-                    bow_wave_r = (cello_sig * 0.46 + viola_sig * 0.62 + rosin) * bow_env * 0.25 * ost_accent
-                    left[st_pos:ost_end] += bow_wave_l
-                    right[st_pos:ost_end] += bow_wave_r
-
-                # (b) Haunting Macabre Music-Box / Celesta & Minor Piano Motif
-                cel_end = min(n, st_pos + int(step_samples * 2.4))
-                cel_len = cel_end - st_pos
-                if cel_len > 32:
-                    ct = np.linspace(0.0, cel_len / float(SAMPLE_RATE), cel_len, endpoint=False)
-                    cel_f = celesta_notes[(st_idx + (b_idx % 4) * 2) % len(celesta_notes)]
-                    # Bell-like metallic attack + warm minor piano octave body (293-466 Hz) + crystalline celesta (587-932 Hz)
-                    cel_atk = 1.0 - np.exp(-ct / 0.0035)
-                    cel_body = (
-                        0.68 * np.sin(2.0 * np.pi * cel_f * ct) * np.exp(-2.15 * ct)
-                        + 0.48 * np.sin(2.0 * np.pi * (cel_f * 0.5) * ct) * np.exp(-1.75 * ct)
-                        + 0.34 * np.sin(2.0 * np.pi * (cel_f * 2.0) * ct) * np.exp(-3.8 * ct)
-                        + 0.20 * np.sin(2.0 * np.pi * (cel_f * 3.008) * ct) * np.exp(-9.5 * ct)
-                        + 0.12 * np.sin(2.0 * np.pi * (cel_f * 4.19) * ct) * np.exp(-16.0 * ct)
-                    ) * cel_atk
-                    cel_gain = 0.24 if (st_idx in (0, 2, 3, 5, 6)) else 0.16
-                    pan_c = 0.76 if (st_idx % 2 == 0) else 0.28
-                    celesta_l[st_pos:cel_end] += cel_body * cel_gain * pan_c
-                    celesta_r[st_pos:cel_end] += cel_body * cel_gain * (1.04 - pan_c)
+            if perc_style == "bouncy_pizzicato":
+                bounce_env = np.exp(-5.5 * (seg_t % (beat_s * 0.5)))
+                sub_wave = np.sin(2.0 * np.pi * bass_f * seg_t) * 0.20 * bounce_env
             else:
+                wobble = 1.0 + 0.0025 * np.sin(2.0 * np.pi * 1.4 * seg_t)
+                sub_wave = np.tanh(sub_drive * np.sin(2.0 * np.pi * (bass_f * wobble) * seg_t)) * 0.18
+            left[start:end] += sub_wave
+            right[start:end] += sub_wave
+
+            for st_idx in range(8):
+                st_pos = start + st_idx * step_samples
+                if st_pos >= end:
+                    break
                 st_end = min(end, st_pos + step_samples)
                 st_len = st_end - st_pos
                 if st_len <= 16:
@@ -750,121 +1262,55 @@ def _synthesize_procedural_track(
                 left[st_pos:st_end] += pluck * pan_alt
                 right[st_pos:st_end] += pluck * (1.08 - pan_alt)
 
-        # 3c. Distant Cathedral Tubular Bells (293.7 Hz D4 + inharmonic bell partials) on bar boundaries
-        if is_dark_cinema:
-            bell_len = min(n - start, int(2.85 * SAMPLE_RATE))
-            if bell_len > 64:
-                bt_arr = np.linspace(0.0, bell_len / float(SAMPLE_RATE), bell_len, endpoint=False)
-                bell_f = bell_notes[b_idx % len(bell_notes)]
-                bell_atk = 1.0 - np.exp(-bt_arr / 0.005)
-                # Authentic tubular bell inharmonic partials centered around 293.66 Hz (D4) -> 1,200 Hz
-                bell_sig_l = (
-                    0.42 * np.sin(2.0 * np.pi * (bell_f * 0.5) * bt_arr) * np.exp(-1.15 * bt_arr)
-                    + 0.95 * np.sin(2.0 * np.pi * bell_f * bt_arr) * np.exp(-1.45 * bt_arr)
-                    + 0.58 * np.sin(2.0 * np.pi * (bell_f * 1.183) * bt_arr + 0.3) * np.exp(-1.85 * bt_arr)
-                    + 0.48 * np.sin(2.0 * np.pi * (bell_f * 1.506) * bt_arr + 0.7) * np.exp(-2.15 * bt_arr)
-                    + 0.62 * np.sin(2.0 * np.pi * (bell_f * 2.002) * bt_arr + 1.1) * np.exp(-2.45 * bt_arr)
-                    + 0.34 * np.sin(2.0 * np.pi * (bell_f * 2.514) * bt_arr + 1.5) * np.exp(-3.10 * bt_arr)
-                    + 0.22 * np.sin(2.0 * np.pi * (bell_f * 3.011) * bt_arr + 1.9) * np.exp(-3.90 * bt_arr)
-                ) * bell_atk * 0.21
-                bell_sig_r = np.roll(bell_sig_l, 22) * 0.98
-                left[start : start + bell_len] += bell_sig_l
-                right[start : start + bell_len] += bell_sig_r
-
-    # Apply stereo ping-pong delay echo to Macabre Music-Box / Celesta motif
-    if is_dark_cinema:
-        d1 = max(1, int(round(beat_s * 0.375 * SAMPLE_RATE)))  # dotted-16th / 8th stereo echo
-        d2 = max(1, int(round(beat_s * 0.75 * SAMPLE_RATE)))
-        echo_l = celesta_l.copy()
-        echo_r = celesta_r.copy()
-        if d1 < n:
-            echo_l[d1:] += celesta_r[:-d1] * 0.48
-            echo_r[d1:] += celesta_l[:-d1] * 0.48
-        if d2 < n:
-            echo_l[d2:] += celesta_l[:-d2] * 0.26
-            echo_r[d2:] += celesta_r[:-d2] * 0.26
-        left += echo_l
-        right += echo_r
-
-    # 4. Broadcast Rhythmic Percussion & Deep Heartbeat Sub-Pulse (55-90 Hz)
-    total_beats = int(math.ceil(n / float(beat_samples)))
-    for bt in range(total_beats):
-        pos = bt * beat_samples
-        if pos >= n:
-            break
-        k_len = min(int(0.45 * SAMPLE_RATE), n - pos)
-        if k_len <= 16:
-            continue
-        kt = np.linspace(0.0, k_len / float(SAMPLE_RATE), k_len, endpoint=False)
-
-        if perc_style == "horror_heartbeat":
+        total_beats = int(math.ceil(n / float(beat_samples)))
+        for bt in range(total_beats):
+            pos = bt * beat_samples
+            if pos >= n:
+                break
+            k_len = min(int(0.45 * SAMPLE_RATE), n - pos)
+            if k_len <= 16:
+                continue
+            kt = np.linspace(0.0, k_len / float(SAMPLE_RATE), k_len, endpoint=False)
             if bt % 2 == 0:
-                # Deep realistic double-thump heartbeat sub-pulse (55-90 Hz)
-                f_lub = 56.0 + 34.0 * np.exp(-18.0 * kt)
-                ph_lub = 2.0 * np.pi * np.cumsum(f_lub) / float(SAMPLE_RATE)
-                lub = np.tanh(1.4 * np.sin(ph_lub)) * np.exp(-9.5 * kt) * 0.15
-                dt_dub = np.maximum(0.0, kt - 0.24)
-                m_dub = (kt >= 0.24).astype(np.float64)
-                f_dub = 55.0 + 30.0 * np.exp(-20.0 * dt_dub)
-                ph_dub = 2.0 * np.pi * np.cumsum(f_dub * m_dub) / float(SAMPLE_RATE)
-                dub = m_dub * np.tanh(1.3 * np.sin(ph_dub)) * np.exp(-11.0 * dt_dub) * 0.12
-                thump = lub + dub
-                left[pos : pos + k_len] += thump
-                right[pos : pos + k_len] += thump
-            continue
+                f_sweep = 90.0 * np.exp(-22.0 * kt) + 52.0
+                phase = 2.0 * np.pi * np.cumsum(f_sweep) / float(SAMPLE_RATE)
+                kick = np.tanh(1.4 * np.sin(phase)) * np.exp(-13.5 * kt) * 0.17
+                left[pos : pos + k_len] += kick
+                right[pos : pos + k_len] += kick
+            else:
+                noise = rng.standard_normal(k_len)
+                hat_l = _bandpass(noise, 5200.0, 12500.0) * np.exp(-55.0 * kt) * 0.065
+                hat_r = _bandpass(rng.standard_normal(k_len), 5400.0, 12800.0) * np.exp(-58.0 * kt) * 0.065
+                left[pos : pos + k_len] += hat_l
+                right[pos : pos + k_len] += hat_r
 
-        if bt % 2 == 0:
-            f_sweep = 90.0 * np.exp(-22.0 * kt) + 52.0
-            phase = 2.0 * np.pi * np.cumsum(f_sweep) / float(SAMPLE_RATE)
-            kick = np.tanh(1.4 * np.sin(phase)) * np.exp(-13.5 * kt) * 0.17
-            left[pos : pos + k_len] += kick
-            right[pos : pos + k_len] += kick
-        else:
-            noise = rng.standard_normal(k_len)
-            hat_l = _bandpass(noise, 5200.0, 12500.0) * np.exp(-55.0 * kt) * 0.065
-            hat_r = _bandpass(rng.standard_normal(k_len), 5400.0, 12800.0) * np.exp(-58.0 * kt) * 0.065
-            left[pos : pos + k_len] += hat_l
-            right[pos : pos + k_len] += hat_r
+        cutoff_hz = float(prof.get("cutoff_hz", 6500.0))
+        left_eq = _lowpass(left, cutoff_hz, order=2)
+        right_eq = _lowpass(right, cutoff_hz, order=2)
+        fade_in = min(int(0.15 * SAMPLE_RATE), n // 8)
+        fade_out = min(int(0.25 * SAMPLE_RATE), n // 6)
+        if fade_in > 0:
+            left_eq[:fade_in] *= np.linspace(0.0, 1.0, fade_in)
+            right_eq[:fade_in] *= np.linspace(0.0, 1.0, fade_in)
+        if fade_out > 0:
+            left_eq[-fade_out:] *= np.linspace(1.0, 0.0, fade_out)
+            right_eq[-fade_out:] *= np.linspace(1.0, 0.0, fade_out)
+        stereo = np.column_stack([left_eq, right_eq])
 
-        off_pos = pos + step_samples
-        if off_pos < n and perc_style in ("investigative_pulse", "modern_tech", "driving_viral"):
-            gh_len = min(int(0.08 * SAMPLE_RATE), n - off_pos)
-            if gh_len > 16:
-                ght = np.linspace(0.0, gh_len / float(SAMPLE_RATE), gh_len, endpoint=False)
-                gh = _bandpass(rng.standard_normal(gh_len), 6500.0, 13000.0) * np.exp(-85.0 * ght) * 0.04
-                left[off_pos : off_pos + gh_len] += gh * 0.8
-                right[off_pos : off_pos + gh_len] += gh * 1.1
-
-    # 5. Warm Cinema Filtering (preserving full 250-2,200 Hz Cello + Celesta + Tubular Bell clarity!)
-    nyq = 0.5 * SAMPLE_RATE
-    cutoff_hz = float(prof.get("cutoff_hz", 6500.0))
-    sos_lp = signal.butter(2, min(cutoff_hz, nyq - 200.0) / nyq, btype="low", output="sos")
-    left_eq = signal.sosfilt(sos_lp, left)
-    right_eq = signal.sosfilt(sos_lp, right)
-
-    # Reinforce 280-2,100 Hz mid-range presence for mobile & broadcast speaker translation
-    if is_dark_cinema:
-        mid_l = _bandpass(left_eq, 280.0, 2100.0, order=2)
-        mid_r = _bandpass(right_eq, 280.0, 2100.0, order=2)
-        left_eq = left_eq + 0.38 * mid_l
-        right_eq = right_eq + 0.38 * mid_r
-
-    # Smooth 0.15s fade-in and 0.25s fade-out so looping is click-free
-    fade_in = min(int(0.15 * SAMPLE_RATE), n // 8)
-    fade_out = min(int(0.25 * SAMPLE_RATE), n // 6)
-    if fade_in > 0:
-        env_in = np.linspace(0.0, 1.0, fade_in)
-        left_eq[:fade_in] *= env_in
-        right_eq[:fade_in] *= env_in
-    if fade_out > 0:
-        env_out = np.linspace(1.0, 0.0, fade_out)
-        left_eq[-fade_out:] *= env_out
-        right_eq[-fade_out:] *= env_out
-
-    stereo = np.column_stack([left_eq, right_eq])
     target_out.parent.mkdir(parents=True, exist_ok=True)
     tmp_wav = target_out.with_name(f"{target_out.stem}_raw_tmp.wav")
     _save_stereo_wav(tmp_wav, stereo, sr=SAMPLE_RATE)
+
+    # Exact linear LUFS calibration to -16.0 LUFS + transparent 192kHz peak limiter
+    # (preserves 100% of the 4-Movement macro dynamic range LRA >= 4.5 LU — zero dynamic loudnorm crushing!)
+    raw_lufs = _measure_lufs_flow(tmp_wav)
+    cal_db = max(-14.0, min(14.0, -16.0 - raw_lufs)) if raw_lufs is not None else 0.0
+    master_af = (
+        f"volume={cal_db:+.2f}dB,"
+        "aresample=192000,"
+        "alimiter=limit=0.84:level=false:attack=3:release=45:latency=true,"
+        f"aresample={SAMPLE_RATE}"
+    )
 
     if target_out.suffix.lower() == ".wav":
         try:
@@ -878,7 +1324,9 @@ def _synthesize_procedural_track(
                     "-i",
                     str(tmp_wav),
                     "-af",
-                    "loudnorm=I=-16.0:TP=-1.5:LRA=9",
+                    master_af,
+                    "-c:a",
+                    "pcm_s16le",
                     "-ar",
                     str(SAMPLE_RATE),
                     "-ac",
@@ -902,7 +1350,7 @@ def _synthesize_procedural_track(
                     "-i",
                     str(tmp_wav),
                     "-af",
-                    "loudnorm=I=-16.0:TP=-1.5:LRA=9",
+                    master_af,
                     "-c:a",
                     "libmp3lame",
                     "-b:a",
@@ -923,12 +1371,31 @@ def _synthesize_procedural_track(
         "path": final_file,
         "profile": prof_str,
         "bpm": round(bpm, 1),
+        "bars": eff_bars,
         "key": prof["key"],
         "duration_s": round(total_s, 2),
         "sample_rate": SAMPLE_RATE,
         "channels": 2,
         "lufs_target": -16.0,
+        "score_version": DARK_SCORE_VERSION if is_dark_cinema else "v7_procedural",
     }
+
+
+def _generate_procedural_bgm_wav(
+    out_wav: Union[Path, str],
+    mood_raw: str = "dark_horror_cinema",
+    duration_s: float = DARK_SCORE_DURATION_S,
+) -> Dict[str, Any]:
+    """Generate a bar-locked 48kHz stereo WAV BGM score (4-Movement Evolving Score for dark_horror_cinema)."""
+    target_wav = Path(out_wav)
+    if target_wav.suffix.lower() != ".wav":
+        target_wav = target_wav.with_suffix(".wav")
+    return _synthesize_procedural_track(
+        out_mp3=target_wav,
+        mood_raw=mood_raw,
+        profile_key=normalize_music_mood(mood_raw),
+        duration_s=duration_s,
+    )
 
 
 # Keep backward-compatible alias
@@ -937,10 +1404,10 @@ _synthesize_flow_music_bed = _synthesize_procedural_track
 
 def measure_track_midband_rms(
     audio_path: Path,
-    low_hz: float = 300.0,
-    high_hz: float = 2000.0,
+    low_hz: float = 400.0,
+    high_hz: float = 2500.0,
 ) -> Tuple[float, float, float]:
-    """Return `(mid_rms, total_rms, mid_to_total_ratio)` for an audio file in the 300-2000 Hz mid-band."""
+    """Return `(mid_rms, total_rms, mid_to_total_ratio)` for an audio file in the 400-2500 Hz vocal band."""
     p = Path(audio_path)
     if not p.exists() or p.stat().st_size < 256:
         return 0.0, 0.0, 0.0
@@ -948,7 +1415,7 @@ def measure_track_midband_rms(
         res = subprocess.run(
             ["ffmpeg", "-v", "error", "-i", str(p), "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "-"],
             capture_output=True,
-            timeout=30,
+            timeout=60,
         )
         if not res.stdout:
             return 0.0, 0.0, 0.0
@@ -963,41 +1430,104 @@ def measure_track_midband_rms(
         return 0.0, 0.0, 0.0
 
 
-def ensure_upgraded_dark_horror_music(force_regen: bool = True, duration_s: float = 45.0) -> Path:
-    """Regenerate both the `FlowVault` `dark_horror_cinema` track AND `assets/music/dark_mystery_horror.mp3`
-    whenever `force_regen=True` OR when existing track mid-band (`300-2000 Hz`) RMS is too weak (`< 0.068`).
+def _probe_audio_duration_s(audio_path: Path) -> float:
+    p = Path(audio_path)
+    if not p.exists() or p.stat().st_size < 256:
+        return 0.0
+    try:
+        res = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(p)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return float(res.stdout.strip() or 0.0)
+    except Exception:
+        return 0.0
+
+
+def ensure_upgraded_dark_horror_music(
+    force_regen: bool = True,
+    duration_s: float = DARK_SCORE_DURATION_S,
+) -> Path:
+    """Regenerate BOTH `data/flow_vault/music/dark_horror_cinema.wav` AND
+    `assets/music/dark_mystery_horror.mp3` with the metric bar-locked 48-bar (`174.55s` @ `66 BPM`)
+    4-Movement Evolving Documentary Score whenever `force_regen=True`, either file is missing/short
+    (`< 110s`), or mid-band (`400-2500 Hz`) is unbalanced/masking (`> 0.45` ratio).
     Returns the ready `assets/music/dark_mystery_horror.mp3` path.
     """
+    ensure_vault_dirs()
     assets_music_dir = BASE_DIR / "assets" / "music"
     assets_music_dir.mkdir(parents=True, exist_ok=True)
     dark_mp3 = assets_music_dir / "dark_mystery_horror.mp3"
+    vault_wav = VAULT_MUSIC_DIR / "dark_horror_cinema.wav"
 
-    mid_rms, _, mid_ratio = measure_track_midband_rms(dark_mp3)
-    assets_weak = (not dark_mp3.exists()) or (mid_rms < 0.068) or (mid_ratio < 0.42)
-
-    vault_path = fetch_or_generate_flow_music_sync(
-        "dark_horror_cinema",
-        duration_s=duration_s,
-        force_regen=bool(force_regen or assets_weak),
+    mp3_dur = _probe_audio_duration_s(dark_mp3)
+    wav_dur = _probe_audio_duration_s(vault_wav)
+    mid_rms, total_rms, mid_ratio = measure_track_midband_rms(dark_mp3)
+    needs_upgrade = (
+        bool(force_regen)
+        or (not dark_mp3.exists())
+        or (not vault_wav.exists())
+        or (mp3_dur < 110.0)
+        or (wav_dur < 110.0)
+        or (total_rms < 0.04)
+        or (mid_ratio > 0.45)
     )
-    v_mid_rms, _, v_mid_ratio = measure_track_midband_rms(vault_path)
-    if v_mid_rms < 0.068 or v_mid_ratio < 0.42:
-        vault_path = fetch_or_generate_flow_music_sync(
-            "dark_horror_cinema",
-            duration_s=duration_s,
-            force_regen=True,
-        )
 
-    if force_regen or assets_weak:
-        if vault_path.exists() and vault_path.resolve() != dark_mp3.resolve():
-            shutil.copy2(vault_path, dark_mp3)
-        else:
-            _synthesize_procedural_track(
-                out_mp3=dark_mp3,
-                mood_raw="dark_horror_cinema",
-                profile_key="dark_horror_cinema",
-                duration_s=duration_s,
-            )
+    if needs_upgrade:
+        # 1. Generate canonical 48-bar 4-Movement WAV in data/flow_vault/music/dark_horror_cinema.wav
+        meta = _generate_procedural_bgm_wav(
+            out_wav=vault_wav,
+            mood_raw="dark_horror_cinema",
+            duration_s=duration_s,
+        )
+        # 2. Encode assets/music/dark_mystery_horror.mp3 cleanly from that exact bar-locked WAV
+        run_ffmpeg_safe(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-i",
+                str(vault_wav),
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                "-ar",
+                str(SAMPLE_RATE),
+                "-ac",
+                "2",
+                str(dark_mp3),
+            ]
+        )
+        # 3. Register in FlowVault index for zero-credit reuse
+        vault = get_flow_vault()
+        dur_bucket = f"{int(round(max(12.0, float(meta['duration_s'])) / 5.0) * 5)}s"
+        vault.store_asset(
+            kind="music",
+            prompt_or_mood="dark_horror_cinema",
+            file_path=vault_wav,
+            aspect_ratio="stereo",
+            credits_cost=0,
+            extra=dur_bucket,
+            copy_into_vault=False,
+            metadata={
+                "mood": "dark_horror_cinema",
+                "mood_profile": "dark_horror_cinema",
+                "bpm": meta["bpm"],
+                "bars": meta.get("bars", DARK_SCORE_BARS),
+                "key": meta["key"],
+                "duration_s": meta["duration_s"],
+                "sample_rate": SAMPLE_RATE,
+                "channels": 2,
+                "source": "flowmusic.app_vault_dsp_4movement",
+                "score_version": DARK_SCORE_VERSION,
+                "lufs_target": -16.0,
+                "sidechain_ready": True,
+            },
+        )
 
     return dark_mp3.resolve()
 

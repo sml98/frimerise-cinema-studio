@@ -2,12 +2,14 @@
 
 Synthesizes rich, multi-layered 48kHz stereo cinema sound effects and atmospheric
 dark-mystery/horror music beds purely with NumPy + SciPy (100% permissive license, zero GPL):
-- 15 upgraded cinema SFX in `assets/sfx/`:
+- 21 upgraded cinema & mixed-media tactile foley SFX in `assets/sfx/`:
   `sub_boom.wav`, `horror_braam.wav`, `cinematic_hit.wav`, `whoosh_fast.wav`,
   `whoosh_deep.wav`, `riser_tension.wav`, `paper_flip.wav`, `flash_impact.wav`,
   `heartbeat.wav`, `pop_bubble.wav`, `glitch_digital.wav`, `camera_shutter.wav`,
-  `cash_chime.wav`, `typing_tick.wav`, `ui_click.wav`
-- Seamless 45s dark mystery/horror cinema music bed: `assets/music/dark_mystery_horror.mp3`
+  `cash_chime.wav`, `typing_tick.wav`, `ui_click.wav`,
+  `marker_highlight_stroke.wav`, `vector_draw_tick.wav`, `pip_card_slide.wav`,
+  `scene_cut_sub_pulse.wav`, `pattern_interrupt_shutter.wav`, `room_tone_bed.wav`
+- Seamless 48-bar (`174.55s` @ `66 BPM`) 4-Movement Evolving Dark Documentary Score: `assets/music/dark_mystery_horror.mp3`
 - Public helpers: `ensure_pro_cinema_sfx()` and `select_music_for_mood(topic, default_file)`
 """
 from __future__ import annotations
@@ -31,7 +33,7 @@ SFX_DIR = ASSETS_DIR / "sfx"
 MUSIC_DIR = ASSETS_DIR / "music"
 
 SR = 48000
-PRO_SFX_VERSION = "pro_cinema_sfx_v6"
+PRO_SFX_VERSION = "pro_cinema_sfx_v7_tactile"
 VERSION_STAMP_FILE = SFX_DIR / ".pro_cinema_sfx_version.json"
 
 ALL_SFX_NAMES: Tuple[str, ...] = (
@@ -50,7 +52,24 @@ ALL_SFX_NAMES: Tuple[str, ...] = (
     "cash_chime.wav",
     "typing_tick.wav",
     "ui_click.wav",
+    # JSON v3.0.0 Tactile Mixed-Media Foley & SFX
+    "marker_highlight_stroke.wav",
+    "vector_draw_tick.wav",
+    "pip_card_slide.wav",
+    "scene_cut_sub_pulse.wav",
+    "pattern_interrupt_shutter.wav",
+    "room_tone_bed.wav",
 )
+
+# Canonical JSON v3.0.0 tactile foley mix guidance (dBFS relative to voiceover bus)
+TACTILE_FOLEY_RECOMMENDED_DB: Dict[str, float] = {
+    "marker_highlight_stroke.wav": -12.0,
+    "vector_draw_tick.wav": -15.0,
+    "pip_card_slide.wav": -13.0,
+    "scene_cut_sub_pulse.wav": -18.0,
+    "pattern_interrupt_shutter.wav": -10.0,
+    "room_tone_bed.wav": -26.0,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -846,6 +865,237 @@ def synth_ui_click() -> np.ndarray:
     return _master_stereo(dry, target_peak_db=-0.7, fade_in_ms=0.4, fade_out_ms=14.0, bus_drive=1.45)
 
 
+# ---------------------------------------------------------------------------
+# 6 JSON v3.0.0 Tactile Mixed-Media Foley & Documentary SFX (48kHz Stereo)
+# ---------------------------------------------------------------------------
+def synth_marker_highlight_stroke() -> np.ndarray:
+    """Organic felt-tip brush marker stroke on archival paper (0.38s) for #FFD700 highlighter wipes (-12dB)."""
+    rng = _rng(16001)
+    dur = 0.38
+    n = int(round(dur * SR))
+    t = np.arange(n, dtype=np.float64) / SR
+
+    # 1. Soft felt nib landing contact on matte parchment (0.008s - 0.045s)
+    dt_touch = np.maximum(0.0, t - 0.008)
+    m_touch = (t >= 0.008).astype(np.float64)
+    nib_touch = m_touch * (
+        _butter(_pink_noise(n, rng), (240.0, 1450.0), "bandpass", order=2) * np.exp(-dt_touch / 0.016) * 0.72
+        + np.sin(2.0 * math.pi * 310.0 * dt_touch) * np.exp(-dt_touch / 0.012) * 0.35
+    )
+
+    # 2. Continuous felt-tip fiber friction sweep across paper tooth (0.018s -> 0.345s)
+    prog = np.clip((t - 0.018) / 0.325, 0.0, 1.0)
+    stroke_win = np.where((t >= 0.018) & (t <= 0.345), np.sin(math.pi * prog) ** 0.68, 0.0)
+    # Organic paper grain micro-irregularity
+    grain_mod = (
+        0.74
+        + 0.16 * np.sin(2.0 * math.pi * 54.0 * t + 1.3 * np.sin(2.0 * math.pi * 13.0 * t))
+        + 0.10 * np.sin(2.0 * math.pi * 118.0 * t)
+    )
+    f_brush = 1350.0 + 1650.0 * np.sin(math.pi * (prog ** 0.85))
+    brush_body = _resonant_filter_sweep(_pink_noise(n, rng), f_brush, q_curve=2.3, mode="bandpass") * stroke_win * grain_mod * 1.25
+    paper_tooth = _butter(_white_noise(n, rng), (2800.0, 7900.0), "bandpass", order=2) * stroke_win * grain_mod * 0.62
+
+    # 3. Subtle warm wet-felt resonance whisper (never piercing)
+    f_felt = 2150.0 + 420.0 * prog
+    felt_whisp = np.sin(2.0 * math.pi * np.cumsum(f_felt) / SR) * stroke_win * grain_mod * 0.055
+
+    # 4. Crisp nib lift at end of highlight (0.325s)
+    dt_lift = np.maximum(0.0, t - 0.322)
+    m_lift = (t >= 0.322).astype(np.float64)
+    nib_lift = m_lift * _butter(_white_noise(n, rng), (1800.0, 6200.0), "bandpass", order=2) * np.exp(-dt_lift / 0.012) * 0.38
+
+    # Left -> Right spatial glide matching visual #FFD700 wipe direction
+    pan = -0.52 + 1.04 * prog
+    dry = _stereo_pan(nib_touch + brush_body + paper_tooth + felt_whisp + nib_lift, pan)
+    wet = _dark_hall_reverb(dry, decay_s=0.24, predelay_ms=4.0, damp_hz=4200.0, mix=0.11, seed=16002)
+    return _master_stereo(wet, target_peak_db=-1.0, fade_in_ms=2.0, fade_out_ms=18.0, bus_drive=1.35)
+
+
+def synth_vector_draw_tick() -> np.ndarray:
+    """Tactile pen/chalk scratch + precision multi-tick burst (0.65s) for 2D vector lines, charts & timelines (-15dB)."""
+    rng = _rng(17001)
+    dur = 0.65
+    n = int(round(dur * SR))
+    t = np.arange(n, dtype=np.float64) / SR
+
+    # 1. Tactile drafting pen / chalk scratch bed across blueprint paper (0.01s -> 0.58s)
+    prog = np.clip((t - 0.012) / 0.565, 0.0, 1.0)
+    draw_win = np.where((t >= 0.012) & (t <= 0.580), np.sin(math.pi * prog) ** 0.55, 0.0)
+    stroke_pulse = 0.68 + 0.32 * np.sin(2.0 * math.pi * 11.5 * t)
+    f_chalk = 1950.0 + 1850.0 * (prog ** 0.9)
+    chalk_mid = _resonant_filter_sweep(_pink_noise(n, rng), f_chalk, q_curve=2.6, mode="bandpass") * draw_win * stroke_pulse * 0.85
+    chalk_hi = _butter(_white_noise(n, rng), (4200.0, 9600.0), "bandpass", order=2) * draw_win * stroke_pulse * 0.42
+    pan_draw = -0.45 + 0.90 * prog
+    st = _stereo_pan(chalk_mid + chalk_hi, pan_draw)
+
+    # 2. Precision 5-tick chronometer / vector-node lock burst
+    tick_specs = [
+        (0.038, 1620.0, -0.36, 0.82),
+        (0.155, 1780.0, +0.28, 0.78),
+        (0.278, 1940.0, -0.22, 0.85),
+        (0.402, 2110.0, +0.24, 0.82),
+        (0.528, 2320.0, 0.00, 0.96),
+    ]
+    for t0, f_pk, pan_t, amp_t in tick_specs:
+        dt = np.maximum(0.0, t - t0)
+        m = (t >= t0).astype(np.float64)
+        click_hi = _butter(_white_noise(n, rng), (2600.0, 10200.0), "bandpass", order=2) * np.exp(-dt / 0.0042) * m
+        wood_body = np.sin(2.0 * math.pi * (f_pk * 0.34) * dt) * np.exp(-dt / 0.015) * m * 0.58
+        brass_ping = np.sin(2.0 * math.pi * f_pk * dt) * np.exp(-dt / 0.011) * m * 0.64
+        st += _stereo_pan((click_hi * 0.85 + wood_body + brass_ping) * amp_t, pan_t)
+
+    wet = _dark_hall_reverb(st, decay_s=0.30, predelay_ms=5.0, damp_hz=4500.0, mix=0.14, seed=17002)
+    return _master_stereo(wet, target_peak_db=-1.0, fade_in_ms=1.5, fade_out_ms=26.0, bus_drive=1.32)
+
+
+def synth_pip_card_slide() -> np.ndarray:
+    """Crisp archival paper slide + low velvety air whoosh (0.48s) for Video-over-Video PiP card entrances (-13dB)."""
+    rng = _rng(18001)
+    dur = 0.48
+    n = int(round(dur * SR))
+    t = np.arange(n, dtype=np.float64) / SR
+    peak_t = 0.20
+
+    # 1. Low velvety air whoosh envelope
+    env_air = np.where(
+        t < peak_t,
+        np.exp(-((t - peak_t) / 0.095) ** 2),
+        np.exp(-((t - peak_t) / 0.145) ** 2),
+    )
+    f_velvet = 145.0 + 1020.0 * (env_air ** 1.25)
+    velvet_air = _resonant_filter_sweep(_pink_noise(n, rng), f_velvet, q_curve=1.45, mode="bandpass") * env_air * 1.15
+    sub_glide = np.sin(2.0 * math.pi * np.cumsum(54.0 + 62.0 * env_air) / SR) * (env_air ** 1.3) * 0.48
+
+    # 2. Crisp archival heavy-stock card friction glide (0.04s -> 0.36s)
+    c_prog = np.clip((t - 0.04) / 0.31, 0.0, 1.0)
+    card_win = np.where((t >= 0.04) & (t <= 0.35), np.sin(math.pi * c_prog) ** 0.75, 0.0)
+    card_satin = _butter(_white_noise(n, rng), (1400.0, 5800.0), "bandpass", order=2) * card_win * 0.65
+    card_body = _butter(_pink_noise(n, rng), (380.0, 1400.0), "bandpass", order=2) * card_win * 0.58
+
+    # 3. Tactile settled paper-card landing thud (t = 0.33s)
+    dt_land = np.maximum(0.0, t - 0.330)
+    m_land = (t >= 0.330).astype(np.float64)
+    f_land = 92.0 + 115.0 * np.exp(-dt_land / 0.014)
+    land_thud = m_land * np.sin(2.0 * math.pi * np.cumsum(f_land * m_land) / SR) * np.exp(-dt_land / 0.036) * 0.52
+    land_snap = m_land * _butter(_white_noise(n, rng), (1100.0, 4400.0), "bandpass", order=2) * np.exp(-dt_land / 0.011) * 0.36
+
+    pan_slide = np.clip(-0.58 + 0.82 * (t / 0.36), -0.58, 0.24)
+    dry = _stereo_pan(velvet_air + sub_glide + card_satin + card_body, pan_slide) + _stereo_pan(land_thud + land_snap, 0.16)
+    wet = _dark_hall_reverb(dry, decay_s=0.40, predelay_ms=7.0, damp_hz=3200.0, mix=0.18, seed=18002)
+    return _master_stereo(wet, target_peak_db=-1.0, fade_in_ms=3.0, fade_out_ms=28.0, bus_drive=1.35)
+
+
+def synth_scene_cut_sub_pulse() -> np.ndarray:
+    """Subtle low-frequency whoosh + deep rounded sub-pulse (0.55s) for every 2nd scene cut (-18dB)."""
+    rng = _rng(19001)
+    dur = 0.55
+    n = int(round(dur * SR))
+    t = np.arange(n, dtype=np.float64) / SR
+    apex_t = 0.17
+
+    # 1. Soft dark low-frequency air whoosh peaking gently at 0.17s (kept out of vocal mid-band!)
+    w_env = np.where(
+        t < apex_t,
+        np.exp(-((t - apex_t) / 0.085) ** 2),
+        np.exp(-((t - apex_t) / 0.165) ** 2),
+    )
+    f_lo_air = 85.0 + 540.0 * (w_env ** 1.3)
+    lo_whoosh = _resonant_filter_sweep(_pink_noise(n, rng) * 0.65 + _brown_noise(n, rng) * 0.55, f_lo_air, q_curve=1.25, mode="bandpass") * w_env * 0.85
+
+    # 2. Smooth deep cinema sub-pulse (74Hz -> 38Hz rounded drop right at apex)
+    dt_p = np.maximum(0.0, t - 0.115)
+    m_p = (t >= 0.115).astype(np.float64)
+    f_sub = 38.0 + 38.0 * np.exp(-dt_p / 0.085)
+    sub_wave = m_p * np.sin(2.0 * math.pi * np.cumsum(f_sub * m_p) / SR) * (1.0 - np.exp(-dt_p / 0.016)) * np.exp(-dt_p / 0.165)
+    sub_warm = _butter(_soft_saturate(sub_wave * 1.15, drive=1.45, asym=0.05), 220.0, "lowpass", order=3)
+
+    pan_sw = np.tanh((t - apex_t) * 3.2) * 0.42
+    dry = _stereo_pan(lo_whoosh, pan_sw) + _to_stereo(sub_warm * 1.05, delay_ms=0.50, side_gain=0.08)
+    wet = _dark_hall_reverb(dry, decay_s=0.62, predelay_ms=10.0, damp_hz=1100.0, mix=0.22, seed=19002)
+    return _master_stereo(wet, target_peak_db=-1.2, fade_in_ms=5.0, fade_out_ms=42.0, bus_drive=1.28)
+
+
+def synth_pattern_interrupt_shutter() -> np.ndarray:
+    """Crisp mechanical 35mm camera-shutter + vintage typewriter strike (0.42s) for the 240s Pattern Interrupt."""
+    rng = _rng(20001)
+    dur = 0.42
+    n = int(round(dur * SR))
+    t = np.arange(n, dtype=np.float64) / SR
+
+    def _mech_strike(t0: float, f_body: float, f_lo: float, f_hi: float, dec: float, amp: float) -> np.ndarray:
+        dt = np.maximum(0.0, t - t0)
+        m = (t >= t0).astype(np.float64)
+        e_tr = m * np.exp(-dt / dec)
+        e_bd = m * np.exp(-dt / (dec * 2.4))
+        click = _butter(_white_noise(n, rng), (f_lo, f_hi), "bandpass", order=3) * e_tr
+        body = np.sin(2.0 * math.pi * f_body * dt) * e_bd * 0.62
+        ring = np.sin(2.0 * math.pi * (f_lo * 1.18) * dt) * np.exp(-dt / (dec * 1.1)) * m * 0.34
+        return (click * 0.95 + body + ring) * amp
+
+    # 1. Mechanical 35mm camera shutter mirror-up (t = 0.004s) + curtain close (t = 0.064s)
+    shutter_open = _mech_strike(0.004, 285.0, 2600.0, 10800.0, 0.0085, 0.95)
+    shutter_close = _mech_strike(0.064, 215.0, 2100.0, 8200.0, 0.0105, 0.82)
+
+    # 2. Authoritative vintage mechanical typewriter keybar + platen strike (t = 0.148s)
+    dt_tw = np.maximum(0.0, t - 0.148)
+    m_tw = (t >= 0.148).astype(np.float64)
+    f_platen = 175.0 + 190.0 * np.exp(-dt_tw / 0.009)
+    platen = m_tw * np.sin(2.0 * math.pi * np.cumsum(f_platen * m_tw) / SR) * np.exp(-dt_tw / 0.022) * 0.92
+    typebar_snap = m_tw * _butter(_white_noise(n, rng), (3100.0, 11800.0), "bandpass", order=3) * np.exp(-dt_tw / 0.0065) * 1.12
+    steel_ring = m_tw * (
+        0.44 * np.sin(2.0 * math.pi * 3420.0 * dt_tw) * np.exp(-dt_tw / 0.018)
+        + 0.24 * np.sin(2.0 * math.pi * 5180.0 * dt_tw) * np.exp(-dt_tw / 0.011)
+    )
+    typewriter = platen + typebar_snap + steel_ring
+
+    dry = _stereo_pan(shutter_open, -0.22) + _stereo_pan(shutter_close, +0.20) + _stereo_pan(typewriter, 0.0)
+    wet = _dark_hall_reverb(dry, decay_s=0.38, predelay_ms=6.0, damp_hz=4400.0, mix=0.18, seed=20002)
+    return _master_stereo(wet, target_peak_db=-0.8, fade_in_ms=0.6, fade_out_ms=26.0, bus_drive=1.42)
+
+
+def synth_room_tone_bed() -> np.ndarray:
+    """Seamless 16.0s low-level atmospheric room tone / subtle winter air bed mastered at -26 dBFS RMS."""
+    rng = _rng(21001)
+    dur = 16.0
+    xf_s = 2.0
+    n_out = int(round(dur * SR))
+    n_xf = int(round(xf_s * SR))
+    n_raw = n_out + n_xf
+    t = np.arange(n_raw, dtype=np.float64) / SR
+
+    # 1. Deep archival room air pressure (45-165 Hz gentle stereo-decorrelated brown noise)
+    sub_l = _butter(_brown_noise(n_raw, rng), (42.0, 165.0), "bandpass", order=2) * (0.82 + 0.18 * np.sin(2.0 * math.pi * 0.075 * t))
+    sub_r = _butter(_brown_noise(n_raw, rng), (42.0, 165.0), "bandpass", order=2) * (0.82 + 0.18 * np.cos(2.0 * math.pi * 0.068 * t))
+
+    # 2. Subtle distant winter draft / cathedral stone air (210-860 Hz smooth pink noise drift)
+    air_l = _butter(_pink_noise(n_raw, rng), (210.0, 860.0), "bandpass", order=2) * (0.72 + 0.28 * np.sin(2.0 * math.pi * 0.095 * t + 0.5))
+    air_r = _butter(_pink_noise(n_raw, rng), (225.0, 890.0), "bandpass", order=2) * (0.72 + 0.28 * np.sin(2.0 * math.pi * 0.082 * t + 2.1))
+
+    # 3. Ultra-delicate archival room silk (1200-3400 Hz whisper texture)
+    silk_l = _butter(_pink_noise(n_raw, rng), (1200.0, 3400.0), "bandpass", order=2) * 0.14
+    silk_r = _butter(_pink_noise(n_raw, rng), (1250.0, 3500.0), "bandpass", order=2) * 0.14
+
+    raw = np.column_stack([
+        sub_l * 0.62 + air_l * 0.42 + silk_l,
+        sub_r * 0.62 + air_r * 0.42 + silk_r,
+    ])
+    raw = _butter(raw, 28.0, "highpass", order=2)
+
+    # Seamless equal-power loop crossfade over 2.0s -> exact 16.000s zero-seam bed
+    looped = raw[:n_out].copy()
+    fi = np.sin(np.linspace(0.0, math.pi * 0.5, n_xf))[:, None]
+    fo = np.cos(np.linspace(0.0, math.pi * 0.5, n_xf))[:, None]
+    looped[:n_xf] = looped[:n_xf] * fi + raw[n_out : n_out + n_xf] * fo
+
+    # Calibrate directly to exact -26.0 dBFS RMS (per JSON v3.0.0 tactile_sound_design_engine)
+    rms = float(np.sqrt(np.mean(looped * looped) + 1e-12))
+    target_rms = 10.0 ** (-26.0 / 20.0)  # ~0.05012
+    if rms > 1e-9:
+        looped = looped * (target_rms / rms)
+    return np.clip(looped, -0.35, 0.35)
+
+
 _SFX_BUILDERS = {
     "sub_boom.wav": synth_sub_boom,
     "horror_braam.wav": synth_horror_braam,
@@ -862,28 +1112,40 @@ _SFX_BUILDERS = {
     "cash_chime.wav": synth_cash_chime,
     "typing_tick.wav": synth_typing_tick,
     "ui_click.wav": synth_ui_click,
+    # JSON v3.0.0 Tactile Mixed-Media Foley & SFX
+    "marker_highlight_stroke.wav": synth_marker_highlight_stroke,
+    "vector_draw_tick.wav": synth_vector_draw_tick,
+    "pip_card_slide.wav": synth_pip_card_slide,
+    "scene_cut_sub_pulse.wav": synth_scene_cut_sub_pulse,
+    "pattern_interrupt_shutter.wav": synth_pattern_interrupt_shutter,
+    "room_tone_bed.wav": synth_room_tone_bed,
 }
 
 
 # ---------------------------------------------------------------------------
-# Dark Mystery / Horror Cinema Music Bed (45s Seamless Broadcast Stereo MP3)
+# Dark Mystery / Horror Cinema Music Bed (48-Bar / 174.55s 4-Movement Score)
 # ---------------------------------------------------------------------------
 def synthesize_dark_mystery_horror_music(
     out_mp3: Path = MUSIC_DIR / "dark_mystery_horror.mp3",
-    duration_s: float = 45.0,
+    duration_s: float = 174.545,
     thermal_limit_c: float = 85.0,
 ) -> Path:
-    """Synthesize a seamless 45s Netflix/A24 dark mystery/horror cinema music bed (-16.0 LUFS)
-    with rich 250-2,200 Hz mid-range presence:
-    - Tense bowed Cello & Viola Ostinato in D Minor (66 BPM: D3 146.8Hz, F3 174.6Hz, A3 220Hz, Bb3 233.1Hz, G#3 207.6Hz)
-    - Haunting Macabre Music-Box / Celesta & Minor Piano motifs (D5 587Hz, F5 698Hz, A5 880Hz, Bb5 932Hz, G#5 830Hz, E5 659Hz)
-    - Distant Cathedral Tubular Bells (D4 293.7Hz + inharmonic bell partials) + deep heartbeat sub-pulse (55-90Hz).
+    """Synthesize the metric bar-locked 48-bar (`174.55s` @ `66 BPM`) 4-Movement Evolving
+    Documentary Score (`-16.0 LUFS` linear master, balanced `400-2500 Hz` vocal pocket):
+    - Movement I  (Bars 1-8):  Dark ticking clockwork pulse + deep D1/A1 sub drone + rising string swell
+    - Movement II (Bars 9-20): Warm acoustic bowed cello & contrabass + sparse ancient Dorian lute/harp fifths
+    - Movement III(Bars 21-36): Minimalist investigative brushed pulse + muted low brass swells + sparse celesta
+    - Movement IV (Bars 37-48): Dramatic orchestral string crescendo -> haunting solo cello & felt-piano coda.
     """
     out_mp3 = Path(out_mp3)
     out_mp3.parent.mkdir(parents=True, exist_ok=True)
     try:
-        from engine.flow_vault import _synthesize_procedural_track
+        from engine.flow_vault import _synthesize_procedural_track, ensure_upgraded_dark_horror_music
 
+        if out_mp3.resolve() == (MUSIC_DIR / "dark_mystery_horror.mp3").resolve():
+            res_p = ensure_upgraded_dark_horror_music(force_regen=True, duration_s=duration_s)
+            if res_p.exists() and res_p.stat().st_size > 4096:
+                return res_p
         meta = _synthesize_procedural_track(
             out_mp3=out_mp3,
             mood_raw="dark_horror_cinema",
@@ -1102,8 +1364,8 @@ def ensure_pro_cinema_sfx(force: bool = False, thermal_limit_c: float = 85.0) ->
         sfx_map[fname] = str(fpath)
 
     dark_music = MUSIC_DIR / "dark_mystery_horror.mp3"
-    if need_upgrade or not dark_music.exists() or dark_music.stat().st_size < 100_000:
-        synthesize_dark_mystery_horror_music(dark_music, duration_s=45.0, thermal_limit_c=thermal_limit_c)
+    if need_upgrade or not dark_music.exists() or dark_music.stat().st_size < 2_500_000:
+        synthesize_dark_mystery_horror_music(dark_music, duration_s=174.545, thermal_limit_c=thermal_limit_c)
         generated.append("dark_mystery_horror.mp3")
 
     VERSION_STAMP_FILE.write_text(
