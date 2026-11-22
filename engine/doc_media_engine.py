@@ -1668,6 +1668,8 @@ def _check_wikimedia_modern_metadata(
     Returns `(is_rejected, reason, is_historical_art_cat)`.
     """
     _ = mood
+    if not isinstance(extmeta, dict):
+        extmeta = {}
     clean_title = re.sub(r"^file:", "", str(title_raw or ""), flags=re.IGNORECASE).strip()
     if _WIKI_MODERN_SNAP_CAM_RE.search(clean_title):
         return True, "modern_cam_prefix", False
