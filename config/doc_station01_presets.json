@@ -1,0 +1,115 @@
+{
+  "version": "1.0.0",
+  "engine_module": "engine/doc_station01_engine.py",
+  "individual_styles": [
+    {
+      "id": "caption_news",
+      "label": "Caption News (Impacto / Sound-Off First)",
+      "best_for": "Aberturas virais, Reels/Shorts, números de impacto e explicações rápidas",
+      "default_transition": "cut"
+    },
+    {
+      "id": "visual_investigation",
+      "label": "Visual Investigation (Bancada Investigativa)",
+      "best_for": "Documentários investigativos, cruzamento de provas, fact-check Then vs. Record",
+      "default_transition": "flash"
+    },
+    {
+      "id": "newsreel_1920s",
+      "label": "1920s Newsreel (Cinejornal Histórico)",
+      "best_for": "Flashbacks históricos, jornais girando, arquivo em domínio público",
+      "default_transition": "iris"
+    },
+    {
+      "id": "constructivist_montage",
+      "label": "Constructivist Montage (Montagem Rítmica)",
+      "best_for": "Escala industrial, contadores rápidos, construção e tensão rítmica",
+      "default_transition": "red_wipe"
+    },
+    {
+      "id": "broadcast_news_package",
+      "label": "Broadcast News Package (Telejornal Moderno)",
+      "best_for": "Cobertura de eventos recentes, boletins com lower-third e card OTS",
+      "default_transition": "cut"
+    },
+    {
+      "id": "live_countdown_split",
+      "label": "Live Countdown Split-Screen (Contagem Regressiva)",
+      "best_for": "Clímax cronológico, duas frentes simultâneas sob relógio regressivo",
+      "default_transition": "flash"
+    },
+    {
+      "id": "sports_telestrator",
+      "label": "Sports Telestrator (Freeze Frame Tático)",
+      "best_for": "Análise espacial, trajetórias, ângulos de impacto e telemetria",
+      "default_transition": "cut"
+    },
+    {
+      "id": "city_symphony",
+      "label": "City Symphony (Montagem Cinematográfica)",
+      "best_for": "Respiros poéticos, ambientação de época/cidade com letterbox e carimbo de hora",
+      "default_transition": "cut"
+    }
+  ],
+  "recommended_mixes": {
+    "mix_investigacao_completa": {
+      "name": "Mix Investigação Completa (Netflix / NYT Style)",
+      "description": "Hook de impacto -> contexto histórico -> bancada investigativa -> clímax em contagem regressiva.",
+      "acts": {
+        "ACT_0_HOOK": [
+          "caption_news"
+        ],
+        "ACT_1_CONTEXT": [
+          "city_symphony",
+          "newsreel_1920s"
+        ],
+        "ACT_2_EVIDENCE": [
+          "visual_investigation",
+          "sports_telestrator"
+        ],
+        "ACT_3_CLIMAX": [
+          "live_countdown_split",
+          "constructivist_montage"
+        ],
+        "ACT_4_VERDICT": [
+          "visual_investigation"
+        ]
+      }
+    },
+    "mix_viral_curto": {
+      "name": "Mix Viral Rápido (1–3 min / Shorts & Reels)",
+      "description": "Abre com número rolando em Caption News, prova no Visual Investigation e fecha em Broadcast.",
+      "acts": {
+        "ACT_0_HOOK": [
+          "caption_news"
+        ],
+        "ACT_1_TURN": [
+          "visual_investigation"
+        ],
+        "ACT_2_PAYOFF": [
+          "broadcast_news_package",
+          "caption_news"
+        ]
+      }
+    },
+    "mix_documentario_historico": {
+      "name": "Mix Documentário Histórico (Arquivo & Época)",
+      "description": "Combina película 1920s, montagem construtivista e bancada de documentos reais.",
+      "acts": {
+        "ACT_0_HOOK": [
+          "newsreel_1920s"
+        ],
+        "ACT_1_BUILD": [
+          "constructivist_montage",
+          "city_symphony"
+        ],
+        "ACT_2_DEEP_DIVE": [
+          "visual_investigation"
+        ],
+        "ACT_3_CLOSE": [
+          "newsreel_1920s"
+        ]
+      }
+    }
+  }
+}
