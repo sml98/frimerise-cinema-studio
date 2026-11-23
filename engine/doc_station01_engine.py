@@ -45,6 +45,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
+try:
+    import cv2  # type: ignore
+    HAS_CV2 = True
+except ImportError:
+    cv2 = None
+    HAS_CV2 = False
+
 RGB = Tuple[int, int, int]
 
 SUPPORTED_STYLES = (
@@ -198,6 +205,60 @@ def build_1920s_radio_audio_filter() -> str:
 def build_broadcast_audio_filter() -> str:
     """Padrão de masterização FrimeRise (-14.0 LUFS / <= -1.0 dBTP)."""
     return "loudnorm=I=-14:TP=-1.0:LRA=8"
+
+
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+
+
+def _fit_cover_pil(im: Image.Image, width: int, height: int) -> Image.Image:
+    src_ratio = im.width / max(1, im.height)
+    dst_ratio = width / max(1, height)
+    if src_ratio > dst_ratio:
+        new_w = int(im.height * dst_ratio)
+        x0 = (im.width - new_w) // 2
+        im = im.crop((x0, 0, x0 + new_w, im.height))
+    else:
+        new_h = int(im.width / dst_ratio)
+        y0 = (im.height - new_h) // 2
+        im = im.crop((0, y0, im.width, y0 + new_h))
+    return im.resize((width, height), Image.Resampling.LANCZOS)
+
+
+class MediaFrameReader:
+    """Lê imagem estática ou faz streaming frame a frame de vídeo MP4 (com loop limpo e baixa RAM)."""
+
+    def __init__(self, media_path: Optional[str], width: int, height: int, seed: int = 1, tone: RGB = (22, 29, 42)):
+        self.width = width
+        self.height = height
+        self.cap = None
+        self.static_img: Optional[Image.Image] = None
+
+        if media_path and os.path.exists(media_path) and Path(media_path).suffix.lower() in VIDEO_EXTS and HAS_CV2:
+            cap = cv2.VideoCapture(media_path)
+            if cap.isOpened():
+                self.cap = cap
+            else:
+                cap.release()
+
+        if self.cap is None:
+            self.static_img = load_or_synthesize_bg(media_path, width, height, seed=seed, tone=tone)
+
+    def read(self) -> Image.Image:
+        if self.cap is not None:
+            ok, bgr = self.cap.read()
+            if not ok:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, bgr = self.cap.read()
+            if ok and bgr is not None:
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                return _fit_cover_pil(Image.fromarray(rgb), self.width, self.height)
+        assert self.static_img is not None
+        return self.static_img
+
+    def close(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
 
 
 def load_or_synthesize_bg(
@@ -605,8 +666,10 @@ class Station01Renderer:
         half_w = (w - gap) // 2
 
         left_im = apply_grade(bg.resize((half_w, h), Image.Resampling.LANCZOS), 1.1, 0.88, 0.92)
-        right_src = load_or_synthesize_bg(
-            sc.secondary_media[0] if sc.secondary_media else None, half_w, h, seed=fidx // 30 + 99, tone=(36, 24, 26)
+        right_src = (
+            self._active_sec_frame
+            if getattr(self, "_active_sec_frame", None) is not None
+            else load_or_synthesize_bg(sc.secondary_media[0] if sc.secondary_media else None, half_w, h, seed=fidx // 30 + 99, tone=(36, 24, 26))
         )
         right_im = apply_grade(right_src, 1.1, 0.88, 0.92)
 
@@ -712,7 +775,14 @@ class Station01Renderer:
     # Renderização em streaming direto para FFmpeg --------------------------
     def render(self, output_path: str, audio_path: Optional[str] = None) -> str:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        vaapi_dev = "/dev/dri/renderD128" if (self.prefer_vaapi and os.path.exists("/dev/dri/renderD128")) else None
+        has_nvenc = False
+        if os.path.exists("/dev/nvidia0"):
+            try:
+                encs = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"], text=True, stderr=subprocess.DEVNULL)
+                has_nvenc = "h264_nvenc" in encs
+            except Exception:
+                has_nvenc = False
+        vaapi_dev = "/dev/dri/renderD128" if (not has_nvenc and self.prefer_vaapi and os.path.exists("/dev/dri/renderD128")) else None
 
         cmd = [
             "ffmpeg",
@@ -733,9 +803,14 @@ class Station01Renderer:
         if audio_path and os.path.exists(audio_path):
             cmd += ["-i", audio_path, "-af", build_broadcast_audio_filter(), "-c:a", "aac", "-b:a", "192k", "-shortest"]
 
-        if vaapi_dev:
+        if has_nvenc:
+            print("[Station01Renderer] Encoder ativo: NVIDIA GPU (h264_nvenc)")
+            cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "20", "-pix_fmt", "yuv420p"]
+        elif vaapi_dev:
+            print("[Station01Renderer] Encoder ativo: Intel QuickSync VAAPI (h264_vaapi)")
             cmd += ["-vaapi_device", vaapi_dev, "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", "20"]
         else:
+            print("[Station01Renderer] Encoder ativo: CPU (libx264)")
             cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p"]
         cmd += ["-movflags", "+faststart", output_path]
 
@@ -760,18 +835,39 @@ class Station01Renderer:
         try:
             for s_idx, sc in enumerate(self.spec.scenes):
                 fn = dispatch.get(sc.style, self._render_visual_investigation)
-                bg = load_or_synthesize_bg(sc.media_path, self.spec.width, self.spec.height, seed=s_idx * 17 + 5)
+                bg_reader = MediaFrameReader(sc.media_path, self.spec.width, self.spec.height, seed=s_idx * 17 + 5)
+                sec_path = sc.secondary_media[0] if sc.secondary_media else None
+                sec_w = (self.spec.width - 8) // 2 if sc.style == "live_countdown_split" else int(self.spec.width * 0.30)
+                sec_h = self.spec.height if sc.style == "live_countdown_split" else int(self.spec.height * 0.30)
+                sec_reader = MediaFrameReader(sec_path, sec_w, sec_h, seed=s_idx * 31 + 99, tone=(36, 24, 26)) if (sec_path or sc.style == "live_countdown_split") else None
+                self._active_sec_frame = None
                 total_f = max(1, int(round(sc.duration * self.spec.fps)))
-                for f in range(total_f):
-                    t = f / self.spec.fps
-                    img = fn(sc, bg, t, global_f)
-                    arr = np.asarray(img, dtype=np.uint8)
-                    if s_idx > 0 and last_frame is not None and sc.transition_in != "cut" and f < trans_frames:
-                        arr = self._apply_transition(last_frame, arr, sc.transition_in, (f + 1) / trans_frames)
-                    proc.stdin.write(arr.tobytes())
-                    global_f += 1
-                    if f == total_f - 1:
-                        last_frame = arr
+                try:
+                    for f in range(total_f):
+                        t = f / self.spec.fps
+                        bg = bg_reader.read()
+                        self._active_sec_frame = sec_reader.read() if sec_reader is not None else None
+                        img = fn(sc, bg, t, global_f)
+                        # Vídeo-sobre-vídeo PiP automático quando há secondary_media fora do split-screen
+                        if sec_path and sc.style != "live_countdown_split" and self._active_sec_frame is not None:
+                            pip = self._active_sec_frame
+                            px = self.spec.width - pip.width - int(self.spec.width * 0.035)
+                            py = int(self.spec.height * 0.14)
+                            d_pip = ImageDraw.Draw(img, "RGBA")
+                            d_pip.rectangle([px - 4, py - 4, px + pip.width + 4, py + pip.height + 4], fill=(12, 14, 18, 230), outline=(255, 194, 26, 235), width=2)
+                            img.paste(pip, (px, py))
+                        arr = np.asarray(img, dtype=np.uint8)
+                        if s_idx > 0 and last_frame is not None and sc.transition_in != "cut" and f < trans_frames:
+                            arr = self._apply_transition(last_frame, arr, sc.transition_in, (f + 1) / trans_frames)
+                        proc.stdin.write(arr.tobytes())
+                        global_f += 1
+                        if f == total_f - 1:
+                            last_frame = arr
+                finally:
+                    bg_reader.close()
+                    if sec_reader is not None:
+                        sec_reader.close()
+                    self._active_sec_frame = None
                 gc.collect()
         finally:
             proc.stdin.close()
