@@ -360,6 +360,10 @@ def build_narration_track(repo_dir: Path, spec_path: Path, keys: Dict[str, str])
         spoken = normalize_narration_for_speech(text, "pt_br")
         # A API de TTS às vezes devolve um blob anômalo (3x+ a duração esperada).
         # Sintetiza até 2x e fica com a tentativa de duração mais plausível.
+        # Duração esperada pela contagem de palavras (PT-BR Charon ≈ 0,62 s/palavra).
+        # A API às vezes devolve a mesma frase duplicada (~2x), o que cortaria o final.
+        words = len(spoken.split())
+        est = max(2.0, words * 0.62)
         best: Optional[tuple] = None
         for attempt in range(2):
             cand = work_dir / f"seg_{idx:02d}_try{attempt}.wav"
@@ -371,18 +375,24 @@ def build_narration_track(repo_dir: Path, spec_path: Path, keys: Dict[str, str])
                 api_key=api_key,
                 lang="pt_br",
             )
-            plausible = 0.25 * scene_dur <= cand_dur <= 1.90 * scene_dur
-            print(f"[NARR] cena {idx:02d} tentativa {attempt + 1}: {cand_dur:.2f}s"
-                  f" ({'ok' if plausible else 'ANÔMALA, repetindo'})")
-            if best is None or abs(cand_dur - scene_dur) < abs(best[0] - scene_dur):
+            plausible = 0.45 * est <= cand_dur <= 1.55 * est
+            print(f"[NARR] cena {idx:02d} tentativa {attempt + 1}: {cand_dur:.2f}s "
+                  f"(esperado ~{est:.1f}s: {'ok' if plausible else 'ANÔMALA, repetindo'})")
+            if best is None or abs(cand_dur - est) < abs(best[0] - est):
                 best = (cand_dur, cand)
             if plausible:
                 break
         spoken_dur, raw = best
+        if spoken_dur > 1.55 * est:
+            print(f"[NARR] AVISO cena {idx:02d}: fala {spoken_dur:.1f}s vs esperado {est:.1f}s "
+                  f"após 2 tentativas — o fim pode ser cortado")
 
         tempo = 1.0
         if spoken_dur > 0.1 and spoken_dur > scene_dur:
             tempo = min(1.20, max(1.0, spoken_dur / scene_dur))
+            cut = spoken_dur / tempo - scene_dur
+            if cut > 0.15:
+                print(f"[NARR] AVISO cena {idx:02d}: {cut:.2f}s de fala serão cortados no ajuste")
         filters = []
         if tempo > 1.001:
             filters.append(f"atempo={tempo:.4f}")
