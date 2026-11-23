@@ -1,0 +1,258 @@
+{
+  "title": "Tacoma Narrows (1940): Os 42 Minutos que Mudaram a Engenharia",
+  "channel_bug": "FRIMERISE DOCS",
+  "width": 1920,
+  "height": 1080,
+  "fps": 30,
+  "scenes": [
+    {
+      "style": "caption_news",
+      "duration": 7.0,
+      "highlight_number": 67,
+      "number_suffix": " KM/H",
+      "subline": "era só um vento moderado — mas derrubou uma ponte gigante",
+      "caption_chunks": [
+        "Ela foi feita para {190 km/h}",
+        "mas caiu com um vento comum"
+      ],
+      "source_tag": "WSDOT · 1940",
+      "transition_in": "cut"
+    },
+    {
+      "style": "visual_investigation",
+      "duration": 8.0,
+      "headline": "TACOMA NARROWS · O COLAPSO DE 1940",
+      "location_code": "WASHINGTON · EUA · 1940-11-07",
+      "source_tag": "ARQ · FWA 1941",
+      "clock_start_sec": 0.0,
+      "fact_claim": "A ponte suportava furacões de até 190 km/h.",
+      "fact_verdict": "Um vento constante de 67 km/h iniciou a torção fatal.",
+      "caption_chunks": [
+        "Por 42 minutos, o aço se comportou como borracha."
+      ],
+      "focus_point": [0.48, 0.45],
+      "transition_in": "flash"
+    },
+    {
+      "style": "city_symphony",
+      "duration": 7.5,
+      "headline": "07:00 — Neblina sobre o estreito de Puget Sound",
+      "location_code": "07:00 AM · TACOMA · 1940",
+      "clock_start_sec": 8.0,
+      "transition_in": "cut"
+    },
+    {
+      "style": "newsreel_1920s",
+      "duration": 8.0,
+      "headline": "A TERCEIRA MAIOR DO MUNDO!",
+      "subline": "Inaugurada em 1º de julho de 1940 por US$ 6,4 milhões",
+      "clock_start_sec": 15.5,
+      "transition_in": "iris"
+    },
+    {
+      "style": "constructivist_montage",
+      "duration": 7.5,
+      "headline": "853 METROS DE VÃO",
+      "subline": "MAIS FINA E LEVE DO QUE QUALQUER PONTE ANTES DELA",
+      "highlight_number": 853,
+      "number_suffix": " M",
+      "transition_in": "red_wipe"
+    },
+    {
+      "style": "caption_news",
+      "duration": 7.5,
+      "highlight_number": 2.4,
+      "number_suffix": " METROS",
+      "subline": "era a espessura das vigas laterais de aço maciço",
+      "caption_chunks": [
+        "O tabuleiro era {estreito demais}",
+        "e bloqueava a passagem do vento"
+      ],
+      "source_tag": "RELATÓRIO 1941",
+      "transition_in": "cut"
+    },
+    {
+      "style": "newsreel_1920s",
+      "duration": 7.5,
+      "headline": "APELIDO: GALLOPING GERTIE",
+      "subline": "Motoristas já sentiam a pista subir e descer semanas antes",
+      "transition_in": "iris"
+    },
+    {
+      "style": "broadcast_news_package",
+      "duration": 8.0,
+      "headline": "TESTES DE TÚNEL DE VENTO JÁ ALERTAVAM",
+      "subline": "Engenheiros tentaram cabos extras para conter o balanço vertical",
+      "location_code": "UNIV. WASHINGTON",
+      "source_tag": "ARQUIVO UW",
+      "highlight_number": 129,
+      "number_suffix": " DIAS",
+      "transition_in": "cut"
+    },
+    {
+      "style": "visual_investigation",
+      "duration": 8.5,
+      "headline": "07 DE NOVEMBRO · 10:00 DA MANHÃ",
+      "location_code": "TORRE LESTE · 10:00 AM",
+      "source_tag": "FWA · ANEXO B",
+      "clock_start_sec": 600.0,
+      "fact_claim": "O movimento era apenas oscilação vertical comum.",
+      "fact_verdict": "Um cabo de amarração rompeu e liberou torção lateral.",
+      "caption_chunks": [
+        "Às 10h00, o balanço vertical virou torção violenta."
+      ],
+      "focus_point": [0.55, 0.42],
+      "transition_in": "flash"
+    },
+    {
+      "style": "sports_telestrator",
+      "duration": 8.0,
+      "headline": "FREEZE FRAME · TORÇÃO DE 35 GRAUS",
+      "subline": "Uma faixa subia enquanto a outra afundava 8,5 metros",
+      "focus_point": [0.34, 0.56],
+      "target_point": [0.74, 0.34],
+      "transition_in": "cut"
+    },
+    {
+      "style": "visual_investigation",
+      "duration": 8.5,
+      "headline": "O ERRO QUE TODOS REPETEM NOS LIVROS",
+      "location_code": "ANÁLISE AERODINÂMICA",
+      "source_tag": "BILLAH & SCANLAN",
+      "clock_start_sec": 640.0,
+      "fact_claim": "A ponte caiu por simples ressonância forçada.",
+      "fact_verdict": "A causa real foi aeroelasticidade (flutter autoexcitado).",
+      "caption_chunks": [
+        "O próprio movimento da ponte alimentava a força do vento."
+      ],
+      "focus_point": [0.46, 0.48],
+      "transition_in": "flash"
+    },
+    {
+      "style": "caption_news",
+      "duration": 7.5,
+      "highlight_number": 14,
+      "number_suffix": " CICLOS/MIN",
+      "subline": "cada torção absorvia mais energia do vento constante",
+      "caption_chunks": [
+        "Não era um {empurrão externo}",
+        "era um ciclo que se autoalimentava"
+      ],
+      "source_tag": "AJP · 1991",
+      "transition_in": "cut"
+    },
+    {
+      "style": "city_symphony",
+      "duration": 7.5,
+      "headline": "10:30 — O único carro preso no centro da ponte",
+      "location_code": "10:30 AM · PISTA CENTRAL",
+      "clock_start_sec": 680.0,
+      "transition_in": "cut"
+    },
+    {
+      "style": "live_countdown_split",
+      "duration": 8.5,
+      "headline": "PISTA CENTRAL · TORÇÃO MÁXIMA",
+      "subline": "CABOS DE SUSPENSÃO · TENSÃO CRÍTICA",
+      "countdown_from_sec": 32.0,
+      "transition_in": "flash"
+    },
+    {
+      "style": "sports_telestrator",
+      "duration": 8.0,
+      "headline": "PONTO DE RUPTURA · VÃO PRINCIPAL",
+      "subline": "Pendurais de aço rompem em efeito dominó",
+      "focus_point": [0.50, 0.36],
+      "target_point": [0.50, 0.76],
+      "transition_in": "cut"
+    },
+    {
+      "style": "live_countdown_split",
+      "duration": 8.5,
+      "headline": "11:02 AM · PRIMEIRA LAJE CAI",
+      "subline": "CÂMERA DE BARNEY ELLIOTT · 16MM",
+      "countdown_from_sec": 12.0,
+      "transition_in": "flash"
+    },
+    {
+      "style": "constructivist_montage",
+      "duration": 7.5,
+      "headline": "11:02 · COLAPSO TOTAL",
+      "subline": "CENTENAS DE TONELADAS NO FUNDO DO ESTREITO",
+      "highlight_number": 180,
+      "number_suffix": " M DE PISTA",
+      "transition_in": "red_wipe"
+    },
+    {
+      "style": "broadcast_news_package",
+      "duration": 7.5,
+      "headline": "ZERO VÍTIMAS HUMANAS NO ACIDENTE",
+      "subline": "Trânsito foi bloqueado a tempo; motorista escapou engatinhando",
+      "location_code": "TACOMA · 1940-11-07",
+      "source_tag": "BOLETIM OFICIAL",
+      "highlight_number": 0,
+      "number_suffix": " MORTOS",
+      "transition_in": "cut"
+    },
+    {
+      "style": "visual_investigation",
+      "duration": 8.5,
+      "headline": "A INVESTIGAÇÃO FEDERAL DE 1941",
+      "location_code": "COMISSÃO FWA · RELATÓRIO FINAL",
+      "source_tag": "FWA · MAR 1941",
+      "clock_start_sec": 1200.0,
+      "fact_claim": "O projeto seguia as normas estáticas da época.",
+      "fact_verdict": "Normas ignoravam completamente a aerodinâmica de pontes.",
+      "caption_chunks": [
+        "O relatório reescreveu os manuais de engenharia no mundo todo."
+      ],
+      "focus_point": [0.52, 0.44],
+      "transition_in": "flash"
+    },
+    {
+      "style": "caption_news",
+      "duration": 7.5,
+      "highlight_number": 10,
+      "number_suffix": " ANOS",
+      "subline": "até a nova ponte abrir em 1950 com treliças abertas",
+      "caption_chunks": [
+        "A solução foi deixar o {vento passar}",
+        "por vigas vazadas e testes em túnel"
+      ],
+      "source_tag": "WSDOT · 1950",
+      "transition_in": "cut"
+    },
+    {
+      "style": "constructivist_montage",
+      "duration": 7.0,
+      "headline": "ENGENHARIA PÓS-1940",
+      "subline": "TODA GRANDE PONTE PASSA POR TÚNEL DE VENTO",
+      "highlight_number": 100,
+      "number_suffix": "% TESTADAS",
+      "transition_in": "red_wipe"
+    },
+    {
+      "style": "visual_investigation",
+      "duration": 8.5,
+      "headline": "VEREDITO FINAL · O LEGADO DE 42 MINUTOS",
+      "location_code": "ARQUIVO HISTÓRICO · 1940–HOJE",
+      "source_tag": "ENCERRAMENTO",
+      "clock_start_sec": 2520.0,
+      "fact_claim": "Uma falha isolada de um único engenheiro.",
+      "fact_verdict": "O marco zero da engenharia aeroelástica moderna.",
+      "caption_chunks": [
+        "Os 42 minutos de 1940 salvam pontes todos os dias até hoje."
+      ],
+      "focus_point": [0.50, 0.50],
+      "transition_in": "flash"
+    },
+    {
+      "style": "city_symphony",
+      "duration": 7.5,
+      "headline": "No fundo do estreito, os restos da ponte viraram recife artificial",
+      "location_code": "PUGET SOUND · HOJE",
+      "clock_start_sec": 2528.5,
+      "transition_in": "cut"
+    }
+  ]
+}
