@@ -333,11 +333,14 @@ def build_narration_track(repo_dir: Path, spec_path: Path, keys: Dict[str, str])
 
     if str(repo_dir) not in sys.path:
         sys.path.insert(0, str(repo_dir))
-    run(["pip", "install", "-q", "httpx"])
+    try:
+        import httpx  # noqa: F401
+    except ImportError:
+        run(["pip", "install", "-q", "httpx"])
 
     from engine.gemini_tts import normalize_narration_for_speech, synthesize_gemini_tts_line
 
-    work_dir = Path("/content/narration")
+    work_dir = Path(os.environ.get("NARRATION_DIR", "/content/narration"))
     work_dir.mkdir(parents=True, exist_ok=True)
     silence = f"anullsrc=r=48000:cl=mono"
     segments: list[Path] = []
@@ -355,14 +358,27 @@ def build_narration_track(repo_dir: Path, spec_path: Path, keys: Dict[str, str])
 
         raw = work_dir / f"seg_{idx:02d}_raw.wav"
         spoken = normalize_narration_for_speech(text, "pt_br")
-        _, spoken_dur = synthesize_gemini_tts_line(
-            spoken,
-            raw,
-            voice_name=NARRATION_VOICE,
-            acting_direction=NARRATION_ACTING,
-            api_key=api_key,
-            lang="pt_br",
-        )
+        # A API de TTS às vezes devolve um blob anômalo (3x+ a duração esperada).
+        # Sintetiza até 2x e fica com a tentativa de duração mais plausível.
+        best: Optional[tuple] = None
+        for attempt in range(2):
+            cand = work_dir / f"seg_{idx:02d}_try{attempt}.wav"
+            _, cand_dur = synthesize_gemini_tts_line(
+                spoken,
+                cand,
+                voice_name=NARRATION_VOICE,
+                acting_direction=NARRATION_ACTING,
+                api_key=api_key,
+                lang="pt_br",
+            )
+            plausible = 0.25 * scene_dur <= cand_dur <= 1.90 * scene_dur
+            print(f"[NARR] cena {idx:02d} tentativa {attempt + 1}: {cand_dur:.2f}s"
+                  f" ({'ok' if plausible else 'ANÔMALA, repetindo'})")
+            if best is None or abs(cand_dur - scene_dur) < abs(best[0] - scene_dur):
+                best = (cand_dur, cand)
+            if plausible:
+                break
+        spoken_dur, raw = best
 
         tempo = 1.0
         if spoken_dur > 0.1 and spoken_dur > scene_dur:
