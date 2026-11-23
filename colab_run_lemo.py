@@ -296,6 +296,96 @@ def hydrate_spec_media(spec_path: Path, repo_dir: Path, keys: Dict[str, str]) ->
     return hydrated_path
 
 
+NARRATION_VOICE = "Charon"
+NARRATION_ACTING = (
+    "Narre em português do Brasil com voz grave, investigativa e ritmo de documentário. "
+    "Pausas curtas entre as frases, sem entonação publicitária e sem CTA."
+)
+
+
+def probe_audio_duration_s(path: Path) -> float:
+    out = subprocess.check_output(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
+        text=True,
+    )
+    return float(out.strip())
+
+
+def build_narration_track(repo_dir: Path, spec_path: Path, keys: Dict[str, str]) -> Optional[Path]:
+    """
+    Sintetiza a narração cena a cena com Gemini TTS e monta uma trilha contínua.
+    Cada trecho é ajustado à duração EXATA da cena (`atempo` até 1.20x + `apad` + `atrim`),
+    para o áudio nunca dessincronizar dos cards de fact-check.
+
+    Retorna None (render segue sem áudio) quando o spec não tem `narration` ou a chave falta.
+    """
+    api_key = keys.get("GEMINI_API_KEY", "")
+    if not api_key:
+        print("[NARR] GEMINI_API_KEY ausente — render segue sem narração")
+        return None
+
+    data = json.loads(spec_path.read_text(encoding="utf-8"))
+    scenes = data.get("scenes", [])
+    if not any(str(sc.get("narration", "")).strip() for sc in scenes):
+        return None
+
+    import sys
+
+    if str(repo_dir) not in sys.path:
+        sys.path.insert(0, str(repo_dir))
+    run(["pip", "install", "-q", "httpx"])
+
+    from engine.gemini_tts import normalize_narration_for_speech, synthesize_gemini_tts_line
+
+    work_dir = Path("/content/narration")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    silence = f"anullsrc=r=48000:cl=mono"
+    segments: list[Path] = []
+
+    for idx, sc in enumerate(scenes):
+        scene_dur = float(sc.get("duration", 3.0))
+        text = str(sc.get("narration", "")).strip()
+        fitted = work_dir / f"seg_{idx:02d}.wav"
+
+        if not text:
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", silence,
+                 "-t", f"{scene_dur:.3f}", "-c:a", "pcm_s16le", str(fitted)])
+            segments.append(fitted)
+            continue
+
+        raw = work_dir / f"seg_{idx:02d}_raw.wav"
+        spoken = normalize_narration_for_speech(text, "pt_br")
+        _, spoken_dur = synthesize_gemini_tts_line(
+            spoken,
+            raw,
+            voice_name=NARRATION_VOICE,
+            acting_direction=NARRATION_ACTING,
+            api_key=api_key,
+            lang="pt_br",
+        )
+
+        tempo = 1.0
+        if spoken_dur > 0.1 and spoken_dur > scene_dur:
+            tempo = min(1.20, max(1.0, spoken_dur / scene_dur))
+        filters = []
+        if tempo > 1.001:
+            filters.append(f"atempo={tempo:.4f}")
+        filters.append(f"apad=whole_dur={scene_dur:.3f}")
+        filters.append(f"atrim=0:{scene_dur:.3f}")
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(raw), "-af", ",".join(filters),
+             "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", str(fitted)])
+        print(f"[NARR] cena {idx:02d}: {spoken_dur:.2f}s -> {scene_dur:.2f}s (tempo {tempo:.2f}x)")
+        segments.append(fitted)
+
+    listing = work_dir / "segments.txt"
+    listing.write_text("".join(f"file '{p}'\n" for p in segments), encoding="utf-8")
+    track = work_dir / "narracao.wav"
+    run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0",
+         "-i", str(listing), "-c:a", "pcm_s16le", str(track)])
+    print(f"[NARR] trilha contínua -> {track} ({probe_audio_duration_s(track):.1f}s)")
+    return track
+
+
 def ensure_ffmpeg7() -> None:
     ver = subprocess.check_output(["ffmpeg", "-version"], text=True).splitlines()[0]
     if any(v in ver for v in ("version 4.", "version 5.", "version 6.")):
@@ -328,6 +418,13 @@ def run_frimerise(repo_url: str, spec_rel: str, output_name: str, export_dir: Pa
         spec_path = repo_dir / spec_rel
         if fetch_media:
             spec_path = hydrate_spec_media(spec_path, repo_dir, keys)
+        try:
+            narration = build_narration_track(repo_dir, spec_path, keys)
+        except Exception as exc:  # nunca derruba o render por falha de TTS
+            narration = None
+            print(f"[NARR] desativada ({exc.__class__.__name__}: {exc}) — render segue sem áudio")
+        if narration:
+            cmd += ["--audio", str(narration)]
         cmd += ["--spec", str(spec_path)]
 
     run(cmd, cwd=str(repo_dir))

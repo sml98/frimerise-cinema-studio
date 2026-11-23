@@ -14,6 +14,7 @@
       "clock_start_sec": 0.0,
       "fact_claim": "Celebrar o Natal era proibido por lei.",
       "fact_verdict": "A proibição durou 22 anos na Baía de Massachusetts.",
+      "narration": "Em 1659, na colônia de Massachusetts, celebrar o Natal era ilegal. As igrejas fechavam, as lojas abriam, e a lei durou 22 anos.",
       "transition_in": "cut",
       "media_query": "Massachusetts Bay Colony Puritan meeting house 17th century engraving",
       "media_type": "image"
@@ -27,6 +28,7 @@
       "clock_start_sec": 12.0,
       "fact_claim": "Os primeiros cristãos celebravam 25 de dezembro.",
       "fact_verdict": "Clemente propôs 20 de maio. Não havia consenso algum.",
+      "narration": "Antes disso, ninguém sabia quando Jesus nasceu. Por volta do ano 200, o teólogo Clemente de Alexandria arriscou uma data: 20 de maio. Não havia consenso.",
       "transition_in": "flash",
       "media_query": "Clement of Alexandria manuscript Stromateis 3rd century",
       "media_type": "image"
@@ -40,6 +42,7 @@
       "clock_start_sec": 24.0,
       "fact_claim": "25 de dezembro nasceu com o cristianismo.",
       "fact_verdict": "Aureliano fixou a data 62 anos antes da primeira missa natalina.",
+      "narration": "Sessenta e dois anos antes da primeira missa natalina, o imperador Aureliano já havia cravado 25 de dezembro no calendário romano. Não por causa de Cristo.",
       "transition_in": "flash",
       "media_query": "Sol Invictus Roman coin emperor Aurelian 274 AD",
       "media_type": "image"
@@ -53,6 +56,7 @@
       "clock_start_sec": 36.0,
       "fact_claim": "Trocar presentes é um costume cristão.",
       "fact_verdict": "Roma já trocava sigillaria e invertia papéis na Saturnália.",
+      "narration": "Naquele dia, Roma celebrava o Sol Invicto. E nos dias anteriores vinha a Saturnália: banquetes, papéis invertidos e presentes de cerâmica chamados sigillaria.",
       "transition_in": "flash",
       "media_query": "Saturnalia Roman banquet fresco Pompeii",
       "media_type": "image"
@@ -66,6 +70,7 @@
       "clock_start_sec": 48.0,
       "fact_claim": "O Natal é apenas Saturnália reciclada.",
       "fact_verdict": "Havia outra conta: cruz em 25 de março, concepção, nascimento em 25 de dezembro.",
+      "narration": "Então o Natal é só paganismo reciclado? Não é tão simples. Havia outra conta: cruz em 25 de março, concepção na mesma data, nascimento nove meses depois.",
       "transition_in": "flash",
       "media_query": "Chronograph of 354 calendar manuscript page",
       "media_type": "image"
@@ -79,6 +84,7 @@
       "clock_start_sec": 60.0,
       "fact_claim": "A Coca-Cola inventou o Papai Noel vermelho.",
       "fact_verdict": "A marca padronizou um Noel que já era vermelho e barrigudo.",
+      "narration": "E o Papai Noel vermelho? A Coca-Cola não inventou nada. Em 1931, Haddon Sundblom apenas padronizou um velhinho que os americanos já desenhavam de vermelho.",
       "transition_in": "cut",
       "media_query": "Haddon Sundblom Coca-Cola Santa Claus advertisement 1931",
       "media_type": "image"
@@ -92,6 +98,7 @@
       "clock_start_sec": 72.0,
       "fact_claim": "O bom velhinho é invenção do século XX.",
       "fact_verdict": "Thomas Nast desenhou o Noel moderno já em 1863.",
+      "narration": "O rosto moderno veio antes. Em 1863, em plena guerra civil, Thomas Nast publicou o primeiro Papai Noel barrigudo, de barba branca e casaco vermelho.",
       "transition_in": "flash",
       "media_query": "Thomas Nast Santa Claus Harpers Weekly 1863",
       "media_type": "image"
@@ -105,6 +112,7 @@
       "clock_start_sec": 84.0,
       "fact_claim": "O Noel alegre vem da Europa medieval.",
       "fact_verdict": "Washington Irving inventou o personagem em 1809.",
+      "narration": "Mas o personagem alegre é mais antigo ainda: 1809. Washington Irving descreveu um santo gordo, de cachimbo, voando numa carruagem sobre Nova York.",
       "transition_in": "flash",
       "media_query": "Washington Irving Knickerbockers History of New York 1809",
       "media_type": "image"
@@ -118,6 +126,7 @@
       "clock_start_sec": 96.0,
       "fact_claim": "O trenó voador é uma tradição milenar.",
       "fact_verdict": "Nasceu num poema publicado sem assinatura em 1823.",
+      "narration": "O trenó e as renas, porém, nasceram de um poema publicado sem assinatura em 1823. Era para ser história de ninar. Virou a imagem oficial do Natal.",
       "transition_in": "flash",
       "media_query": "Troy Sentinel 1823 Visit from St Nicholas poem page",
       "media_type": "image"
@@ -131,6 +140,7 @@
       "clock_start_sec": 108.0,
       "fact_claim": "Papai Noel não tem nenhuma base histórica.",
       "fact_verdict": "Bispo real em Mira, hoje Turquia. Festa em 6 de dezembro.",
+      "narration": "Sobrou uma raiz real: Nicolau, bispo de Mira, no século quarto, na atual Turquia. Famoso por dar presentes em segredo. Sua festa era 6 de dezembro.",
       "transition_in": "flash",
       "media_query": "Saint Nicholas of Myra Byzantine icon",
       "media_type": "image"
@@ -144,6 +154,7 @@
       "clock_start_sec": 120.0,
       "fact_claim": "O príncipe Albert inventou a árvore de Natal.",
       "fact_verdict": "O costume era alemão. Charlotte já tinha árvore nos anos 1790.",
+      "narration": "E a árvore de Natal? O príncipe Albert não inventou. O costume era alemão. A rainha Charlotte, esposa de George terceiro, já montava árvores nos anos 1790.",
       "transition_in": "flash",
       "media_query": "Queen Charlotte German Christmas tree 1790s royal",
       "media_type": "image"
@@ -157,6 +168,7 @@
       "clock_start_sec": 132.0,
       "fact_claim": "A árvore de Natal virou moda por acaso.",
       "fact_verdict": "Uma gravura da família real em 1848 espalhou o costume pelo mundo.",
+      "narration": "O que Albert fez foi aparecer na gravura certa. Em 1848, o Illustrated London News publicou a família real ao redor da árvore. A imagem correu o mundo.",
       "transition_in": "flash",
       "media_query": "1848 Illustrated London News royal family Christmas tree Windsor",
       "media_type": "image"
@@ -170,6 +182,7 @@
       "clock_start_sec": 144.0,
       "fact_claim": "Dickens ressuscitou um Natal moribundo.",
       "fact_verdict": "A tese é contestada: ele acelerou uma reinvenção vitoriana.",
+      "narration": "Cinco anos antes, Dickens publicara Um Conto de Natal. Dizem que salvou a festa. Historiadores discordam: ele acelerou uma reinvenção que já estava em curso.",
       "transition_in": "cut",
       "media_query": "Charles Dickens A Christmas Carol 1843 first edition",
       "media_type": "image"
@@ -183,6 +196,7 @@
       "clock_start_sec": 156.0,
       "fact_claim": "O Natal que você conhece é muito antigo.",
       "fact_verdict": "Árvore, trenó, presentes e Papai Noel têm menos de 200 anos.",
+      "narration": "O veredito: a data é romana, o santo é real, o trenó é um poema e o vermelho é americano. O Natal que você conhece tem menos de 200 anos.",
       "transition_in": "cut",
       "media_query": "Victorian Christmas dinner table 19th century engraving",
       "media_type": "image"
