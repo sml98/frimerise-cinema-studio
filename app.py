@@ -1188,20 +1188,21 @@ async def api_test_setup():
     gkey = (settings.get("gemini_api_key") or "").strip()
     gem_ok, gem_detail = False, "Não configurada (opcional)"
     if gkey:
-        try:
-            r = httpx.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent",
-                headers={"x-goog-api-key": gkey},
-                json={"contents": [{"parts": [{"text": "OK"}]}]},
-                timeout=12.0,
-            )
-            if r.status_code == 200:
-                key_tag = "AQ." if gkey.startswith("AQ.") else "AIza"
-                gem_ok, gem_detail = True, f"Conectada (HTTP 200 • chave {key_tag} • LLM + Gemini TTS ativos!)"
-            else:
-                gem_detail = f"Erro HTTP {r.status_code} ({len(gkey)} chars)"
-        except Exception as exc:
-            gem_detail = f"Erro de rede: {str(exc)[:60]}"
+        for _gm in ("gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.8-flash"):
+            try:
+                r = httpx.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{_gm}:generateContent",
+                    headers={"x-goog-api-key": gkey},
+                    json={"contents": [{"parts": [{"text": "OK"}]}]},
+                    timeout=12.0,
+                )
+                if r.status_code == 200:
+                    key_tag = "AQ." if gkey.startswith("AQ.") else "AIza"
+                    gem_ok, gem_detail = True, f"Conectada (HTTP 200 • {_gm} • chave {key_tag} • LLM + Gemini 3.8 TTS ativos!)"
+                    break
+                gem_detail = f"Erro HTTP {r.status_code} em {_gm} ({len(gkey)} chars)"
+            except Exception as exc:
+                gem_detail = f"Erro de rede: {str(exc)[:60]}"
 
     dkey = (settings.get("deepseek_api_key") or "").strip()
     ds_ok, ds_detail = False, "Não configurada (opcional)"

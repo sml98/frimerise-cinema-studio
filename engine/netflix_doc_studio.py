@@ -1671,7 +1671,7 @@ def _call_open_topic_director_llm(
     target_seconds: float = 60.0,
     skill_id: Optional[str] = None,
 ) -> Optional[Tuple[Dict[str, Any], str, int, float]]:
-    """Call LIVE DeepSeek (`deepseek-chat`) OR Google Gemini (`gemini-2.5-flash-lite` / `gemini-2.5-flash` via
+    """Call LIVE DeepSeek (`deepseek-chat`) OR Google Gemini (`gemini-3.8-flash` / `gemini-3.5-flash-lite` via
     `headers={"x-goog-api-key": gkey}`) with automatic failover to author a 100% original, deeply
     researched, gripping Netflix / Dark History documentary blueprint for ANY arbitrary topic.
 
@@ -1684,10 +1684,10 @@ def _call_open_topic_director_llm(
     settings = get_settings() or {}
     dkey = str(settings.get("deepseek_api_key") or "").strip()
     gkey = str(settings.get("gemini_api_key") or "").strip()
-    raw_llm = str(settings.get("default_llm") or "gemini-2.5-flash-lite").strip().lower()
+    raw_llm = str(settings.get("default_llm") or "gemini-3.8-flash").strip().lower()
     default_llm = {
-        "gemini-3.5-flash-lite": "gemini-2.5-flash-lite",
-        "gemini-3.8-flash": "gemini-2.5-flash",
+        "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+        "gemini-2.5-flash": "gemini-3.8-flash",
     }.get(raw_llm, raw_llm)
     if not dkey and not gkey:
         return None
@@ -1842,9 +1842,10 @@ def _call_open_topic_director_llm(
                             m
                             for m in (
                                 default_llm if "gemini" in default_llm else "",
-                                "gemini-2.5-flash",
-                                "gemini-2.5-flash-lite",
+                                "gemini-3.8-flash",
+                                "gemini-3.5-flash-lite",
                                 "gemini-flash-lite-latest",
+                                "gemini-3-flash-preview",
                             )
                             if m
                         ]
@@ -3317,7 +3318,7 @@ def generate_netflix_doc_plan(
                 except Exception:
                     pass
             if not expanded_ok and gkey:
-                for gm in ("gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-lite-latest"):
+                for gm in ("gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3-flash-preview"):
                     try:
                         url = f"https://generativelanguage.googleapis.com/v1beta/models/{gm}:generateContent"
                         r = httpx.post(
@@ -4070,10 +4071,10 @@ def _invoke_gemini_tts_sync(
 
     res = fn(**filtered_kwargs)
     if isinstance(res, tuple) and len(res) >= 3:
-        return Path(res[0]), float(res[1]), str(res[2] or pinned_tts_model or "gemini-2.5-flash-preview-tts")
+        return Path(res[0]), float(res[1]), str(res[2] or pinned_tts_model or "gemini-3.8-flash-tts")
     if isinstance(res, tuple) and len(res) == 2:
-        return Path(res[0]), float(res[1]), str(pinned_tts_model or "gemini-2.5-flash-preview-tts")
-    return raw_wav, _probe_wav_duration_s(raw_wav), str(pinned_tts_model or "gemini-2.5-flash-preview-tts")
+        return Path(res[0]), float(res[1]), str(pinned_tts_model or "gemini-3.8-flash-tts")
+    return raw_wav, _probe_wav_duration_s(raw_wav), str(pinned_tts_model or "gemini-3.8-flash-tts")
 
 
 async def _synthesize_doc_scene_narration(

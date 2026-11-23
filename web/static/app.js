@@ -1837,10 +1837,10 @@ function renderSettingsForm() {
   const pxImgEl = document.getElementById('set-pixabay-image');
   if (pxImgEl) pxImgEl.value = s.pixabay_image_api_key || '';
   const llmAliases = {
-    'gemini-3.5-flash-lite': 'gemini-2.5-flash-lite',
-    'gemini-3.8-flash': 'gemini-2.5-flash',
+    'gemini-2.5-flash-lite': 'gemini-3.5-flash-lite',
+    'gemini-2.5-flash': 'gemini-3.8-flash',
   };
-  const normLlm = llmAliases[s.default_llm] || s.default_llm || 'gemini-2.5-flash-lite';
+  const normLlm = llmAliases[s.default_llm] || s.default_llm || 'gemini-3.8-flash';
   document.getElementById('set-llm').value = normLlm;
   document.getElementById('set-ollama').value = s.ollama_url || 'http://localhost:11434';
   document.getElementById('set-thermal').value = s.thermal_limit_c || '85';

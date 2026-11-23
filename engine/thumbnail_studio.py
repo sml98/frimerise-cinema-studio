@@ -48,18 +48,21 @@ THUMB_HERO_CACHE_DIR = BASE_DIR / "data" / "thumb_hero_cache"
 THUMB_HERO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 GEMINI_IMAGE_MODELS: Tuple[str, ...] = (
-    "gemini-2.5-flash-image",
+    "gemini-nano-banana-2.1",
     "gemini-3.1-flash-image",
+    "gemini-3.1-flash-lite-image",
 )
 GEMINI_TEXT_PLANNER_MODELS: Tuple[str, ...] = (
-    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash-lite",
     "gemini-flash-lite-latest",
-    "gemini-2.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3-flash-preview",
 )
 GEMINI_VISION_SELECTOR_MODELS: Tuple[str, ...] = (
-    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash-lite",
     "gemini-flash-lite-latest",
-    "gemini-2.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3-flash-preview",
 )
 
 _REMBG_SESSION = None

@@ -1,7 +1,7 @@
 """FrimeRise Ultra-Low-Token LLM Router (< 1,800 tokens/video with Context Caching).
 Supports:
 - deepseek-flash (DeepSeek API)
-- gemini-2.5-flash / gemini-2.5-flash-lite (Google Gemini API)
+- gemini-3.8-flash / gemini-3.5-flash-lite (Google Gemini API)
 - ollama (Local Ollama server)
 - Instant PT-BR Viral Script Synthesizer fallback when no API key is configured yet.
 """
@@ -25,21 +25,23 @@ SKILLS_DIR = BASE_DIR / "skills"
 MODEL_PRICING = {
     "deepseek-flash": (0.14, 0.28),
     "deepseek-chat": (0.14, 0.28),
-    "gemini-2.5-flash": (0.15, 0.60),
-    "gemini-2.5-flash-lite": (0.075, 0.30),
+    "gemini-3.8-flash": (0.15, 0.60),
+    "gemini-3.5-flash-lite": (0.075, 0.30),
+    "gemini-3-flash-preview": (0.15, 0.60),
+    "gemini-flash-latest": (0.15, 0.60),
     "gemini-flash-lite-latest": (0.075, 0.30),
     "ollama": (0.0, 0.0),
     "local_template": (0.0, 0.0),
 }
 
 _LEGACY_GEMINI_ALIASES = {
-    "gemini-3.5-flash-lite": "gemini-2.5-flash-lite",
-    "gemini-3.8-flash": "gemini-2.5-flash",
+    "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-2.5-flash": "gemini-3.8-flash",
 }
 
 
 def normalize_llm_model_name(model_name: Optional[str]) -> str:
-    m = str(model_name or "gemini-2.5-flash-lite").strip()
+    m = str(model_name or "gemini-3.8-flash").strip()
     return _LEGACY_GEMINI_ALIASES.get(m, m)
 
 # Static prefix kept byte-identical across calls so DeepSeek / Gemini Context Caching hits >80%
@@ -445,7 +447,7 @@ def generate_viral_script(
 ) -> Dict[str, Any]:
     """Generate a structured viral script shaped by target duration, language, and custom directives."""
     settings = get_settings()
-    model_choice = normalize_llm_model_name(provider_override or settings.get("default_llm") or "gemini-2.5-flash-lite")
+    model_choice = normalize_llm_model_name(provider_override or settings.get("default_llm") or "gemini-3.8-flash")
     skill_md = load_skill_text(skill_id)
     lang = _normalize_language(language)
     sec, target_words, n_body, max_out_tokens = _compute_duration_plan(target_duration_s)
@@ -530,9 +532,9 @@ def generate_viral_script(
 
         if prov == "gemini" and gkey:
             raw_cands = (
-                [model_choice, "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-flash-lite-latest"]
+                [model_choice, "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3-flash-preview"]
                 if "gemini" in model_choice
-                else ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-flash-lite-latest"]
+                else ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3-flash-preview"]
             )
             candidates = list(dict.fromkeys(raw_cands))
             for gm in candidates:

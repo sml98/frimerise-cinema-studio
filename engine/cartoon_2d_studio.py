@@ -325,10 +325,10 @@ def generate_cartoon_episode_plan(
 ) -> Tuple[CartoonEpisodePlan, Dict[str, Any]]:
     """Generate a validated CartoonEpisodePlan via LLM (if key configured) or high-craft built-in comedy."""
     settings = get_settings()
-    raw_model = str(settings.get("default_llm") or "gemini-2.5-flash-lite").strip()
+    raw_model = str(settings.get("default_llm") or "gemini-3.8-flash").strip()
     model_choice = {
-        "gemini-3.5-flash-lite": "gemini-2.5-flash-lite",
-        "gemini-3.8-flash": "gemini-2.5-flash",
+        "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+        "gemini-2.5-flash": "gemini-3.8-flash",
     }.get(raw_model, raw_model)
 
     skill_path = SKILLS_DIR / f"{skill_id}.md" if (skill_id and (SKILLS_DIR / f"{skill_id}.md").exists()) else (SKILLS_DIR / "09_cartoon_dialogue.md")
@@ -354,7 +354,7 @@ def generate_cartoon_episode_plan(
     for prov in order:
         if prov == "gemini" and gkey:
             gem_candidates = list(dict.fromkeys([
-                m for m in (model_choice, "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-flash-lite-latest")
+                m for m in (model_choice, "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3-flash-preview")
                 if "gemini" in m
             ]))
             for gm in gem_candidates:

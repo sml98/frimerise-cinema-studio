@@ -689,15 +689,17 @@ MOOD_DOC_PHOTO_QUERIES: Dict[str, List[str]] = {
 }
 
 GEMINI_IMAGE_MODELS: Tuple[str, ...] = (
-    "gemini-2.5-flash-image",
+    "gemini-nano-banana-2.1",
     "gemini-3.1-flash-image",
     "gemini-3.1-flash-lite-image",
+    "gemini-3-pro-image",
 )
 
 GEMINI_VISION_MODELS: Tuple[str, ...] = (
+    "gemini-3.5-flash-lite",
     "gemini-flash-lite-latest",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
+    "gemini-3.8-flash",
+    "gemini-3-flash-preview",
 )
 
 _BESPOKE_HISTORY_FOLKLORE_RE = re.compile(

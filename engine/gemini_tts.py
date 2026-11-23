@@ -20,9 +20,9 @@ import httpx
 from database import get_settings, record_token_usage
 from engine.intel_vaapi import run_ffmpeg_safe
 
-GEMINI_TTS_MODELS = ("gemini-2.5-flash-preview-tts", "gemini-3.1-flash-tts-preview")
+GEMINI_TTS_MODELS = ("gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts", "gemini-3.1-flash-tts-preview")
 GEMINI_TTS_MODEL = GEMINI_TTS_MODELS[0]
-GEMINI_TEXT_MODELS = ("gemini-flash-lite-latest", "gemini-2.5-flash-lite", "gemini-2.5-flash")
+GEMINI_TEXT_MODELS = ("gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-3-flash-preview")
 
 GEMINI_TTS_DEFAULT_TEMPERATURE = 0.28
 GEMINI_TTS_MIN_INTERVAL_S = 4.5

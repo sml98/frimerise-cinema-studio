@@ -363,9 +363,9 @@ def init_db() -> None:
                 ),
             )
 
-        # Default settings (valid Gemini 2.5 model identifiers)
+        # Default settings (live-verified Gemini 3.8 / 3.5 model identifiers)
         defaults = {
-            "default_llm": "gemini-2.5-flash-lite",
+            "default_llm": "gemini-3.8-flash",
             "ollama_url": "http://localhost:11434",
             "thermal_limit_c": "85",
             "pexels_api_key": "",
@@ -381,13 +381,13 @@ def init_db() -> None:
                 "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
                 (k, v, now),
             )
-        # Migrate legacy invalid Gemini 3.5/3.8 model names in existing databases
+        # Upgrade deprecated Gemini 2.5 (HTTP 404) settings to live Gemini 3.5/3.8 models
         conn.execute(
-            "UPDATE settings SET value = 'gemini-2.5-flash-lite', updated_at = ? WHERE key = 'default_llm' AND value = 'gemini-3.5-flash-lite'",
+            "UPDATE settings SET value = 'gemini-3.5-flash-lite', updated_at = ? WHERE key = 'default_llm' AND value = 'gemini-2.5-flash-lite'",
             (now,),
         )
         conn.execute(
-            "UPDATE settings SET value = 'gemini-2.5-flash', updated_at = ? WHERE key = 'default_llm' AND value = 'gemini-3.8-flash'",
+            "UPDATE settings SET value = 'gemini-3.8-flash', updated_at = ? WHERE key = 'default_llm' AND value = 'gemini-2.5-flash'",
             (now,),
         )
 
