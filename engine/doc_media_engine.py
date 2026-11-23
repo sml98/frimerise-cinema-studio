@@ -781,11 +781,27 @@ def _infer_media_mood(query: str, explicit_mood: str = "") -> str:
     return "corporate_thriller"
 
 
+def _read_pixabay_keys() -> Tuple[str, str]:
+    """Return `(pixabay_image_key, pixabay_video_key)`.
+    If `pixabay_image_api_key` is set, uses it for images; otherwise falls back to `pixabay_api_key`.
+    If `pixabay_api_key` is set, uses it for videos; otherwise falls back to `pixabay_image_api_key`.
+    """
+    try:
+        settings = get_settings() or {}
+        global_key = str(settings.get("pixabay_api_key") or "").strip()
+        img_key = str(settings.get("pixabay_image_api_key") or "").strip() or global_key
+        vid_key = global_key or img_key
+        return img_key, vid_key
+    except Exception:
+        return "", ""
+
+
 def _read_api_keys() -> Tuple[str, str]:
     try:
         settings = get_settings() or {}
+        _, vid_key = _read_pixabay_keys()
         return (
-            str(settings.get("pixabay_api_key") or "").strip(),
+            vid_key,
             str(settings.get("pexels_api_key") or "").strip(),
         )
     except Exception:
@@ -2520,7 +2536,7 @@ def fetch_doc_real_photo(
         url_hash = hashlib.sha256(c_url.encode("utf-8")).hexdigest()[:16]
         return _materialize_photo_in_work_dir(c_file, work_dir, tag, url_hash)
 
-    pixabay_key, _ = _read_api_keys()
+    pixabay_key, _ = _read_pixabay_keys()
 
     def _record_and_return(cached_path: Path, src_url: str, src_name: str, w: int, h: int) -> Optional[Path]:
         if not _check_dhash_ok(cached_path):

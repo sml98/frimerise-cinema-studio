@@ -370,6 +370,7 @@ def init_db() -> None:
             "thermal_limit_c": "85",
             "pexels_api_key": "",
             "pixabay_api_key": "",
+            "pixabay_image_api_key": "",
             "deepseek_api_key": "",
             "gemini_api_key": "",
             "openai_api_key": "",

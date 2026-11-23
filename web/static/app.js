@@ -1834,6 +1834,8 @@ function renderSettingsForm() {
   document.getElementById('set-deepseek').value = s.deepseek_api_key || '';
   document.getElementById('set-pexels').value = s.pexels_api_key || '';
   document.getElementById('set-pixabay').value = s.pixabay_api_key || '';
+  const pxImgEl = document.getElementById('set-pixabay-image');
+  if (pxImgEl) pxImgEl.value = s.pixabay_image_api_key || '';
   const llmAliases = {
     'gemini-3.5-flash-lite': 'gemini-2.5-flash-lite',
     'gemini-3.8-flash': 'gemini-2.5-flash',
@@ -2040,6 +2042,7 @@ async function saveSettingsForm() {
         deepseek_api_key: document.getElementById('set-deepseek').value.trim(),
         pexels_api_key: document.getElementById('set-pexels').value.trim(),
         pixabay_api_key: document.getElementById('set-pixabay').value.trim(),
+        pixabay_image_api_key: (document.getElementById('set-pixabay-image') ? document.getElementById('set-pixabay-image').value.trim() : ''),
         default_llm: document.getElementById('set-llm').value,
         ollama_url: document.getElementById('set-ollama').value.trim(),
         thermal_limit_c: document.getElementById('set-thermal').value.trim(),

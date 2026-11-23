@@ -509,6 +509,7 @@ class SettingsPayload(BaseModel):
     openai_api_key: Optional[str] = None
     pexels_api_key: Optional[str] = None
     pixabay_api_key: Optional[str] = None
+    pixabay_image_api_key: Optional[str] = None
     ollama_url: Optional[str] = None
     default_llm: Optional[str] = None
     thermal_limit_c: Optional[str] = None
@@ -1220,14 +1221,34 @@ async def api_test_setup():
             ds_detail = f"Erro de rede: {str(exc)[:60]}"
 
     pxkey = (settings.get("pixabay_api_key") or "").strip()
+    px_img_key = (settings.get("pixabay_image_api_key") or "").strip()
+    effective_img_key = px_img_key or pxkey
     px_ok, px_detail = True, "Opcional (Zero-Key yt-dlp + Wikimedia + Archive ativos)"
-    if pxkey:
-        try:
-            r = httpx.get("https://pixabay.com/api/videos/", params={"key": pxkey, "q": "city", "per_page": 3}, timeout=8.0)
-            px_ok = r.status_code == 200
-            px_detail = "Conectada (HTTP 200 • API Instantânea)" if px_ok else f"Chave inválida (HTTP {r.status_code})"
-        except Exception:
-            px_detail = "Erro de rede"
+    if pxkey or effective_img_key:
+        details = []
+        if pxkey:
+            try:
+                r = httpx.get("https://pixabay.com/api/videos/", params={"key": pxkey, "q": "city", "per_page": 3}, timeout=8.0)
+                if r.status_code == 200:
+                    details.append("Vídeos OK")
+                else:
+                    px_ok = False
+                    details.append(f"Vídeos: HTTP {r.status_code}")
+            except Exception:
+                details.append("Vídeos: Erro de rede")
+        if px_img_key and px_img_key != pxkey:
+            try:
+                r_img = httpx.get("https://pixabay.com/api/", params={"key": px_img_key, "q": "nature", "per_page": 3}, timeout=8.0)
+                if r_img.status_code == 200:
+                    details.append("Fotos OK (chave dedicada)")
+                else:
+                    px_ok = False
+                    details.append(f"Fotos: HTTP {r_img.status_code}")
+            except Exception:
+                details.append("Fotos: Erro de rede")
+        elif pxkey and px_ok:
+            details.append("Fotos OK (chave compartilhada)")
+        px_detail = "Conectada (" + " • ".join(details) + ")"
 
     checks = {
         "quicksync": {"ok": bool(qs["quicksync_on"]), "detail": str(qs["detail"])},
