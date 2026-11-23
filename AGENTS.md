@@ -109,3 +109,8 @@ python3 -m venv .venv
 - **NUNCA commite** `data/frimerise.db`, `.env`, `data/gdrive_token.json`, `data/gdrive_credentials.json`, `data/profiles/` ou `outputs/`.
 - Configure chaves de API (`GEMINI_API_KEY`, `PIXABAY_API_KEY`, `PEXELS_API_KEY`) exclusivamente pela aba **Setup** da UI local ou via `database.save_settings(...)` no banco local.
 - Respeite sempre fila sequencial (1 render por vez) e `thermal_guard_wait` para manter RAM estável e CPU segura.
+
+## Station 01 — Edit & Documentary Pack (`engine/doc_station01_engine.py`)
+- Presets individuais (8 estilos) e mixes por Ato ficam em `config/doc_station01_presets.json`.
+- Playbook obrigatório para agentes: `skills/11_doc_station01_mix.md`.
+- Em produção, gere apenas o JSON `DocStation01Spec` e execute `python3 engine/doc_station01_engine.py --spec <arquivo.json> --output <saida.mp4>` (zero tokens de código).
